@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/tmp/.cache/uv \
     uv sync --frozen --no-dev --extra graphinator
 
 # Copy source files
-COPY config.py ./
+COPY common/ ./common/
 COPY graphinator/ ./graphinator/
 
 # Final stage
@@ -55,9 +55,11 @@ LABEL org.opencontainers.image.title="Discogsography Graphinator" \
       com.discogsography.python.version="${PYTHON_VERSION}" \
       com.discogsography.database="neo4j"
 
-# Install security updates
+# Install security updates and curl for healthcheck
+# hadolint ignore=DL3008
 RUN apt-get update && \
     apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends curl && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
