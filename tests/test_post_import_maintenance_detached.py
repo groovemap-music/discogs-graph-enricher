@@ -19,8 +19,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from aio_pika.abc import AbstractIncomingMessage
 import pytest
+from aio_pika.abc import AbstractIncomingMessage
 
 import graphinator.graphinator as g
 

@@ -31,9 +31,7 @@ class GraphinatorConfig:
             if not value
         ]
         if missing_vars:
-            raise ValueError(
-                f"Missing required environment variables: {', '.join(missing_vars)}"
-            )
+            raise ValueError(f"Missing required environment variables: {', '.join(missing_vars)}")
         return cls(
             amqp_connection=_build_amqp_url(),
             neo4j_host=_build_neo4j_uri(),

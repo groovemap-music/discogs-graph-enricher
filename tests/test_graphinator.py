@@ -8,9 +8,9 @@ import signal
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from aio_pika.abc import AbstractIncomingMessage
 from orjson import dumps
-import pytest
 
 from graphinator.graphinator import (
     main,
@@ -4957,9 +4957,8 @@ class TestOutageRequeueBackoff:
         x-delivery-limit=20 is a budget with no time dimension: unthrottled
         requeues dead-letter perfectly valid records within minutes.
         """
-        from neo4j.exceptions import ServiceUnavailable
-
         from common.outage_backoff import OutageBackoff
+        from neo4j.exceptions import ServiceUnavailable
 
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         mock_message.body = json.dumps(sample_artist_data).encode()

@@ -43,6 +43,7 @@ from graphinator.catalog_contract import (
 )
 from graphinator.config import GraphinatorConfig
 
+
 logger = structlog.get_logger(__name__)
 
 # Config will be initialized in main
@@ -85,13 +86,9 @@ current_progress = 0.0
 
 # Consumer management
 consumer_tags: dict[str, str] = {}  # {"artists": "consumer-tag-123", ...}
-consumer_cancel_tasks: dict[
-    str, asyncio.Task[None]
-] = {}  # {"artists": asyncio.Task, ...}
+consumer_cancel_tasks: dict[str, asyncio.Task[None]] = {}  # {"artists": asyncio.Task, ...}
 queues: dict[str, Any] = {}  # {"artists": queue_object, ...}
-CONSUMER_CANCEL_DELAY = int(
-    os.environ.get("CONSUMER_CANCEL_DELAY", "300")
-)  # Default 5 minutes
+CONSUMER_CANCEL_DELAY = int(os.environ.get("CONSUMER_CANCEL_DELAY", "300"))  # Default 5 minutes
 
 # Periodic queue checking settings
 QUEUE_CHECK_INTERVAL = int(
@@ -99,17 +96,11 @@ QUEUE_CHECK_INTERVAL = int(
 )  # Default 1 hour - how often to check for new messages when connection is closed
 
 # Interval for checking stuck state (consumers died unexpectedly)
-STUCK_CHECK_INTERVAL = int(
-    os.environ.get("STUCK_CHECK_INTERVAL", "30")
-)  # Default 30 seconds - how often to check for stuck state
+STUCK_CHECK_INTERVAL = int(os.environ.get("STUCK_CHECK_INTERVAL", "30"))  # Default 30 seconds - how often to check for stuck state
 
 # Idle mode settings - reduce log noise when no messages arrive after startup
-STARTUP_IDLE_TIMEOUT = int(
-    os.environ.get("STARTUP_IDLE_TIMEOUT", "30")
-)  # Seconds after startup with no messages before entering idle mode
-IDLE_LOG_INTERVAL = int(
-    os.environ.get("IDLE_LOG_INTERVAL", "300")
-)  # 5 min between idle status logs
+STARTUP_IDLE_TIMEOUT = int(os.environ.get("STARTUP_IDLE_TIMEOUT", "30"))  # Seconds after startup with no messages before entering idle mode
+IDLE_LOG_INTERVAL = int(os.environ.get("IDLE_LOG_INTERVAL", "300"))  # 5 min between idle status logs
 
 # Idle mode state
 idle_mode = False
@@ -127,9 +118,7 @@ BATCH_FLUSH_INTERVAL = float(os.environ.get("NEO4J_BATCH_FLUSH_INTERVAL", "5.0")
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
 active_connection: Any = None  # Current active connection
 active_channel: Any = None  # Current active channel
-connection_check_task: asyncio.Task[None] | None = (
-    None  # Background task for periodic queue checks
-)
+connection_check_task: asyncio.Task[None] | None = None  # Background task for periodic queue checks
 
 # Global shutdown flag
 shutdown_requested = False
@@ -206,9 +195,7 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
 
             if data_type in consumer_tags:
                 consumer_tag = consumer_tags[data_type]
-                logger.info(
-                    f"🔧 Canceling consumer for {data_type} after {CONSUMER_CANCEL_DELAY}s grace period"
-                )
+                logger.info(f"🔧 Canceling consumer for {data_type} after {CONSUMER_CANCEL_DELAY}s grace period")
 
                 # Cancel the consumer with nowait to avoid hanging
                 await queue.cancel(consumer_tag, nowait=True)
@@ -225,7 +212,7 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
                 if await check_all_consumers_idle():
                     logger.info("🔧 All consumers idle, closing RabbitMQ connection")
                     await close_rabbitmq_connection()
-        except Exception as e:  # noqa: BLE001 - consumer cancellation is best-effort
+        except Exception as e:
             logger.error(
                 "❌ Failed to cancel consumer",
                 data_type=data_type,
@@ -260,7 +247,7 @@ async def cancel_all_consumers() -> None:
         try:
             await queue.cancel(consumer_tag, nowait=True)
             consumer_tags.pop(data_type, None)
-        except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+        except Exception as e:
             logger.warning(
                 "⚠️ Failed to cancel consumer during shutdown",
                 data_type=data_type,
@@ -278,7 +265,7 @@ async def close_rabbitmq_connection() -> None:
             try:
                 await active_channel.close()
                 logger.info("🔧 Closed RabbitMQ channel - all consumers idle")
-            except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+            except Exception as e:
                 logger.warning("⚠️ Error closing channel", error=str(e))
             active_channel = None
 
@@ -286,14 +273,12 @@ async def close_rabbitmq_connection() -> None:
             try:
                 await active_connection.close()
                 logger.info("🔧 Closed RabbitMQ connection - all consumers idle")
-            except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+            except Exception as e:
                 logger.warning("⚠️ Error closing connection", error=str(e))
             active_connection = None
 
-        logger.info(
-            "✅ RabbitMQ connection closed", check_interval=f"{QUEUE_CHECK_INTERVAL}s"
-        )
-    except Exception as e:  # noqa: BLE001 - best-effort teardown; the connection is being discarded regardless
+        logger.info("✅ RabbitMQ connection closed", check_interval=f"{QUEUE_CHECK_INTERVAL}s")
+    except Exception as e:
         logger.error("❌ Error closing RabbitMQ connection", error=str(e))
 
 
@@ -342,8 +327,7 @@ async def periodic_queue_checker() -> None:
             # Check for stuck state (consumers died but work remains)
             if await check_consumers_unexpectedly_dead():
                 logger.warning(
-                    "⚠️ Detected stuck state: consumers died but files not completed. "
-                    "Attempting recovery...",
+                    "⚠️ Detected stuck state: consumers died but files not completed. Attempting recovery...",
                     active_consumers=len(consumer_tags),
                     completed_files=list(completed_files),
                     message_counts=message_counts,
@@ -367,7 +351,7 @@ async def periodic_queue_checker() -> None:
         except asyncio.CancelledError:
             logger.info("🛑 Queue checker task cancelled")
             break
-        except Exception as e:  # noqa: BLE001 - long-running loop must survive per-iteration faults
+        except Exception as e:
             logger.error("❌ Error in periodic queue checker", error=str(e))
             # Continue running despite errors
 
@@ -385,10 +369,8 @@ async def _recover_consumers() -> None:
     if active_connection:
         try:
             await active_connection.close()
-        except Exception as e:  # noqa: BLE001 - the connection is already broken; recovery must proceed regardless
-            logger.warning(
-                "⚠️ Error closing broken connection during recovery", error=str(e)
-            )
+        except Exception as e:
+            logger.warning("⚠️ Error closing broken connection during recovery", error=str(e))
         active_connection = None
         active_channel = None
 
@@ -396,7 +378,7 @@ async def _recover_consumers() -> None:
     try:
         temp_connection = await rabbitmq_manager.connect()
         temp_channel = await temp_connection.channel()
-    except Exception as e:  # noqa: BLE001 - recovery must not raise into its caller
+    except Exception as e:
         logger.error("❌ Failed to connect to RabbitMQ for recovery", error=str(e))
         return
 
@@ -407,21 +389,14 @@ async def _recover_consumers() -> None:
             queue_name = catalog_queue_name("graphinator", data_type)
 
             # Use queue.declare with passive=True to get message count without affecting the queue
-            declared_queue = await temp_channel.declare_queue(
-                name=queue_name, passive=True
-            )
+            declared_queue = await temp_channel.declare_queue(name=queue_name, passive=True)
 
             if declared_queue.declaration_result.message_count > 0:
-                queues_with_messages.append(
-                    (data_type, declared_queue.declaration_result.message_count)
-                )
+                queues_with_messages.append((data_type, declared_queue.declaration_result.message_count))
 
         if queues_with_messages:
             total_messages = sum(count for _, count in queues_with_messages)
-            logger.info(
-                f"📬 Found messages in queues, restarting consumers: {queues_with_messages} "
-                f"(total: {total_messages})"
-            )
+            logger.info(f"📬 Found messages in queues, restarting consumers: {queues_with_messages} (total: {total_messages})")
 
             # Re-establish full connection and start consuming
             active_connection = temp_connection
@@ -490,23 +465,16 @@ async def _recover_consumers() -> None:
                 if data_type in queues and data_type not in consumer_tags:
                     handler = HANDLERS.get(data_type)
                     if handler:
-                        consumer_tag = await queues[data_type].consume(
-                            handler, consumer_tag=f"graphinator-{data_type}"
-                        )
+                        consumer_tag = await queues[data_type].consume(handler, consumer_tag=f"graphinator-{data_type}")
                         consumer_tags[data_type] = consumer_tag
                         # Only un-complete a type that actually has a backlog, so
                         # genuinely-finished types stay marked complete.
                         if data_type in pending_counts:
                             completed_files.discard(data_type)
                         last_message_time[data_type] = time.time()
-                        logger.info(
-                            f"✅ Started consumer for {data_type} "
-                            f"(pending: {pending_counts.get(data_type, 0)})"
-                        )
+                        logger.info(f"✅ Started consumer for {data_type} (pending: {pending_counts.get(data_type, 0)})")
 
-            logger.info(
-                f"✅ Recovery complete - consumers restarted: {list(consumer_tags.keys())}"
-            )
+            logger.info(f"✅ Recovery complete - consumers restarted: {list(consumer_tags.keys())}")
             # Clear idle mode since we have active consumers again
             idle_mode = False
             # Don't close temp_connection since we're using it as active_connection
@@ -516,13 +484,13 @@ async def _recover_consumers() -> None:
             await temp_channel.close()
             await temp_connection.close()
 
-    except Exception as e:  # noqa: BLE001 - recovery must not raise into its caller
+    except Exception as e:
         logger.error("❌ Error during consumer recovery", error=str(e))
         # Make sure to close temporary connection on error
         try:
             await temp_channel.close()
             await temp_connection.close()
-        except Exception as close_error:  # noqa: BLE001 - best-effort cleanup inside an error path
+        except Exception as close_error:
             logger.warning(
                 "⚠️ Error closing temporary connection after recovery failure",
                 error=str(close_error),
@@ -609,21 +577,14 @@ async def _sync_extraction_signals(version: str) -> None:
         )
 
 
-async def check_file_completion(
-    data: dict[str, Any], data_type: str, message: AbstractIncomingMessage
-) -> bool:
+async def check_file_completion(data: dict[str, Any], data_type: str, message: AbstractIncomingMessage) -> bool:
     """Check if message is a file completion or extraction completion message."""
     if data.get("type") == "file_complete":
         total_processed = data.get("total_processed", 0)
-        logger.info(
-            f"✅ File processing complete for {data_type}! "
-            f"Total records processed: {total_processed}"
-        )
+        logger.info(f"✅ File processing complete for {data_type}! Total records processed: {total_processed}")
 
         # Flush remaining batches for this data type before cancellation
-        if batch_processor is not None and not await batch_processor.flush_queue(
-            data_type
-        ):
+        if batch_processor is not None and not await batch_processor.flush_queue(data_type):
             # The drain gave up with records still pending (typically a database
             # outage). Marking the file complete here would cancel the consumer
             # and let post-import maintenance run over an incomplete graph while
@@ -655,9 +616,7 @@ async def check_file_completion(
         )
 
         # Flush remaining batches for this data type before cleanup
-        if batch_processor is not None and not await batch_processor.flush_queue(
-            data_type
-        ):
+        if batch_processor is not None and not await batch_processor.flush_queue(data_type):
             # Records are still pending, so this type is NOT complete. Recording
             # the signal would let stub cleanup and stats run over a graph that is
             # still missing rows. Requeue and retry (discogsography-hh7r).
@@ -677,7 +636,7 @@ async def check_file_completion(
             await _sync_extraction_signals(version)
             extraction_complete_signals.add(data_type)
             await _persist_extraction_signals(version, extraction_complete_signals)
-        except Exception as e:  # noqa: BLE001 - a lost latch write must requeue, never ack
+        except Exception as e:
             logger.error(
                 "❌ Failed to persist extraction_complete latch — requeueing the signal",
                 data_type=data_type,
@@ -755,13 +714,8 @@ def start_post_import_maintenance() -> None:
     """
     global post_import_maintenance_task
 
-    if (
-        post_import_maintenance_task is not None
-        and not post_import_maintenance_task.done()
-    ):
-        logger.info(
-            "⏳ Post-import maintenance already running — ignoring duplicate trigger"
-        )
+    if post_import_maintenance_task is not None and not post_import_maintenance_task.done():
+        logger.info("⏳ Post-import maintenance already running — ignoring duplicate trigger")
         return
 
     task = asyncio.create_task(run_post_import_maintenance())
@@ -805,8 +759,7 @@ async def run_post_import_maintenance() -> bool:
             # in-flight batches per type.
             if batch_processor is not None and not await batch_processor.flush_all():
                 logger.error(
-                    "❌ Batch queues did not drain — deferring stub cleanup rather than "
-                    "sweeping while writers are still creating stubs",
+                    "❌ Batch queues did not drain — deferring stub cleanup rather than sweeping while writers are still creating stubs",
                 )
                 maintenance_ok = False
 
@@ -814,26 +767,16 @@ async def run_post_import_maintenance() -> bool:
             # EVERY entity label — not just one type's — because release batches
             # create Artist/Label/Master stubs regardless of which signal arrived
             # last.
-            if (
-                maintenance_ok
-                and graph is not None
-                and not await cleanup_all_stub_nodes()
-            ):
+            if maintenance_ok and graph is not None and not await cleanup_all_stub_nodes():
                 maintenance_ok = False
 
             # All releases are now imported — compute aggregate stats on
             # Genre/Style/Label nodes. Skipped when the queues never drained: the
             # counts would be computed over a graph that is still being written.
-            if (
-                maintenance_ok
-                and graph is not None
-                and not await compute_genre_style_stats()
-            ):
+            if maintenance_ok and graph is not None and not await compute_genre_style_stats():
                 maintenance_ok = False
-        except Exception as e:  # noqa: BLE001 - detached task: log and retry instead of dying silently
-            logger.error(
-                "❌ Post-import maintenance raised", attempt=attempt, error=str(e)
-            )
+        except Exception as e:
+            logger.error("❌ Post-import maintenance raised", attempt=attempt, error=str(e))
             maintenance_ok = False
 
         if maintenance_ok:
@@ -842,8 +785,7 @@ async def run_post_import_maintenance() -> bool:
 
         if attempt == POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS:
             logger.error(
-                "❌ Post-import maintenance failed after every attempt — stub nodes and "
-                "aggregate stats are stale until it is re-run",
+                "❌ Post-import maintenance failed after every attempt — stub nodes and aggregate stats are stale until it is re-run",
                 attempts=attempt,
             )
             return False
@@ -1017,7 +959,7 @@ async def compute_genre_style_stats() -> bool:
                 f"✅ {node_label} stats computed",
                 counters=str(summary.counters),
             )
-    except Exception as e:  # noqa: BLE001 - aggregate stats are advisory; failure must not stop ingestion
+    except Exception as e:
         logger.error(
             "❌ Failed to compute genre/style/label stats",
             error=str(e),
@@ -1238,7 +1180,7 @@ async def cleanup_stub_nodes(data_type: str) -> bool:
                 f"✅ No stub {label} nodes to clean up",
                 data_type=data_type,
             )
-    except Exception as e:  # noqa: BLE001 - stub cleanup is advisory; failure must not stop ingestion
+    except Exception as e:
         logger.error(
             f"❌ Failed to clean up stub {label} nodes",
             data_type=data_type,
@@ -1279,10 +1221,7 @@ async def process_artist(tx: Any, record: dict[str, Any]) -> bool:
         valid_members = [m for m in members if m.get("id")]
         if valid_members:
             await tx.run(
-                "UNWIND $members AS member "
-                "MATCH (a:Artist {id: $artist_id}) "
-                "MERGE (m_a:Artist {id: member.id}) "
-                "MERGE (m_a)-[:MEMBER_OF]->(a)",
+                "UNWIND $members AS member MATCH (a:Artist {id: $artist_id}) MERGE (m_a:Artist {id: member.id}) MERGE (m_a)-[:MEMBER_OF]->(a)",
                 members=valid_members,
                 artist_id=record["id"],
             )
@@ -1293,10 +1232,7 @@ async def process_artist(tx: Any, record: dict[str, Any]) -> bool:
         valid_groups = [g for g in groups if g.get("id")]
         if valid_groups:
             await tx.run(
-                "UNWIND $groups AS group "
-                "MATCH (a:Artist {id: $artist_id}) "
-                "MERGE (g_a:Artist {id: group.id}) "
-                "MERGE (a)-[:MEMBER_OF]->(g_a)",
+                "UNWIND $groups AS group MATCH (a:Artist {id: $artist_id}) MERGE (g_a:Artist {id: group.id}) MERGE (a)-[:MEMBER_OF]->(g_a)",
                 groups=valid_groups,
                 artist_id=record["id"],
             )
@@ -1307,10 +1243,7 @@ async def process_artist(tx: Any, record: dict[str, Any]) -> bool:
         valid_aliases = [a for a in aliases if a.get("id")]
         if valid_aliases:
             await tx.run(
-                "UNWIND $aliases AS alias "
-                "MATCH (a:Artist {id: $artist_id}) "
-                "MERGE (a_a:Artist {id: alias.id}) "
-                "MERGE (a_a)-[:ALIAS_OF]->(a)",
+                "UNWIND $aliases AS alias MATCH (a:Artist {id: $artist_id}) MERGE (a_a:Artist {id: alias.id}) MERGE (a_a)-[:ALIAS_OF]->(a)",
                 aliases=valid_aliases,
                 artist_id=record["id"],
             )
@@ -1320,17 +1253,13 @@ async def process_artist(tx: Any, record: dict[str, Any]) -> bool:
 
 async def process_label(tx: Any, record: dict[str, Any]) -> bool:
     """Process label within a single transaction for atomicity."""
-    existing_result = await tx.run(
-        "MATCH (l:Label {id: $id}) RETURN l.sha256 AS hash", id=record["id"]
-    )
+    existing_result = await tx.run("MATCH (l:Label {id: $id}) RETURN l.sha256 AS hash", id=record["id"])
     existing_record = await existing_result.single()
     if existing_record and existing_record["hash"] == record["sha256"]:
         return False  # No update needed
 
     await tx.run(
-        "MERGE (l:Label {id: $id}) "
-        "ON CREATE SET l.name = $name, l.sha256 = $sha256 "
-        "ON MATCH SET l.name = $name, l.sha256 = $sha256",
+        "MERGE (l:Label {id: $id}) ON CREATE SET l.name = $name, l.sha256 = $sha256 ON MATCH SET l.name = $name, l.sha256 = $sha256",
         id=record["id"],
         name=record.get("name", "Unknown Label"),
         sha256=record["sha256"],
@@ -1340,9 +1269,7 @@ async def process_label(tx: Any, record: dict[str, Any]) -> bool:
     parent: dict[str, Any] | None = record.get("parentLabel")
     if parent and parent.get("id"):
         await tx.run(
-            "MATCH (l:Label {id: $id}) "
-            "MERGE (p_l:Label {id: $p_id}) "
-            "MERGE (l)-[:SUBLABEL_OF]->(p_l)",
+            "MATCH (l:Label {id: $id}) MERGE (p_l:Label {id: $p_id}) MERGE (l)-[:SUBLABEL_OF]->(p_l)",
             id=record["id"],
             p_id=parent["id"],
         )
@@ -1353,10 +1280,7 @@ async def process_label(tx: Any, record: dict[str, Any]) -> bool:
         valid_sublabels = [s for s in sublabels if s.get("id")]
         if valid_sublabels:
             await tx.run(
-                "UNWIND $sublabels AS sublabel "
-                "MATCH (l:Label {id: $label_id}) "
-                "MERGE (s_l:Label {id: sublabel.id}) "
-                "MERGE (s_l)-[:SUBLABEL_OF]->(l)",
+                "UNWIND $sublabels AS sublabel MATCH (l:Label {id: $label_id}) MERGE (s_l:Label {id: sublabel.id}) MERGE (s_l)-[:SUBLABEL_OF]->(l)",
                 sublabels=valid_sublabels,
                 label_id=record["id"],
             )
@@ -1388,9 +1312,7 @@ async def _prune_stale_edges(
     Mirrors Neo4jBatchProcessor._prune_stale_edges.
     """
     await tx.run(
-        f"MATCH (n:{label} {{id: $node_id}})-[rel:{rel_type}]->(t:{target_label}) "
-        f"WHERE NOT t.{target_key} IN $keep "
-        "DELETE rel",
+        f"MATCH (n:{label} {{id: $node_id}})-[rel:{rel_type}]->(t:{target_label}) WHERE NOT t.{target_key} IN $keep DELETE rel",
         node_id=node_id,
         keep=keep,
     )
@@ -1452,10 +1374,7 @@ async def process_master(tx: Any, record: dict[str, Any]) -> bool:
         valid_artists = [a for a in artists if a.get("id")]
         if valid_artists:
             await tx.run(
-                "UNWIND $artists AS artist "
-                "MATCH (m:Master {id: $master_id}) "
-                "MERGE (a_m:Artist {id: artist.id}) "
-                "MERGE (m)-[:BY]->(a_m)",
+                "UNWIND $artists AS artist MATCH (m:Master {id: $master_id}) MERGE (a_m:Artist {id: artist.id}) MERGE (m)-[:BY]->(a_m)",
                 artists=valid_artists,
                 master_id=record["id"],
             )
@@ -1464,10 +1383,7 @@ async def process_master(tx: Any, record: dict[str, Any]) -> bool:
     genres_list: list[str] = record.get("genres", [])
     if genres_list:
         await tx.run(
-            "UNWIND $genres AS genre "
-            "MATCH (m:Master {id: $master_id}) "
-            "MERGE (g:Genre {name: genre.name}) "
-            "MERGE (m)-[:IS]->(g)",
+            "UNWIND $genres AS genre MATCH (m:Master {id: $master_id}) MERGE (g:Genre {name: genre.name}) MERGE (m)-[:IS]->(g)",
             genres=[{"name": genre} for genre in genres_list],
             master_id=record["id"],
         )
@@ -1475,10 +1391,7 @@ async def process_master(tx: Any, record: dict[str, Any]) -> bool:
     styles_list: list[str] = record.get("styles", [])
     if styles_list:
         await tx.run(
-            "UNWIND $styles AS style "
-            "MATCH (m:Master {id: $master_id}) "
-            "MERGE (s:Style {name: style.name}) "
-            "MERGE (m)-[:IS]->(s)",
+            "UNWIND $styles AS style MATCH (m:Master {id: $master_id}) MERGE (s:Style {name: style.name}) MERGE (m)-[:IS]->(s)",
             styles=[{"name": style} for style in styles_list],
             master_id=record["id"],
         )
@@ -1489,13 +1402,8 @@ async def process_master(tx: Any, record: dict[str, Any]) -> bool:
     # Style-[:PART_OF]->Genre edges (discogsography-sy5k).
     if len(genres_list) == 1 and styles_list:
         await tx.run(
-            "UNWIND $genre_style_pairs AS pair "
-            "MERGE (g:Genre {name: pair.genre}) "
-            "MERGE (s:Style {name: pair.style}) "
-            "MERGE (s)-[:PART_OF]->(g)",
-            genre_style_pairs=[
-                {"genre": genres_list[0], "style": style} for style in styles_list
-            ],
+            "UNWIND $genre_style_pairs AS pair MERGE (g:Genre {name: pair.genre}) MERGE (s:Style {name: pair.style}) MERGE (s)-[:PART_OF]->(g)",
+            genre_style_pairs=[{"genre": genres_list[0], "style": style} for style in styles_list],
         )
 
     return True  # Updated successfully
@@ -1511,11 +1419,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
     if existing_record and existing_record["hash"] == record["sha256"]:
         return False  # No update needed
 
-    formats = [
-        f["name"]
-        for f in record.get("formats", [])
-        if isinstance(f, dict) and "name" in f
-    ]
+    formats = [f["name"] for f in record.get("formats", []) if isinstance(f, dict) and "name" in f]
     await tx.run(
         "MERGE (r:Release {id: $id}) "
         "ON CREATE SET r.title = $title, r.year = $year, r.formats = $formats, r.sha256 = $sha256 "
@@ -1581,10 +1485,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         valid_artists = [a for a in artists if a.get("id")]
         if valid_artists:
             await tx.run(
-                "UNWIND $artists AS artist "
-                "MATCH (r:Release {id: $release_id}) "
-                "MERGE (a_r:Artist {id: artist.id}) "
-                "MERGE (r)-[:BY]->(a_r)",
+                "UNWIND $artists AS artist MATCH (r:Release {id: $release_id}) MERGE (a_r:Artist {id: artist.id}) MERGE (r)-[:BY]->(a_r)",
                 artists=valid_artists,
                 release_id=record["id"],
             )
@@ -1595,10 +1496,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         valid_labels = [lbl for lbl in labels if lbl.get("id")]
         if valid_labels:
             await tx.run(
-                "UNWIND $labels AS label "
-                "MATCH (r:Release {id: $release_id}) "
-                "MERGE (l_r:Label {id: label.id}) "
-                "MERGE (r)-[:ON]->(l_r)",
+                "UNWIND $labels AS label MATCH (r:Release {id: $release_id}) MERGE (l_r:Label {id: label.id}) MERGE (r)-[:ON]->(l_r)",
                 labels=valid_labels,
                 release_id=record["id"],
             )
@@ -1607,9 +1505,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
     master_id = record.get("master_id")
     if master_id:
         await tx.run(
-            "MATCH (r:Release {id: $id}) "
-            "MERGE (m_r:Master {id: $m_id}) "
-            "MERGE (r)-[:DERIVED_FROM]->(m_r)",
+            "MATCH (r:Release {id: $id}) MERGE (m_r:Master {id: $m_id}) MERGE (r)-[:DERIVED_FROM]->(m_r)",
             id=record["id"],
             m_id=master_id,
         )
@@ -1618,10 +1514,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
     genres_list: list[str] = record.get("genres", [])
     if genres_list:
         await tx.run(
-            "UNWIND $genres AS genre "
-            "MATCH (r:Release {id: $release_id}) "
-            "MERGE (g:Genre {name: genre.name}) "
-            "MERGE (r)-[:IS]->(g)",
+            "UNWIND $genres AS genre MATCH (r:Release {id: $release_id}) MERGE (g:Genre {name: genre.name}) MERGE (r)-[:IS]->(g)",
             genres=[{"name": genre} for genre in genres_list],
             release_id=record["id"],
         )
@@ -1629,10 +1522,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
     styles_list: list[str] = record.get("styles", [])
     if styles_list:
         await tx.run(
-            "UNWIND $styles AS style "
-            "MATCH (r:Release {id: $release_id}) "
-            "MERGE (s:Style {name: style.name}) "
-            "MERGE (r)-[:IS]->(s)",
+            "UNWIND $styles AS style MATCH (r:Release {id: $release_id}) MERGE (s:Style {name: style.name}) MERGE (r)-[:IS]->(s)",
             styles=[{"name": style} for style in styles_list],
             release_id=record["id"],
         )
@@ -1643,13 +1533,8 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
     # Style-[:PART_OF]->Genre edges (discogsography-sy5k).
     if len(genres_list) == 1 and styles_list:
         await tx.run(
-            "UNWIND $genre_style_pairs AS pair "
-            "MERGE (g:Genre {name: pair.genre}) "
-            "MERGE (s:Style {name: pair.style}) "
-            "MERGE (s)-[:PART_OF]->(g)",
-            genre_style_pairs=[
-                {"genre": genres_list[0], "style": style} for style in styles_list
-            ],
+            "UNWIND $genre_style_pairs AS pair MERGE (g:Genre {name: pair.genre}) MERGE (s:Style {name: pair.style}) MERGE (s)-[:PART_OF]->(g)",
+            genre_style_pairs=[{"genre": genres_list[0], "style": style} for style in styles_list],
         )
 
     # Handle credits (extraartists) — create Person nodes and CREDITED_ON relationships
@@ -1712,9 +1597,7 @@ def make_message_handler(
             # are dead-lettered within a second of a routine restart. Returning
             # without settling lets the connection close requeue them exactly
             # once. See discogsography-lnn4.
-            logger.debug(
-                "🛑 Shutdown requested, leaving message unacked for redelivery"
-            )
+            logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
             return
 
         record_id = "unknown"
@@ -1812,9 +1695,9 @@ def make_message_handler(
             await outage_backoff.wait()
             try:
                 await message.nack(requeue=True)
-            except Exception as nack_error:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+            except Exception as nack_error:
                 logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-        except Exception as e:  # noqa: BLE001 - per-message fault must nack rather than kill the consumer
+        except Exception as e:
             logger.error(
                 f"❌ Failed to process {data_type[:-1]} message",
                 record_id=record_id,
@@ -1822,24 +1705,16 @@ def make_message_handler(
             )
             try:
                 await message.nack(requeue=True)
-            except Exception as nack_error:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+            except Exception as nack_error:
                 logger.warning("⚠️ Failed to nack message", error=str(nack_error))
 
     return handler
 
 
-on_artist_message = make_message_handler(
-    "artists", "name", "Unknown Artist", process_artist
-)
-on_label_message = make_message_handler(
-    "labels", "name", "Unknown Label", process_label
-)
-on_master_message = make_message_handler(
-    "masters", "title", "Unknown Master", process_master
-)
-on_release_message = make_message_handler(
-    "releases", "title", "Unknown Release", process_release
-)
+on_artist_message = make_message_handler("artists", "name", "Unknown Artist", process_artist)
+on_label_message = make_message_handler("labels", "name", "Unknown Label", process_label)
+on_master_message = make_message_handler("masters", "title", "Unknown Master", process_master)
+on_release_message = make_message_handler("releases", "title", "Unknown Release", process_release)
 
 # Handler lookup by data type for consumer registration and recovery
 HANDLERS: dict[str, Any] = {
@@ -1875,16 +1750,11 @@ async def progress_reporter() -> None:
 
         # Idle mode detection: no messages received after STARTUP_IDLE_TIMEOUT
         # Idle mode only suppresses reporting - consumers stay connected
-        if (
-            not idle_mode
-            and total == 0
-            and (current_time - startup_time) >= STARTUP_IDLE_TIMEOUT
-        ):
+        if not idle_mode and total == 0 and (current_time - startup_time) >= STARTUP_IDLE_TIMEOUT:
             idle_mode = True
             last_idle_log = current_time
             logger.info(
-                f"😴 No messages received after {STARTUP_IDLE_TIMEOUT}s, entering idle mode. "
-                "Consumers remain connected, reporting paused.",
+                f"😴 No messages received after {STARTUP_IDLE_TIMEOUT}s, entering idle mode. Consumers remain connected, reporting paused.",
                 startup_idle_timeout=STARTUP_IDLE_TIMEOUT,
             )
             continue
@@ -1905,51 +1775,28 @@ async def progress_reporter() -> None:
         # Check for stalled consumers (skip completed files)
         stalled_consumers = []
         for data_type, last_time in last_message_time.items():
-            if (
-                data_type not in completed_files
-                and last_time > 0
-                and (current_time - last_time) > 120
-            ):  # No messages for 2 minutes
+            if data_type not in completed_files and last_time > 0 and (current_time - last_time) > 120:  # No messages for 2 minutes
                 stalled_consumers.append(data_type)
 
         if stalled_consumers:
-            logger.error(
-                f"⚠️ Stalled consumers detected: {stalled_consumers}. "
-                f"No messages processed for >2 minutes."
-            )
+            logger.error(f"⚠️ Stalled consumers detected: {stalled_consumers}. No messages processed for >2 minutes.")
 
         # Always show progress, even if no messages processed yet
         # Build progress string with completion emojis
         progress_parts = []
         for data_type in ["artists", "labels", "masters", "releases"]:
             emoji = "✅ " if data_type in completed_files else ""
-            progress_parts.append(
-                f"{emoji}{data_type.capitalize()}: {message_counts[data_type]}"
-            )
+            progress_parts.append(f"{emoji}{data_type.capitalize()}: {message_counts[data_type]}")
 
-        logger.info(
-            f"📊 Neo4j Progress: {total} total messages processed "
-            f"({', '.join(progress_parts)})"
-        )
+        logger.info(f"📊 Neo4j Progress: {total} total messages processed ({', '.join(progress_parts)})")
 
         # Log current processing state
         if total == 0:
             logger.info("⏳ Waiting for messages to process...")
-        elif all(
-            current_time - last_time < 5
-            for last_time in last_message_time.values()
-            if last_time > 0
-        ):
+        elif all(current_time - last_time < 5 for last_time in last_message_time.values() if last_time > 0):
             logger.info("✅ All consumers actively processing")
-        elif any(
-            last_time > 0 and 5 < current_time - last_time < 120
-            for last_time in last_message_time.values()
-        ):
-            slow_consumers = [
-                dt
-                for dt, lt in last_message_time.items()
-                if lt > 0 and 5 < current_time - lt < 120
-            ]
+        elif any(last_time > 0 and 5 < current_time - last_time < 120 for last_time in last_message_time.values()):
+            slow_consumers = [dt for dt, lt in last_message_time.items() if lt > 0 and 5 < current_time - lt < 120]
             logger.warning(
                 f"⚠️ Slow consumers detected: {slow_consumers}",
                 slow_consumers=slow_consumers,
@@ -1957,9 +1804,7 @@ async def progress_reporter() -> None:
 
         # Log consumer status
         active_consumers = list(consumer_tags.keys())
-        canceled_consumers = [
-            dt for dt in DATA_TYPES if dt not in consumer_tags and dt in completed_files
-        ]
+        canceled_consumers = [dt for dt in DATA_TYPES if dt not in consumer_tags and dt in completed_files]
 
         if canceled_consumers:
             logger.info(
@@ -1974,15 +1819,7 @@ async def progress_reporter() -> None:
 
 
 async def main() -> None:
-    global \
-        config, \
-        graph, \
-        queues, \
-        rabbitmq_manager, \
-        active_connection, \
-        active_channel, \
-        connection_check_task, \
-        batch_processor
+    global config, graph, queues, rabbitmq_manager, active_connection, active_channel, connection_check_task, batch_processor
 
     # Set up signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -1994,9 +1831,7 @@ async def main() -> None:
     # Add startup delay for dependent services
     startup_delay = int(os.environ.get("STARTUP_DELAY", "5"))
     if startup_delay > 0:
-        logger.info(
-            f"⏳ Waiting {startup_delay} seconds for dependent services to start..."
-        )
+        logger.info(f"⏳ Waiting {startup_delay} seconds for dependent services to start...")
         await asyncio.sleep(startup_delay)
 
     # Start health server
@@ -2041,7 +1876,7 @@ async def main() -> None:
         else:
             logger.info("📝 Using per-message processing (batch mode disabled)")
 
-    except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+    except Exception as e:
         logger.error("❌ Failed to connect to Neo4j", error=str(e))
         return
     # fmt: off
@@ -2077,24 +1912,18 @@ async def main() -> None:
 
     while startup_retry < max_startup_retries and not shutdown_requested:
         try:
-            logger.info(
-                f"🐰 Attempting to connect to RabbitMQ (attempt {startup_retry + 1}/{max_startup_retries})"
-            )
+            logger.info(f"🐰 Attempting to connect to RabbitMQ (attempt {startup_retry + 1}/{max_startup_retries})")
             amqp_connection = await rabbitmq_manager.connect()
             active_connection = amqp_connection
             break
-        except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+        except Exception as e:
             startup_retry += 1
             if startup_retry < max_startup_retries:
                 wait_time = min(30, 5 * startup_retry)  # Exponential backoff up to 30s
-                logger.warning(
-                    f"⚠️ RabbitMQ connection failed: {e}. Retrying in {wait_time} seconds..."
-                )
+                logger.warning(f"⚠️ RabbitMQ connection failed: {e}. Retrying in {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
             else:
-                logger.error(
-                    f"❌ Failed to connect to AMQP broker after {max_startup_retries} attempts: {e}"
-                )
+                logger.error(f"❌ Failed to connect to AMQP broker after {max_startup_retries} attempts: {e}")
                 return
 
     if amqp_connection is None:
@@ -2131,14 +1960,10 @@ async def main() -> None:
             dlq_name = catalog_dead_letter_queue_name("graphinator", data_type)
 
             # Declare fanout exchange (must match extractor)
-            exchange = await channel.declare_exchange(
-                exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False
-            )
+            exchange = await channel.declare_exchange(exchange_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
             # Declare consumer-owned dead-letter exchange
-            dlx_exchange = await channel.declare_exchange(
-                dlx_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False
-            )
+            dlx_exchange = await channel.declare_exchange(dlx_name, AMQP_EXCHANGE_TYPE, durable=True, auto_delete=False)
 
             # Declare DLQ (classic queue for dead letters)
             dlq = await channel.declare_queue(
@@ -2166,9 +1991,7 @@ async def main() -> None:
 
         # Start consumers for all data types
         for data_type, handler in HANDLERS.items():
-            consumer_tags[data_type] = await queues[data_type].consume(
-                handler, consumer_tag=f"graphinator-{data_type}"
-            )
+            consumer_tags[data_type] = await queues[data_type].consume(handler, consumer_tag=f"graphinator-{data_type}")
 
         logger.info(
             f"🚀 Graphinator started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
@@ -2186,9 +2009,7 @@ async def main() -> None:
 
         # Start periodic queue checker task
         connection_check_task = asyncio.create_task(periodic_queue_checker())
-        logger.info(
-            f"🔄 Started periodic queue checker (interval: {QUEUE_CHECK_INTERVAL}s)"
-        )
+        logger.info(f"🔄 Started periodic queue checker (interval: {QUEUE_CHECK_INTERVAL}s)")
 
         try:
             # Create a shutdown event that can be triggered by signal handler
@@ -2232,7 +2053,7 @@ async def main() -> None:
                 try:
                     await batch_processor.flush_all()
                     logger.info("✅ Batch processor flushed and stopped")
-                except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+                except Exception as e:
                     logger.error("❌ Error flushing batch processor", error=str(e))
 
             # Cancel any pending consumer cancellation tasks
@@ -2257,19 +2078,24 @@ async def main() -> None:
                 if graph is not None:
                     await graph.close()
                 logger.info("✅ Async Neo4j driver closed")
-            except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+            except Exception as e:
                 logger.warning("⚠️ Error closing Neo4j driver", error=str(e))
 
         # Stop health server
         health_server.stop()
 
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Run the async service from a console-script entry point."""
     try:
         run(main())
     except KeyboardInterrupt:
         logger.warning("⚠️ Application interrupted")
-    except Exception as e:  # noqa: BLE001 - top-level guard: log and exit cleanly instead of a traceback
+    except Exception as e:
         logger.error("❌ Application error", error=str(e))
     finally:
         logger.info("✅ Graphinator service shutdown complete")
+
+
+if __name__ == "__main__":
+    cli()

@@ -18,6 +18,7 @@ from common.credit_roles import categorize_role
 from common.db_resilience import DatabaseUnavailableError
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 
+
 logger = structlog.get_logger(__name__)
 
 
@@ -34,9 +35,7 @@ class BatchConfig:
     backoff_max: float = 30.0  # Maximum backoff delay (seconds)
     backoff_multiplier: float = 2.0  # Exponential backoff multiplier
     max_flush_retries: int = 5  # Max retries per data type during flush_queue drain
-    max_poison_retries: int = (
-        5  # Consecutive non-transient failures before nacking a poison batch to the DLQ
-    )
+    max_poison_retries: int = 5  # Consecutive non-transient failures before nacking a poison batch to the DLQ
 
 
 @dataclass
@@ -207,7 +206,7 @@ class Neo4jBatchProcessor:
         # Normalize the data
         try:
             normalized_data = normalize_record(data_type, data)
-        except Exception as e:  # noqa: BLE001 - a malformed record must not abort the whole batch
+        except Exception as e:
             logger.error(
                 "❌ Failed to normalize data",
                 data_type=data_type,
@@ -227,10 +226,7 @@ class Neo4jBatchProcessor:
         )
 
         # Check if we should flush (use adaptive batch size)
-        if (
-            len(queue) >= self._effective_batch_size[data_type]
-            or time.time() - self.last_flush[data_type] >= self.config.flush_interval
-        ):
+        if len(queue) >= self._effective_batch_size[data_type] or time.time() - self.last_flush[data_type] >= self.config.flush_interval:
             await self._flush_queue(data_type)
 
         return True
@@ -323,9 +319,7 @@ class Neo4jBatchProcessor:
 
         # Limit concurrent Neo4j operations to prevent pool exhaustion
         if self._flush_semaphore is None:
-            self._flush_semaphore = asyncio.Semaphore(
-                self.config.max_concurrent_flushes
-            )
+            self._flush_semaphore = asyncio.Semaphore(self.config.max_concurrent_flushes)
 
         # Acquire manually (not `async with`) so a cancellation delivered
         # WHILE BLOCKED on the acquire itself — routine under load, since
@@ -393,11 +387,7 @@ class Neo4jBatchProcessor:
                 # Exponential backoff — prevent tight retry loop that worsens pool exhaustion
                 self._transient_failures[data_type] += 1
                 delay = min(
-                    self.config.backoff_initial
-                    * (
-                        self.config.backoff_multiplier
-                        ** (self._transient_failures[data_type] - 1)
-                    ),
+                    self.config.backoff_initial * (self.config.backoff_multiplier ** (self._transient_failures[data_type] - 1)),
                     self.config.backoff_max,
                 )
                 self._backoff_until[data_type] = time.time() + delay
@@ -427,7 +417,7 @@ class Neo4jBatchProcessor:
                 # Messages are back on deque for retry — do NOT nack them
                 return
 
-            except Exception as e:  # noqa: BLE001 - per-batch fault must nack rather than kill the consumer
+            except Exception as e:
                 # A generic (non-transient) error is deterministic — a poison
                 # record (e.g. a data-induced Neo4j ClientError) fails every
                 # retry. Count consecutive failures so the local retry loop is
@@ -435,14 +425,9 @@ class Neo4jBatchProcessor:
                 # retried forever, and once its unacked messages fill the
                 # prefetch window RabbitMQ stops delivering and the consumer is
                 # permanently wedged (never acked, never nacked).
-                self._consecutive_failures[data_type] = (
-                    self._consecutive_failures.get(data_type, 0) + 1
-                )
+                self._consecutive_failures[data_type] = self._consecutive_failures.get(data_type, 0) + 1
 
-                if (
-                    self._consecutive_failures[data_type]
-                    >= self.config.max_poison_retries
-                ):
+                if self._consecutive_failures[data_type] >= self.config.max_poison_retries:
                     # Poison batch: stop re-enqueueing and nack the messages so
                     # the quorum queue's x-delivery-limit / DLX routes the
                     # persistent poison to the DLQ. _flush_queue is the single
@@ -457,10 +442,8 @@ class Neo4jBatchProcessor:
                     for msg in messages:
                         try:
                             await msg.nack_callback()
-                        except Exception as nack_err:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
-                            logger.warning(
-                                "⚠️ Failed to nack message", error=str(nack_err)
-                            )
+                        except Exception as nack_err:
+                            logger.warning("⚠️ Failed to nack message", error=str(nack_err))
                     # Reset per-data-type state so healthy batches behind the
                     # poison resume normal processing.
                     self._consecutive_failures[data_type] = 0
@@ -488,11 +471,7 @@ class Neo4jBatchProcessor:
                 )
                 # Apply backoff to prevent tight retry loop on persistent errors
                 delay = min(
-                    self.config.backoff_initial
-                    * (
-                        self.config.backoff_multiplier
-                        ** (self._consecutive_failures[data_type] - 1)
-                    ),
+                    self.config.backoff_initial * (self.config.backoff_multiplier ** (self._consecutive_failures[data_type] - 1)),
                     self.config.backoff_max,
                 )
                 self._backoff_until[data_type] = time.time() + delay
@@ -511,7 +490,7 @@ class Neo4jBatchProcessor:
                         await msg.nack_callback()
                     else:
                         await msg.ack_callback()
-                except Exception as e:  # noqa: BLE001 - the nack path itself is best-effort; the broker will redeliver
+                except Exception as e:
                     logger.warning("⚠️ Failed to ack/nack message", error=str(e))
 
             self.processed_counts[data_type] += len(messages) - len(nack_indices)
@@ -527,8 +506,7 @@ class Neo4jBatchProcessor:
                 old_size = self._effective_batch_size[data_type]
                 self._effective_batch_size[data_type] = min(
                     self.config.batch_size,
-                    self._effective_batch_size[data_type]
-                    + max(10, self.config.batch_size // 10),
+                    self._effective_batch_size[data_type] + max(10, self.config.batch_size // 10),
                 )
                 if self._effective_batch_size[data_type] != old_size:
                     logger.info(
@@ -542,9 +520,7 @@ class Neo4jBatchProcessor:
                 data_type=data_type,
                 batch_size=len(messages),
                 duration_ms=round(batch_duration * 1000),
-                records_per_sec=round(len(messages) / batch_duration)
-                if batch_duration > 0
-                else 0,
+                records_per_sec=round(len(messages) / batch_duration) if batch_duration > 0 else 0,
                 total_processed=self.processed_counts[data_type],
             )
 
@@ -577,20 +553,14 @@ class Neo4jBatchProcessor:
             existing_hashes: dict[str, str] = {}
             if ids:
                 result = await session.run(
-                    "UNWIND $ids AS id "
-                    "OPTIONAL MATCH (a:Artist {id: id}) "
-                    "RETURN id, a.sha256 AS hash",
+                    "UNWIND $ids AS id OPTIONAL MATCH (a:Artist {id: id}) RETURN id, a.sha256 AS hash",
                     ids=ids,
                 )
                 async for record in result:
                     if record["hash"]:
                         existing_hashes[str(record["id"])] = record["hash"]
 
-            artists_to_process = [
-                a
-                for a in all_artists
-                if existing_hashes.get(str(a["id"])) != a.get("sha256")
-            ]
+            artists_to_process = [a for a in all_artists if existing_hashes.get(str(a["id"])) != a.get("sha256")]
 
             if not artists_to_process:
                 logger.debug("🔄 All artists in batch already up to date")
@@ -710,20 +680,14 @@ class Neo4jBatchProcessor:
             existing_hashes: dict[str, str] = {}
             if ids:
                 result = await session.run(
-                    "UNWIND $ids AS id "
-                    "OPTIONAL MATCH (l:Label {id: id}) "
-                    "RETURN id, l.sha256 AS hash",
+                    "UNWIND $ids AS id OPTIONAL MATCH (l:Label {id: id}) RETURN id, l.sha256 AS hash",
                     ids=ids,
                 )
                 async for record in result:
                     if record["hash"]:
                         existing_hashes[str(record["id"])] = record["hash"]
 
-            labels_to_process = [
-                label
-                for label in all_labels
-                if existing_hashes.get(str(label["id"])) != label.get("sha256")
-            ]
+            labels_to_process = [label for label in all_labels if existing_hashes.get(str(label["id"])) != label.get("sha256")]
 
             if not labels_to_process:
                 logger.debug("🔄 All labels in batch already up to date")
@@ -816,9 +780,7 @@ class Neo4jBatchProcessor:
         Records whose new version asserts NO edges of the type are included too: that is
         precisely the "all associations removed" case.
         """
-        prune_data = [
-            {"key": record["id"], "keep": desired(record)} for record in records
-        ]
+        prune_data = [{"key": record["id"], "keep": desired(record)} for record in records]
         if not prune_data:
             return
 
@@ -861,20 +823,14 @@ class Neo4jBatchProcessor:
             existing_hashes: dict[str, str] = {}
             if ids:
                 result = await session.run(
-                    "UNWIND $ids AS id "
-                    "OPTIONAL MATCH (m:Master {id: id}) "
-                    "RETURN id, m.sha256 AS hash",
+                    "UNWIND $ids AS id OPTIONAL MATCH (m:Master {id: id}) RETURN id, m.sha256 AS hash",
                     ids=ids,
                 )
                 async for record in result:
                     if record["hash"]:
                         existing_hashes[str(record["id"])] = record["hash"]
 
-            masters_to_process = [
-                m
-                for m in all_masters
-                if existing_hashes.get(str(m["id"])) != m.get("sha256")
-            ]
+            masters_to_process = [m for m in all_masters if existing_hashes.get(str(m["id"])) != m.get("sha256")]
 
             if not masters_to_process:
                 logger.debug("🔄 All masters in batch already up to date")
@@ -904,9 +860,7 @@ class Neo4jBatchProcessor:
                     rel_type="BY",
                     target_label="Artist",
                     target_key="id",
-                    desired=lambda m: [
-                        a["id"] for a in (m.get("artists") or []) if a.get("id")
-                    ],
+                    desired=lambda m: [a["id"] for a in (m.get("artists") or []) if a.get("id")],
                 )
                 await self._prune_stale_edges(
                     tx,
@@ -1056,9 +1010,7 @@ class Neo4jBatchProcessor:
             existing_hashes: dict[str, str] = {}
             if ids:
                 result = await session.run(
-                    "UNWIND $ids AS id "
-                    "OPTIONAL MATCH (r:Release {id: id}) "
-                    "RETURN id, r.sha256 AS hash",
+                    "UNWIND $ids AS id OPTIONAL MATCH (r:Release {id: id}) RETURN id, r.sha256 AS hash",
                     ids=ids,
                 )
                 async for record in result:
@@ -1073,27 +1025,15 @@ class Neo4jBatchProcessor:
                     # Build a copy to avoid mutating the PendingMessage in case
                     # of re-enqueue on Neo4j failure
                     release_data = dict(msg.data)
-                    release_data["format_names"] = [
-                        f["name"]
-                        for f in msg.data.get("formats", [])
-                        if isinstance(f, dict) and "name" in f
-                    ]
+                    release_data["format_names"] = [f["name"] for f in msg.data.get("formats", []) if isinstance(f, dict) and "name" in f]
                     # Per-release metadata bag — populated only with non-null
                     # keys. The cypher uses `SET r += release.metadata`, which
                     # merges only the keys present, so absent fields don't wipe
                     # an existing value (in Neo4j, SET k = null deletes the
                     # property). Future per-release fields just add a key here.
                     raw_labels = msg.data.get("labels") or []
-                    first_label = (
-                        raw_labels[0]
-                        if isinstance(raw_labels, list) and raw_labels
-                        else {}
-                    )
-                    catno = (
-                        first_label.get("catno")
-                        if isinstance(first_label, dict)
-                        else None
-                    )
+                    first_label = raw_labels[0] if isinstance(raw_labels, list) and raw_labels else {}
+                    catno = first_label.get("catno") if isinstance(first_label, dict) else None
                     release_metadata: dict[str, Any] = {}
                     if catno:
                         release_metadata["catalog_number"] = catno
@@ -1136,9 +1076,7 @@ class Neo4jBatchProcessor:
                     rel_type="BY",
                     target_label="Artist",
                     target_key="id",
-                    desired=lambda r: [
-                        a["id"] for a in (r.get("artists") or []) if a.get("id")
-                    ],
+                    desired=lambda r: [a["id"] for a in (r.get("artists") or []) if a.get("id")],
                 )
                 await self._prune_stale_edges(
                     tx,
@@ -1147,9 +1085,7 @@ class Neo4jBatchProcessor:
                     rel_type="ON",
                     target_label="Label",
                     target_key="id",
-                    desired=lambda r: [
-                        x["id"] for x in (r.get("labels") or []) if x.get("id")
-                    ],
+                    desired=lambda r: [x["id"] for x in (r.get("labels") or []) if x.get("id")],
                 )
                 await self._prune_stale_edges(
                     tx,
@@ -1158,9 +1094,7 @@ class Neo4jBatchProcessor:
                     rel_type="DERIVED_FROM",
                     target_label="Master",
                     target_key="id",
-                    desired=lambda r: (
-                        [str(r["master_id"])] if r.get("master_id") else []
-                    ),
+                    desired=lambda r: [str(r["master_id"])] if r.get("master_id") else [],
                 )
                 await self._prune_stale_edges(
                     tx,
@@ -1447,11 +1381,7 @@ class Neo4jBatchProcessor:
             await asyncio.sleep(self.config.flush_interval)
 
             for data_type, queue in self.queues.items():
-                if (
-                    queue
-                    and time.time() - self.last_flush[data_type]
-                    >= self.config.flush_interval
-                ):
+                if queue and time.time() - self.last_flush[data_type] >= self.config.flush_interval:
                     await self._flush_queue(data_type)
 
     def shutdown(self) -> None:
