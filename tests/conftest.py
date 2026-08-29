@@ -195,6 +195,12 @@ def reset_post_import_maintenance_task() -> Iterator[None]:
 
     g.post_import_maintenance_task = None
     g.maintenance_tasks = set()
+    yield
+    task = g.post_import_maintenance_task
+    if task is not None and not task.done():
+        task.cancel()
+    g.post_import_maintenance_task = None
+    g.maintenance_tasks = set()
 
 
 @pytest.fixture(autouse=True)
@@ -222,9 +228,3 @@ def in_memory_extraction_latch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(g, "_load_extraction_signals", load)
     monkeypatch.setattr(g, "_persist_extraction_signals", persist)
     monkeypatch.setattr(g, "extraction_complete_version", None)
-    yield
-    task = g.post_import_maintenance_task
-    if task is not None and not task.done():
-        task.cancel()
-    g.post_import_maintenance_task = None
-    g.maintenance_tasks = set()

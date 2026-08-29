@@ -23,7 +23,7 @@ ARG BUILD_DATE
 ARG BUILD_VERSION=0.1.0
 ARG VCS_REF
 
-LABEL org.opencontainers.image.title="GrooveMap Discogs graph enricher" \
+LABEL org.opencontainers.image.title="discogs-graph-enricher" \
       org.opencontainers.image.description="Construct the GrooveMap Neo4j knowledge graph from Discogs catalog events" \
       org.opencontainers.image.authors="Robert Wlodarczyk <robert@simplicityguy.com>" \
       org.opencontainers.image.url="https://groovemap.music" \

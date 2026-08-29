@@ -1,4 +1,8 @@
-# Graphinator Service
+# GrooveMap Discogs graph enricher service
+
+This package is the Neo4j graph loader owned by `discogs-graph-enricher`. See the
+repository [documentation index](../docs/README.md) for resilience, completion, indexing,
+and performance guidance.
 
 Consumes Discogs data from AMQP queues and stores it in a Neo4j graph database, creating rich relationships between music entities.
 
@@ -28,11 +32,11 @@ Environment variables:
 # Neo4j connection
 NEO4J_HOST=neo4j
 NEO4J_USERNAME=neo4j
-NEO4J_PASSWORD=discogsography
+NEO4J_PASSWORD=groovemap
 
 # RabbitMQ (also supports _FILE variants for Docker secrets)
-RABBITMQ_USERNAME=discogsography
-RABBITMQ_PASSWORD=discogsography
+RABBITMQ_USERNAME=groovemap
+RABBITMQ_PASSWORD=groovemap
 RABBITMQ_HOST=rabbitmq              # Default: rabbitmq
 RABBITMQ_PORT=5672                  # Default: 5672
 
@@ -91,7 +95,7 @@ NEO4J_BATCH_FLUSH_INTERVAL=1.0
 NEO4J_BATCH_MODE=false
 ```
 
-See the [Configuration Guide](../docs/configuration.md#batch-processing-configuration) for detailed tuning guidance.
+See the [performance guide](../docs/performance-guide.md) for detailed tuning guidance.
 
 ## Graph Data Model
 
