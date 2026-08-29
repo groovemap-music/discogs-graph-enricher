@@ -1,11 +1,12 @@
-# Database Resilience Documentation
+# Neo4j and RabbitMQ resilience
 
-This document describes the database resilience features implemented in the GrooveMap platform to handle nightly
-maintenance windows and other database outages.
+This document describes how `discogs-graph-enricher` handles Neo4j maintenance,
+RabbitMQ interruptions, and shutdown without losing or prematurely settling catalog
+events.
 
 ## Overview
 
-All services now use resilient database connections that automatically handle:
+The service uses resilient connections that automatically handle:
 
 - Nightly database maintenance windows
 - Temporary network issues
@@ -43,13 +44,6 @@ jitter: 25%              # Random jitter to prevent thundering herd
 
 ### 3. Connection Health Monitoring
 
-#### PostgreSQL
-
-- Connection pool with 2-20 connections
-- Health checks every 30 seconds
-- Automatic removal of unhealthy connections
-- Maintains minimum connection pool size
-
 #### Neo4j
 
 - Driver-level connection pooling (max 50 connections)
@@ -75,46 +69,12 @@ During database outages:
 
 ## Service-Specific Implementation
 
-### Python Services
-
-- Uses `ResilientRabbitMQConnection` for publishing
-- Buffers messages during connection issues
-- Retries failed publishes with backoff
-- Flushes pending messages on recovery
-
-### Graphinator Service (Neo4j)
+### discogs-graph-enricher
 
 - Uses `ResilientNeo4jDriver` with automatic reconnection
 - Handles `ServiceUnavailable` and `SessionExpired` exceptions
 - Requeues messages on connection failures
 - Removed reactive 2-minute reconnection timer (now proactive)
-
-### Tableinator Service (PostgreSQL)
-
-- Uses `ResilientPostgreSQLPool` with health monitoring
-- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](../graphinator/README.md#configuration))
-- Handles `InterfaceError` and `OperationalError`
-- Automatic connection recycling
-
-### Dashboard Service
-
-- Uses all three resilient connection types
-- Async implementations for non-blocking operations
-- Graceful degradation when services unavailable
-
-### Brainzgraphinator Service (Neo4j)
-
-- Uses `ResilientNeo4jDriver` with automatic reconnection
-- Enriches existing Neo4j nodes with MusicBrainz metadata
-- Handles `ServiceUnavailable` and `SessionExpired` exceptions
-- Requeues messages on connection failures
-
-### Brainztableinator Service (PostgreSQL)
-
-- Uses `ResilientPostgreSQLPool` with health monitoring
-- Stores MusicBrainz data in `musicbrainz` PostgreSQL schema
-- Connection pool with min/max bounds (2-12 by default; see `POSTGRES_POOL_MIN_SIZE` / `POSTGRES_POOL_MAX_SIZE` in [Configuration Guide](../graphinator/README.md#configuration)); RabbitMQ prefetch (channel-global QoS) is coupled to the pool max instead of using batch flushing
-- Handles `InterfaceError` and `OperationalError`
 
 ## Configuration
 
@@ -127,12 +87,6 @@ No changes required to existing environment variables. The resilient connections
 NEO4J_HOST=neo4j
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=password
-
-# PostgreSQL
-POSTGRES_HOST=postgres
-POSTGRES_DATABASE=groovemap
-POSTGRES_USERNAME=postgres
-POSTGRES_PASSWORD=postgres
 
 # RabbitMQ
 RABBITMQ_HOST=rabbitmq
@@ -153,11 +107,6 @@ recovery_timeout = 30  # Seconds before recovery attempt
 max_retries = 5  # Maximum connection attempts
 initial_delay = 1.0  # Initial retry delay
 max_delay = 60.0  # Maximum retry delay
-
-# Connection Pools
-postgres_min_connections = 2
-postgres_max_connections = 20
-postgres_health_check_interval = 30
 
 # Neo4j Settings
 neo4j_max_connection_lifetime = 1800  # 30 minutes
@@ -181,17 +130,9 @@ When databases undergo nightly maintenance:
 
 ### Health Endpoints
 
-Each service exposes health data including connection status:
-
-- Extractor: `http://localhost:8000/health`
-- Graphinator: `http://localhost:8001/health`
-- Tableinator: `http://localhost:8002/health`
-- Dashboard: `http://localhost:8003/health`
-- API: `http://localhost:8005/health`
-- Explore: `http://localhost:8007/health`
-- Insights: `http://localhost:8009/health`
-- Brainztableinator: `http://localhost:8010/health`
-- Brainzgraphinator: `http://localhost:8011/health`
+`discogs-graph-enricher` exposes health data at `http://localhost:8001/health`.
+The response identifies the service as `discogs-graph-enricher` and includes active
+consumers, completed files, message counts, and current work.
 
 ### Logging
 
@@ -218,14 +159,8 @@ To test the resilience features:
 ### 1. Stop a Database
 
 ```bash
-# Stop Neo4j
-docker-compose stop neo4j
-
-# Stop PostgreSQL
-docker-compose stop postgres
-
-# Stop RabbitMQ
-docker-compose stop rabbitmq
+# Use the deployment repository to stop Neo4j or RabbitMQ in a disposable stack.
+# Then observe the service health endpoint and structured log.
 ```
 
 ### 2. Observe Service Behavior
@@ -233,17 +168,13 @@ docker-compose stop rabbitmq
 Watch the logs to see connection failures and circuit breaker activation:
 
 ```bash
-docker-compose logs -f graphinator
-docker-compose logs -f tableinator
+tail -f /logs/discogs-graph-enricher.log
 ```
 
 ### 3. Restart Database
 
 ```bash
-# Restart the stopped service
-docker-compose start neo4j
-docker-compose start postgres
-docker-compose start rabbitmq
+# Restart the stopped dependency with the deployment repository's compose command.
 ```
 
 ### 4. Verify Recovery
@@ -268,7 +199,7 @@ If services don't recover after database restart:
 
 1. Check circuit breaker state in logs
 1. Verify database is fully started and accepting connections
-1. Restart affected service if needed: `docker-compose restart [service]`
+1. Restart `discogs-graph-enricher` through the deployment repository if needed
 
 ### Messages Not Processing
 

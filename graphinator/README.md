@@ -1,20 +1,36 @@
-# GrooveMap Discogs graph enricher service
+# discogs-graph-enricher service reference
 
-This package is the Neo4j graph loader owned by `discogs-graph-enricher`. See the
-repository [documentation index](../docs/README.md) for resilience, completion, indexing,
-and performance guidance.
+This package contains the GrooveMap Neo4j consumer owned by
+`groovemap-music/discogs-graph-enricher`. `graphinator` remains the Python import
+package and is not the deployed service or image name. See the repository
+[documentation index](../docs/README.md) for resilience, completion, indexing, and
+performance guidance.
 
-Consumes Discogs data from AMQP queues and stores it in a Neo4j graph database, creating rich relationships between music entities.
+It consumes versioned Discogs catalog events from RabbitMQ and stores their music
+entities and relationships in Neo4j.
 
 ## Overview
 
-The graphinator service:
+The `discogs-graph-enricher` service:
 
 - Consumes parsed Discogs data from RabbitMQ queues
 - Creates nodes and relationships in Neo4j graph database
 - Models complex music industry relationships
 - Implements efficient batch processing
 - Provides deduplication using SHA256 hashes
+
+```mermaid
+flowchart TD
+    Q1[artists queue] --> C[discogs-graph-enricher]
+    Q2[labels queue] --> C
+    Q3[masters queue] --> C
+    Q4[releases queue] --> C
+    C --> B[bounded per-type batches]
+    B --> N[(Neo4j)]
+    X[extraction_complete] --> D[drain and maintenance]
+    D --> B
+    D --> N
+```
 
 ## Architecture
 
@@ -145,7 +161,7 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 ### Relationship Types
 
-#### Created by Graphinator
+#### Created by discogs-graph-enricher
 
 - `BY` - Release or Master performed by an artist
 - `ON` - Release on a label
@@ -227,37 +243,35 @@ After graph import of releases, the graphinator runs `compute_genre_style_stats(
 
 ## Development
 
-### Running Locally
+### Running locally
 
 ```bash
-# Install dependencies
-uv sync --extra graphinator
-
-# Run the graphinator
-uv run python graphinator/graphinator.py
+mise install
+just setup
+uv run discogs-graph-enricher
 ```
 
 ### Running Tests
 
 ```bash
-# Run graphinator tests
-uv run pytest tests/graphinator/ -v
+# Run the repository checks
+just check
 
 # Run specific test
-uv run pytest tests/graphinator/test_graphinator.py -v
+uv run pytest tests/test_graphinator.py -v
 ```
 
 ## Docker
 
-Build and run with Docker:
+Build and inspect the repository-owned image:
 
 ```bash
-# Build
-docker build -f graphinator/Dockerfile .
-
-# Run with docker-compose
-docker-compose up graphinator
+just image
+docker image inspect discogs-graph-enricher:local
 ```
+
+The release image is `ghcr.io/groovemap-music/discogs-graph-enricher`. Runtime
+composition is owned by the `deployment` repository.
 
 ## Neo4j Queries
 
@@ -288,7 +302,7 @@ RETURN r.title, r.year, r.formats
 ## Monitoring
 
 - Health endpoint at `http://localhost:8001/health`
-- Structured JSON logging with visual emoji prefixes
+- Structured JSON logging in `/logs/discogs-graph-enricher.log`
 - Transaction metrics and timing
 - Error tracking with detailed messages
 
@@ -296,5 +310,7 @@ RETURN r.title, r.year, r.formats
 
 - Graceful handling of malformed messages
 - Transaction rollback on failures
-- Message requeuing on processing errors
+- Transient database failures use bounded retry and safe re-enqueue behavior
+- Poison records are isolated from healthy batch records
+- Shutdown cancels consumers before unsettled deliveries can be requeued
 - Comprehensive exception logging
