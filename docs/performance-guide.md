@@ -5,7 +5,9 @@
 ## Overview
 
 Processing 20+ million music records requires careful attention to performance. This guide covers optimization
-strategies, bottleneck identification, and performance tuning across all services.
+strategies, bottleneck identification, and performance tuning for
+`discogs-graph-enricher`. Cross-service measurements are retained where they explain
+the producer, broker, or database boundary.
 
 ### Performance Optimization Flow
 
@@ -255,18 +257,13 @@ The extractor publishes to 4 fanout exchanges (one per data type). Each consumer
 
 #### Batch Processing (Implemented)
 
-**Graphinator and Tableinator** now include built-in batch processing for optimal write performance:
+`discogs-graph-enricher` uses bounded batches for Neo4j writes:
 
 ```python
 # Configured via environment variables (enabled by default)
-# Code defaults shown; docker-compose.yml overrides to 500/2.0 for production
 NEO4J_BATCH_MODE = true  # Enable batch processing
-NEO4J_BATCH_SIZE = 500  # Records per batch (docker-compose default)
-NEO4J_BATCH_FLUSH_INTERVAL = 2.0  # Seconds between flushes (docker-compose default)
-
-POSTGRES_BATCH_MODE = true  # Enable batch processing
-POSTGRES_BATCH_SIZE = 500  # Records per batch (docker-compose default)
-POSTGRES_BATCH_FLUSH_INTERVAL = 2.0  # Seconds between flushes (docker-compose default)
+NEO4J_BATCH_SIZE = 100  # Records per batch
+NEO4J_BATCH_FLUSH_INTERVAL = 5.0  # Seconds between flushes
 ```
 
 **How it works:**
@@ -289,20 +286,14 @@ POSTGRES_BATCH_FLUSH_INTERVAL = 2.0  # Seconds between flushes (docker-compose d
 # Initial data load (maximize throughput)
 NEO4J_BATCH_SIZE=500
 NEO4J_BATCH_FLUSH_INTERVAL=10.0
-POSTGRES_BATCH_SIZE=500
-POSTGRES_BATCH_FLUSH_INTERVAL=10.0
 
 # Real-time updates (minimize latency)
 NEO4J_BATCH_SIZE=10
 NEO4J_BATCH_FLUSH_INTERVAL=1.0
-POSTGRES_BATCH_SIZE=10
-POSTGRES_BATCH_FLUSH_INTERVAL=1.0
 
-# Balanced (docker-compose default - good for most use cases)
-NEO4J_BATCH_SIZE=500
-NEO4J_BATCH_FLUSH_INTERVAL=2.0
-POSTGRES_BATCH_SIZE=500
-POSTGRES_BATCH_FLUSH_INTERVAL=2.0
+# Balanced defaults
+NEO4J_BATCH_SIZE=100
+NEO4J_BATCH_FLUSH_INTERVAL=5.0
 ```
 
 See [Configuration Guide](../graphinator/README.md#configuration) for complete details.
@@ -581,21 +572,11 @@ net.ipv4.tcp_fin_timeout = 15
 fs.file-max = 2097152
 ```
 
-### Docker Resource Limits
+### Container resource limits
 
-```yaml
-# docker-compose.yml
-services:
-  extractor:
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: 4G
-        reservations:
-          cpus: '1.0'
-          memory: 2G
-```
+The `deployment` repository owns runtime CPU and memory limits. Size them from measured
+batch throughput and Neo4j transaction-memory use; this repository deliberately does
+not duplicate deployment composition.
 
 ### Database Tuning
 

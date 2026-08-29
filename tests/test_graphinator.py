@@ -630,7 +630,7 @@ class TestGetHealthData:
             result = get_health_data()
 
             assert result["status"] == "healthy"
-            assert result["service"] == "graphinator"
+            assert result["service"] == "discogs-graph-enricher"
             # Should show "Processing artists" because it has recent activity (5 seconds ago)
             assert result["current_task"] == "Processing artists"
             assert result["progress"] == 0.75
@@ -651,7 +651,7 @@ class TestGetHealthData:
             result = get_health_data()
 
             assert result["status"] == "starting"
-            assert result["service"] == "graphinator"
+            assert result["service"] == "discogs-graph-enricher"
             assert result["current_task"] == "Initializing Neo4j connection"
 
     def test_health_data_unhealthy_when_graph_lost(self) -> None:
@@ -669,7 +669,7 @@ class TestGetHealthData:
             result = get_health_data()
 
             assert result["status"] == "unhealthy"
-            assert result["service"] == "graphinator"
+            assert result["service"] == "discogs-graph-enricher"
 
     def test_idle_status_with_active_consumers(self) -> None:
         """Test health data shows idle status when consumers active but no recent messages."""
