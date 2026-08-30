@@ -8,15 +8,18 @@ import asyncio
 import os
 import time
 from collections import deque
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from common import normalize_record
 from common.credit_roles import categorize_role
 from common.db_resilience import DatabaseUnavailableError
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 logger = structlog.get_logger(__name__)
