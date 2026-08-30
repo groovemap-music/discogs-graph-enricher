@@ -40,7 +40,7 @@ class AsyncIteratorMock:
         self.items = items
         self.index = 0
 
-    def __aiter__(self) -> "AsyncIteratorMock":
+    def __aiter__(self) -> AsyncIteratorMock:
         """Return self as the async iterator."""
         return self
 

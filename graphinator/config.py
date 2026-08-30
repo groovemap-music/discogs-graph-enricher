@@ -17,7 +17,7 @@ class GraphinatorConfig:
     neo4j_password: str = field(repr=False)
 
     @classmethod
-    def from_env(cls) -> "GraphinatorConfig":
+    def from_env(cls) -> GraphinatorConfig:
         """Create configuration from environment variables."""
         neo4j_username = get_secret("NEO4J_USERNAME")
         neo4j_password = get_secret("NEO4J_PASSWORD")
