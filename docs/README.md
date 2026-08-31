@@ -15,8 +15,8 @@ the Neo4j knowledge graph.
 
 - [Performance guide](performance-guide.md)
 - [Query performance optimization record](query-performance-optimizations.md)
-- [Source-history provenance](extraction.md)
-- [Historical plans](superpowers/plans/) and [design specifications](superpowers/specs/)
+- [Release compliance](release-compliance.md)
+- [History rewrite approval gate](history-rewrite-gate.md)
 
-Historical design records preserve old component and issue identifiers when those names
-are required to trace a regression. They do not define the current service identity.
+Private planning records are preserved exclusively in the private `planning-archive`
+repository. They are not active service documentation and must not be copied here.
