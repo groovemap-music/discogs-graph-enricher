@@ -4593,13 +4593,13 @@ class TestStubCleanupBatchAndOrdering:
                 return summary
 
         class _Session:
-            async def __aenter__(self) -> "_Session":
+            async def __aenter__(self) -> _Session:
                 return self
 
             async def __aexit__(self, *args: Any) -> None:
                 return None
 
-            async def run(self, cypher: str, *_args: Any, **_kwargs: Any) -> "_Result":
+            async def run(self, cypher: str, *_args: Any, **_kwargs: Any) -> _Result:
                 run_calls.append(cypher)
                 if fail:
                     raise RuntimeError("transaction memory limit exceeded")
@@ -4790,13 +4790,13 @@ class TestMaintenanceUnderMemoryPressure:
                 return summary
 
         class _Session:
-            async def __aenter__(self) -> "_Session":
+            async def __aenter__(self) -> _Session:
                 return self
 
             async def __aexit__(self, *args: Any) -> None:
                 return None
 
-            async def run(self, cypher: str, *_args: Any, **_kwargs: Any) -> "_Result":
+            async def run(self, cypher: str, *_args: Any, **_kwargs: Any) -> _Result:
                 run_calls.append(cypher)
                 attempts["n"] += 1
                 if attempts["n"] <= fail_times:
@@ -4880,7 +4880,7 @@ class TestMaintenanceUnderMemoryPressure:
         run_calls: list[str] = []
 
         class _Session:
-            async def __aenter__(self) -> "_Session":
+            async def __aenter__(self) -> _Session:
                 return self
 
             async def __aexit__(self, *args: Any) -> None:

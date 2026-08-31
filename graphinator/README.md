@@ -34,7 +34,7 @@ flowchart TD
 
 ## Architecture
 
-- **Language**: Python 3.13+
+- **Language**: Python 3.14
 - **Database**: Neo4j 2026 (calendar versioning)
 - **Message Broker**: RabbitMQ 4.x (quorum queues)
 - **Health Port**: 8001

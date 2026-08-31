@@ -1,12 +1,15 @@
 """Pytest configuration for graphinator tests."""
 
-from collections.abc import Iterator
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractQueue
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
 
 
 @pytest.fixture

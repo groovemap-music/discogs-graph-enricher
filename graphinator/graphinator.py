@@ -6,10 +6,9 @@ import time
 from asyncio import run
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
-from aio_pika.abc import AbstractIncomingMessage
 from common import (
     AsyncResilientNeo4jDriver,
     AsyncResilientRabbitMQ,
@@ -42,6 +41,10 @@ from graphinator.catalog_contract import (
     queue_name as catalog_queue_name,
 )
 from graphinator.config import GraphinatorConfig
+
+
+if TYPE_CHECKING:
+    from aio_pika.abc import AbstractIncomingMessage
 
 
 logger = structlog.get_logger(__name__)
