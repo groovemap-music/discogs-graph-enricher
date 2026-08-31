@@ -1,4 +1,4 @@
-# File Completion Tracking
+# File and extraction completion
 
 <div align="center">
 
@@ -12,9 +12,9 @@ Last Updated: March 2026
 
 ## Overview
 
-The file completion tracking system ensures accurate monitoring of file processing status across the GrooveMap
-platform. It prevents false warnings about stalled extractors and coordinates with the consumer cancellation feature for
-optimal resource management.
+The service tracks Discogs file and extraction completion so that consumers drain in a
+defined order, post-import maintenance runs once, and health data does not report
+completed queues as stalled.
 
 ## How It Works
 
@@ -42,7 +42,7 @@ graph LR
 
 When a file finishes processing:
 
-1. **Extractor** sends a `file_complete` message with:
+1. **`catalog-ingestion`** sends a `file_complete` message with:
 
    - `type`: "file_complete"
    - `data_type`: The type of data (artists, labels, masters, releases)
@@ -50,18 +50,19 @@ When a file finishes processing:
    - `total_processed`: Number of records processed
    - `file`: Original filename
 
-1. **Extractor** adds the data type to `completed_files` set
+1. **`catalog-ingestion`** marks the data type complete upstream.
 
-1. **Consumers** (graphinator, tableinator, brainzgraphinator, brainztableinator) receive the message and:
+1. **`discogs-graph-enricher`** receives the message and:
 
    - Mark the file as complete (🎉 in logs)
    - Schedule consumer cancellation after grace period
 
 ### 2a. Extraction Completion
 
-After **all** files finish processing, the extractor sends an `extraction_complete` message to all 4 fanout exchanges for the active source (Discogs or MusicBrainz):
+After **all** Discogs files finish processing, `catalog-ingestion` sends an
+`extraction_complete` message to all four Discogs fanout exchanges:
 
-1. **Extractor** builds an `extraction_complete` message with:
+1. **`catalog-ingestion`** builds an `extraction_complete` message with:
 
    - `type`: "extraction_complete"
    - `version`: The Discogs data version (e.g., "20260301")
@@ -69,10 +70,12 @@ After **all** files finish processing, the extractor sends an `extraction_comple
    - `started_at`: When the extraction began (used for stale row detection)
    - `record_counts`: Per-type record counts
 
-1. **Consumers** receive the message on each queue and perform post-extraction cleanup:
+1. **`discogs-graph-enricher`** receives the message on each queue, durably records
+   the completion signal in Neo4j, and waits until all four signals name the same
+   extraction version.
 
-   - **Graphinator**: Flushes remaining batches, then deletes stub nodes without a `sha256` property (skeleton nodes created by cross-type MERGE operations)
-   - **Tableinator**: Flushes remaining batches, then purges rows where `updated_at < started_at` (stale rows from prior extractions)
+1. It then flushes remaining batches, deletes unresolved stub nodes without a `sha256`
+   property, and recomputes aggregate graph statistics.
 
 This ensures database counts match the extractor's record counts after each run.
 
@@ -86,9 +89,9 @@ The extractors' progress monitoring:
 
 ## Implementation Details
 
-### Extractor Changes
+### Producer behavior
 
-The Rust extractor tracks completed files to prevent false stall warnings:
+`catalog-ingestion` tracks completed files to prevent false stall warnings:
 
 - Maintains a `completed_files` set
 - Marks each data type as complete after sending the file completion message
@@ -125,7 +128,7 @@ No additional configuration needed - the feature works automatically with existi
 
 ### Log Messages to Watch
 
-**Extractor**:
+**`catalog-ingestion`**:
 
 - `✅ Sent file completion message for {type}` - File marked complete
 - `✅ Completed file types: [...]` - Shows all completed files
@@ -136,8 +139,7 @@ No additional configuration needed - the feature works automatically with existi
 - `🎉 File processing complete for {type}!` - File completion received
 - `🔧 Canceling consumer for {type}` - Cancellation scheduled
 - `🏁 Received extraction_complete signal` - Extraction complete received
-- `🧹 Cleaned up N stub {Label} nodes` - Graphinator stub node cleanup
-- `🧹 Purged N stale {type} rows` - Tableinator stale row purge
+- `🧹 Cleaned up N stub {Label} nodes` - Neo4j stub-node cleanup
 
 ## Troubleshooting
 
@@ -161,14 +163,7 @@ files complete in the new session.
 Test the feature:
 
 ```bash
-# Start services
-docker-compose up -d
-
-# Watch logs for completion tracking
-docker-compose logs -f extractor-discogs extractor-musicbrainz | grep -E "(Completed file types|Stalled extractors)"
-
-# Force a quick test with small files
-# Files will complete quickly and should not show as stalled
+uv run pytest tests/test_file_completion.py tests/test_extraction_latch_durable.py
 ```
 
 ## Technical Architecture
@@ -182,16 +177,16 @@ docker-compose logs -f extractor-discogs extractor-musicbrainz | grep -E "(Compl
 
 ### Integration Points
 
-1. **Extractor → RabbitMQ**: Sends `file_complete` per data type
-1. **Extractor → RabbitMQ**: Sends `extraction_complete` to all exchanges after all files finish
-1. **Extractor Internal**: Updates completion tracking
-1. **Consumers → RabbitMQ**: Cancel queue consumers
-1. **Consumers → Database**: Post-extraction cleanup (stub nodes / stale rows)
-1. **Progress Reporter**: Excludes completed files
+1. **`catalog-ingestion` → RabbitMQ**: Sends `file_complete` per data type
+1. **`catalog-ingestion` → RabbitMQ**: Sends `extraction_complete` after all files finish
+1. **`discogs-graph-enricher` → RabbitMQ**: Cancels completed queue consumers
+1. **`discogs-graph-enricher` → Neo4j**: Persists the completion latch and performs
+   post-extraction cleanup
+1. **Health reporting**: Excludes completed files from stalled-consumer detection
 
 ## Future Enhancements
 
-- [ ] Persist completion state across restarts
+- [x] Persist extraction-completion signals in Neo4j across restarts
 - [ ] Add completion timestamps to progress reports
 - [ ] Create completion metrics for monitoring
 - [ ] Add file-level (not just type-level) tracking

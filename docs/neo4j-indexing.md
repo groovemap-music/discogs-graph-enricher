@@ -2,7 +2,9 @@
 
 ## Overview
 
-This document describes the Neo4j indexing strategy for the API service to optimize query performance. Indexes are automatically created during service startup.
+This document records the Neo4j indexes that support the graph written by
+`discogs-graph-enricher`. Schema initialization is owned by the `database-schema`
+repository; this consumer relies on that schema while loading catalog data.
 
 > 📖 For detailed analysis of how these indexes support query optimization, see the [Query Performance Optimizations](query-performance-optimizations.md) report.
 
@@ -94,7 +96,8 @@ ORDER BY r.year
 
 #### MusicBrainz MBID Indexes
 
-Used by **brainzgraphinator** for efficient lookups when enriching existing nodes with MusicBrainz metadata.
+These cross-service properties are used by `musicbrainz-graph-enricher` for efficient
+lookups when enriching nodes originally written by this service.
 
 | Index Name     | Label   | Properties | Use Case                                  |
 | -------------- | ------- | ---------- | ------------------------------------------ |

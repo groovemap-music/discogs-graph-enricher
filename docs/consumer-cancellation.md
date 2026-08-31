@@ -1,4 +1,4 @@
-# Consumer Cancellation Feature
+# Consumer cancellation and draining
 
 <div align="center">
 
@@ -10,8 +10,9 @@ Last Updated: March 2026
 
 ## Overview
 
-The consumer cancellation feature automatically closes RabbitMQ queue consumers after files have completed processing.
-This helps free up resources and provides clearer monitoring of active vs. completed file processing.
+`discogs-graph-enricher` cancels each RabbitMQ consumer after its Discogs file has
+completed processing. This frees broker resources while leaving other queues available
+to finish and makes active versus completed work explicit in health data and logs.
 
 ## How It Works
 
@@ -19,9 +20,9 @@ This helps free up resources and provides clearer monitoring of active vs. compl
 
 ```mermaid
 sequenceDiagram
-    participant EXT as Extractor
+    participant EXT as catalog-ingestion
     participant RMQ as RabbitMQ
-    participant CONS as Consumer<br/>(Graphinator/Tableinator/<br/>Brainzgraphinator/Brainztableinator)
+    participant CONS as discogs-graph-enricher
     participant TIMER as Cancellation Timer
 
     EXT->>RMQ: Publish file_complete to fanout exchange
@@ -46,7 +47,8 @@ sequenceDiagram
 
 ### Process Steps
 
-1. When the Python/Rust extractor sends a "file_complete" message, all consumers (graphinator, tableinator, brainzgraphinator, brainztableinator):
+1. When `catalog-ingestion` sends a `file_complete` message,
+   `discogs-graph-enricher`:
 
    - Mark the file as complete (shows 🎉 in progress reports)
    - Schedule the consumer for that queue to be canceled after a grace period
@@ -76,18 +78,11 @@ sequenceDiagram
 ### Examples
 
 ```bash
-# Use default 5-minute delay
-docker-compose up
-
-# Use 30-second delay for faster testing
-CONSUMER_CANCEL_DELAY=30 docker-compose up
+# Start the service entry point with a short grace period
+CONSUMER_CANCEL_DELAY=30 uv run discogs-graph-enricher
 
 # Disable consumer cancellation
-CONSUMER_CANCEL_DELAY=0 docker-compose up
-
-# Different delays per service
-CONSUMER_CANCEL_DELAY=60 docker-compose up tableinator
-CONSUMER_CANCEL_DELAY=120 docker-compose up graphinator
+CONSUMER_CANCEL_DELAY=0 uv run discogs-graph-enricher
 ```
 
 ## Monitoring
@@ -113,16 +108,12 @@ Watch for these log messages:
 
 ## Testing
 
-Use the provided test scripts:
+Run the focused regression tests:
 
 1. **test_file_completion.py** - Tests the file completion message handling
 
 ```bash
-# Run with short delay for testing
-CONSUMER_CANCEL_DELAY=10 docker-compose up -d tableinator graphinator
-
-# Watch the logs
-docker-compose logs -f tableinator graphinator
+uv run pytest tests/test_file_completion.py tests/test_shutdown_delivery_churn.py
 ```
 
 ## Edge Cases Handled
@@ -139,9 +130,9 @@ docker-compose logs -f tableinator graphinator
 - Cancellation tasks are tracked to allow proper cleanup on shutdown
 - The `nowait=True` parameter prevents hanging if RabbitMQ is slow to respond
 
-## Extractor Integration
+## catalog-ingestion integration
 
-The Rust extractor integrates with consumer cancellation by:
+The upstream `catalog-ingestion` service integrates with consumer cancellation by:
 
 1. **Sending File Completion Messages**: When a file finishes processing, the extractor sends a
    "file_complete" message
@@ -153,10 +144,12 @@ and their consumers have been canceled.
 
 ### Extraction Completion Signal (March 2026)
 
-After all files finish, the extractor sends an `extraction_complete` message to all fanout exchanges for the active source. Consumers use this signal to:
+After all files finish, `catalog-ingestion` sends an `extraction_complete` message to
+all Discogs fanout exchanges. `discogs-graph-enricher` uses this signal to:
 
 - **Flush remaining batches** before cleanup
-- **Graphinator**: Delete stub Neo4j nodes (no `sha256` property) created by cross-type MERGE operations
-- **Tableinator**: Purge stale PostgreSQL rows where `updated_at < started_at`
+- Delete stub Neo4j nodes (no `sha256` property) created by cross-type `MERGE`
+  operations
+- Recompute the aggregate properties consumed by graph-query services
 
 This ensures database record counts match extractor counts after each run. See [File Completion Tracking](file-completion-tracking.md) and [Database Schema — Post-Extraction Cleanup](https://github.com/groovemap-music/database-schema) for details.

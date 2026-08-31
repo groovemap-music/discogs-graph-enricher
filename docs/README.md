@@ -1,10 +1,22 @@
-# Discogs graph enricher documentation
+# discogs-graph-enricher documentation
 
-- [Consumer cancellation and draining](consumer-cancellation.md)
-- [File completion tracking](file-completion-tracking.md)
-- [Database resilience](database-resilience.md)
+These documents describe the GrooveMap service that turns Discogs catalog events into
+the Neo4j knowledge graph.
+
+## Runtime contracts
+
+- [Service configuration and graph model](../graphinator/README.md)
+- [Consumer cancellation and drain behavior](consumer-cancellation.md)
+- [File and extraction completion](file-completion-tracking.md)
+- [Neo4j and RabbitMQ resilience](database-resilience.md)
 - [Neo4j indexing](neo4j-indexing.md)
-- [Performance](performance-guide.md)
-- [Query performance optimizations](query-performance-optimizations.md)
-- [Source-history provenance](extraction.md)
-- [Plans](superpowers/plans/) and [design specifications](superpowers/specs/)
+
+## Performance and provenance
+
+- [Performance guide](performance-guide.md)
+- [Query performance optimization record](query-performance-optimizations.md)
+- [Release compliance](release-compliance.md)
+- [History rewrite approval gate](history-rewrite-gate.md)
+
+Private planning records are preserved exclusively in the private `planning-archive`
+repository. They are not active service documentation and must not be copied here.

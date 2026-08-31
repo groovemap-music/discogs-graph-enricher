@@ -1,4 +1,4 @@
-"""Graph enricher configuration owned by the graphinator service."""
+"""Configuration for the GrooveMap discogs-graph-enricher service."""
 
 from dataclasses import dataclass, field
 from os import getenv

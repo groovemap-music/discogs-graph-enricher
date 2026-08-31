@@ -49,13 +49,15 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+SERVICE_NAME = "discogs-graph-enricher"
+
 STARTUP_BANNER = r"""
     _ _                                            _                    _    _
  __| (_)___ __ ___  __ _ ______ __ _ _ _ __ _ _ __| |_ ___ ___ _ _  _ _(_)__| |_  ___ _ _
 / _` | (_-</ _/ _ \/ _` (_-<___/ _` | '_/ _` | '_ \ ' \___/ -_) ' \| '_| / _| ' \/ -_) '_|
 \__,_|_/__/\__\___/\__, /__/   \__, |_| \__,_| .__/_||_|  \___|_||_|_| |_\__|_||_\___|_|
                    |___/       |___/         |_|
-                                  discogs-graph-enricher
+                           GrooveMap / discogs-graph-enricher
 """.strip("\n")
 
 # Config will be initialized in main
@@ -71,7 +73,7 @@ completed_files: set[str] = set()  # Track which files have completed processing
 # outage cannot burn the quorum queue's x-delivery-limit budget and dead-letter
 # valid records. Batch mode gets the same protection from _flush_queue's
 # re-enqueue+backoff, which never nacks (discogsography-rb05).
-outage_backoff = OutageBackoff("graphinator")
+outage_backoff = OutageBackoff(SERVICE_NAME)
 # Track which data types have delivered an extraction_complete signal. Stub
 # cleanup and aggregate stats are deferred until EVERY type has signalled, so
 # cross-type stub creation (release batches MERGE Artist/Label/Master stubs)
@@ -180,7 +182,7 @@ def get_health_data() -> dict[str, Any]:
 
     return {
         "status": status,
-        "service": "graphinator",
+        "service": SERVICE_NAME,
         "current_task": active_task,
         "progress": current_progress,
         "message_counts": message_counts.copy(),
@@ -477,7 +479,7 @@ async def _recover_consumers() -> None:
                 if data_type in queues and data_type not in consumer_tags:
                     handler = HANDLERS.get(data_type)
                     if handler:
-                        consumer_tag = await queues[data_type].consume(handler, consumer_tag=f"graphinator-{data_type}")
+                        consumer_tag = await queues[data_type].consume(handler, consumer_tag=f"{SERVICE_NAME}-{data_type}")
                         consumer_tags[data_type] = consumer_tag
                         # Only un-complete a type that actually has a backlog, so
                         # genuinely-finished types stay marked complete.
@@ -1837,8 +1839,8 @@ async def main() -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    setup_logging("graphinator", log_file=Path("/logs/graphinator.log"))
-    logger.info("🚀 Starting Neo4j graphinator service")
+    setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
+    logger.info("🚀 Starting GrooveMap discogs-graph-enricher service")
 
     # Add startup delay for dependent services
     startup_delay = int(os.environ.get("STARTUP_DELAY", "5"))
@@ -1936,7 +1938,7 @@ async def main() -> None:
         # QoS is deliberately per-consumer (aio-pika's global_=False default) so each
         # data type can fill its own batch; the resulting channel-wide ceiling is
         # prefetch_count x len(DATA_TYPES) and is logged so the multiplier is explicit
-        # rather than silent (discogsography-4fio). Unlike tableinator's non-batch mode,
+        # rather than silent (discogsography-4fio). Unlike the Discogs SQL loader's non-batch mode,
         # graphinator writes through the Neo4j driver's own pool, so there is no small
         # fixed connection budget to couple the prefetch to.
         prefetch_count = max(200, BATCH_SIZE * 2) if BATCH_MODE else 200
@@ -1988,10 +1990,10 @@ async def main() -> None:
 
         # Start consumers for all data types
         for data_type, handler in HANDLERS.items():
-            consumer_tags[data_type] = await queues[data_type].consume(handler, consumer_tag=f"graphinator-{data_type}")
+            consumer_tags[data_type] = await queues[data_type].consume(handler, consumer_tag=f"{SERVICE_NAME}-{data_type}")
 
         logger.info(
-            f"🚀 Graphinator started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
+            f"🚀 GrooveMap {SERVICE_NAME} started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
             f"Consuming from {len(DATA_TYPES)} queues. "
             "Ready to process messages into Neo4j. Press CTRL+C to exit"
         )
@@ -2091,7 +2093,7 @@ def cli() -> None:
     except Exception as e:
         logger.error("❌ Application error", error=str(e))
     finally:
-        logger.info("✅ Graphinator service shutdown complete")
+        logger.info("✅ GrooveMap discogs-graph-enricher shutdown complete")
 
 
 if __name__ == "__main__":
