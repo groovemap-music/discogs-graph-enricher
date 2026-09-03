@@ -17,6 +17,8 @@ from common.credit_roles import categorize_role
 from common.db_resilience import DatabaseUnavailableError
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 
+from graphinator import telemetry as gm_telemetry
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -417,6 +419,12 @@ class Neo4jBatchProcessor:
                         transient_failures=self._transient_failures[data_type],
                     )
 
+                gm_telemetry.record_batch_flush(
+                    gm_telemetry.entity_for(data_type),
+                    "failed",
+                    len(messages),
+                    time.time() - batch_start,
+                )
                 # Messages are back on deque for retry — do NOT nack them
                 return
 
@@ -453,6 +461,12 @@ class Neo4jBatchProcessor:
                     self._transient_failures[data_type] = 0
                     self._backoff_until[data_type] = 0.0
                     self._effective_batch_size[data_type] = self.config.batch_size
+                    gm_telemetry.record_batch_flush(
+                        gm_telemetry.entity_for(data_type),
+                        "failed",
+                        len(messages),
+                        time.time() - batch_start,
+                    )
                     return
 
                 logger.error(
@@ -478,6 +492,12 @@ class Neo4jBatchProcessor:
                     self.config.backoff_max,
                 )
                 self._backoff_until[data_type] = time.time() + delay
+                gm_telemetry.record_batch_flush(
+                    gm_telemetry.entity_for(data_type),
+                    "failed",
+                    len(messages),
+                    time.time() - batch_start,
+                )
                 # Messages are back on deque for retry — do NOT nack them
                 return
         finally:
@@ -486,6 +506,12 @@ class Neo4jBatchProcessor:
         batch_duration = time.time() - batch_start
 
         if success:
+            gm_telemetry.record_batch_flush(
+                gm_telemetry.entity_for(data_type),
+                "processed",
+                len(messages),
+                batch_duration,
+            )
             # Ack processed messages, nack invalid ones (e.g. missing 'id')
             for i, msg in enumerate(messages):
                 try:
