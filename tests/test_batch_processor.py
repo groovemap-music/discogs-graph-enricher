@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import (
     BatchConfig,
     Neo4jBatchProcessor,
@@ -2497,3 +2498,75 @@ class TestDrainWaitsForInFlight:
         assert await asyncio.wait_for(drain, timeout=1.0) is True
         await asyncio.wait_for(in_flight_flush, timeout=1.0)
         assert completed == ["write"], "the write must complete before the drain returns"
+
+
+class TestBatchFlushTelemetry:
+    """groovemap.pipeline.batch.size / groovemap.pipeline.batch.flush.duration, recorded once
+    per flush attempt from _flush_queue_locked (the batch-mode counterpart of the per-message
+    handler's groovemap.pipeline.messages — see test_graphinator.py::TestTelemetry).
+    """
+
+    @pytest.mark.asyncio
+    async def test_successful_flush_records_processed_with_batch_size(self, collector: Any) -> None:
+        mock_driver, _mock_session = create_async_session_mock()
+        processor = Neo4jBatchProcessor(mock_driver)
+
+        processor.queues["artists"].append(PendingMessage("artists", {"id": "1", "name": "A", "sha256": "h1"}, AsyncMock(), AsyncMock()))
+        processor.queues["artists"].append(PendingMessage("artists", {"id": "2", "name": "B", "sha256": "h2"}, AsyncMock(), AsyncMock()))
+
+        await processor._flush_queue("artists")
+
+        [attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)
+        assert attrs == {"store": "neo4j", "entity": "artist", "outcome": "processed"}
+        [point] = collector.points(gm_telemetry.PIPELINE_BATCH_SIZE)
+        assert point.sum == 2
+
+        [duration_attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_FLUSH_DURATION)
+        assert duration_attrs == {"store": "neo4j", "entity": "artist", "outcome": "processed"}
+
+    @pytest.mark.asyncio
+    async def test_transient_neo4j_outage_records_failed(self, collector: Any) -> None:
+        from neo4j.exceptions import ServiceUnavailable
+
+        mock_driver, mock_session = create_async_session_mock()
+        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
+
+        processor = Neo4jBatchProcessor(mock_driver)
+        processor.queues["releases"].append(PendingMessage("releases", {"id": "1", "title": "R", "sha256": "h1"}, AsyncMock(), AsyncMock()))
+
+        await processor._flush_queue("releases")
+
+        [attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)
+        assert attrs == {"store": "neo4j", "entity": "release", "outcome": "failed"}
+        [point] = collector.points(gm_telemetry.PIPELINE_BATCH_SIZE)
+        assert point.sum == 1
+
+    @pytest.mark.asyncio
+    async def test_bounded_local_retry_records_failed(self, collector: Any) -> None:
+        mock_driver, mock_session = create_async_session_mock()
+        mock_session.execute_write.side_effect = RuntimeError("Database error")
+
+        processor = Neo4jBatchProcessor(mock_driver)
+        processor.queues["labels"].append(PendingMessage("labels", {"id": "1", "name": "L", "sha256": "h1"}, AsyncMock(), AsyncMock()))
+
+        await processor._flush_queue("labels")
+
+        [attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)
+        assert attrs == {"store": "neo4j", "entity": "label", "outcome": "failed"}
+
+    @pytest.mark.asyncio
+    async def test_poison_batch_records_failed(self, collector: Any) -> None:
+        """The DLQ-bound poison path (max_poison_retries exhausted) is also `failed`: the
+        batch never durably wrote to Neo4j, regardless of why the write loop stopped retrying.
+        """
+        mock_driver = MagicMock()
+        config = BatchConfig(batch_size=5, max_poison_retries=1, backoff_initial=0.0, min_batch_size=1)
+        processor = Neo4jBatchProcessor(mock_driver, config)
+        processor._process_artists_batch = AsyncMock(side_effect=ValueError("data-induced ClientError"))  # type: ignore[method-assign]
+        processor.queues["artists"].append(PendingMessage("artists", {"id": "1", "name": "x", "sha256": "h"}, AsyncMock(), AsyncMock()))
+
+        await processor._flush_queue("artists")
+
+        outcomes = [attrs["outcome"] for attrs in collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)]
+        assert outcomes == ["failed"]
+        assert not processor.queues["artists"], "the poison batch must still be nacked to the DLQ"

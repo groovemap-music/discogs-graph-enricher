@@ -68,6 +68,14 @@ IDLE_LOG_INTERVAL=300               # Seconds between idle status logs (default:
 # Logging
 LOG_LEVEL=INFO                      # Logging level (default: INFO)
 
+# OpenTelemetry metrics (standard OTEL vars only — no GrooveMap-specific ones)
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318  # Unset disables export (default: unset)
+OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=                # Metrics-only endpoint override (default: falls back to OTEL_EXPORTER_OTLP_ENDPOINT)
+OTEL_METRICS_EXPORTER=otlp                          # otlp or none (default: otlp)
+OTEL_METRIC_EXPORT_INTERVAL=15000                   # Push interval in milliseconds (default: SDK default, 60000)
+OTEL_SERVICE_NAME=graphinator                        # Overrides the service.name resource attribute (default: graphinator)
+OTEL_RESOURCE_ATTRIBUTES=service.namespace=groovemap,deployment.environment.name=dev  # Extra resource attributes (default: empty)
+
 # Batch Processing (Enabled by Default)
 NEO4J_BATCH_MODE=true               # Enable batch processing (default: true)
 NEO4J_BATCH_SIZE=100                # Records per batch (default: 100)
@@ -303,8 +311,48 @@ RETURN r.title, r.year, r.formats
 
 - Health endpoint at `http://localhost:8001/health`
 - Structured JSON logging in `/logs/discogs-graph-enricher.log`
-- Transaction metrics and timing
+- OpenTelemetry metrics pushed to a collector (see below); no `/metrics` scrape route
 - Error tracking with detailed messages
+
+### OpenTelemetry metrics
+
+The service calls `common.telemetry.setup_telemetry("graphinator")` right after
+`setup_logging` and `shutdown_telemetry()` on shutdown. With `OTEL_EXPORTER_OTLP_ENDPOINT`
+unset (the default), telemetry installs a no-op provider and the service behaves exactly as
+it would without the `otel` extra — nothing is recorded, nothing is exported, startup is
+unaffected. Metrics are pushed over OTLP/HTTP-protobuf; the service exposes no Prometheus
+scrape endpoint (the health server's `/metrics` route stays disabled).
+
+Domain instruments, recorded from the per-message handler (non-batch mode) and the batch
+processor (`NEO4J_BATCH_MODE=true`, the default):
+
+| Metric | Instrument | Attributes | Recorded by |
+| --- | --- | --- | --- |
+| `groovemap.pipeline.messages` | counter | `source=discogs`, `entity`, `outcome=processed\|skipped\|failed` | the per-message handler |
+| `groovemap.pipeline.message.duration` | histogram, s | `source`, `entity` | the per-message handler |
+| `groovemap.pipeline.batch.size` | histogram, `{items}` | `store=neo4j`, `entity`, `outcome=processed\|failed` | `Neo4jBatchProcessor._flush_queue_locked` |
+| `groovemap.pipeline.batch.flush.duration` | histogram, s | `store`, `entity`, `outcome` | `Neo4jBatchProcessor._flush_queue_locked` |
+| `groovemap.pipeline.consumers.active` | up-down counter | `source=discogs` | consumer start/stop across `main`, `_recover_consumers`, `cancel_all_consumers`, and `schedule_consumer_cancellation` |
+
+`entity` is one of `artist`, `label`, `master`, `release`.
+
+Two more instruments are recorded locally because this service acks/nacks RabbitMQ
+deliveries itself instead of going through `common.rabbitmq_resilient.process_message_with_retry`:
+
+| Metric | Attributes |
+| --- | --- |
+| `messaging.client.consumed.messages` | `messaging.system=rabbitmq`, `messaging.destination.name`, `messaging.operation.name=process`, `error.type` on failure |
+
+Everything else in the shared runtime conventions comes from the `groovemap-runtime`
+wrappers already in use once telemetry is configured — no code here calls them directly:
+
+| Metric | Emitted by |
+| --- | --- |
+| `db.client.operation.duration` | `AsyncResilientNeo4jDriver.session()`, on every `graph.session(...)` use |
+| `groovemap.pipeline.reconnects` | `AsyncResilientRabbitMQ`, on each RabbitMQ reconnect |
+
+See [`docs/observability.md`](https://github.com/groovemap-music/deployment/blob/main/docs/observability.md)
+in the `deployment` repository for the full cross-service metric catalog and dashboards.
 
 ## Error Handling
 

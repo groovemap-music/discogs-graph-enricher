@@ -20,9 +20,11 @@ from common import (
 )
 from common.credit_roles import categorize_role
 from common.db_resilience import DatabaseUnavailableError
+from common.telemetry import setup_telemetry, shutdown_telemetry
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from orjson import loads
 
+from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor
 from graphinator.catalog_contract import (
     AMQP_EXCHANGE_TYPE,
@@ -50,6 +52,10 @@ if TYPE_CHECKING:
 logger = structlog.get_logger(__name__)
 
 SERVICE_NAME = "discogs-graph-enricher"
+
+# service.name default for setup_telemetry(): the docker-compose service key, not the
+# distribution/repo name above. OTEL_SERVICE_NAME overrides this in every environment.
+TELEMETRY_SERVICE_NAME = "graphinator"
 
 STARTUP_BANNER = r"""
     _ _                                            _                    _    _
@@ -216,6 +222,7 @@ async def schedule_consumer_cancellation(data_type: str, queue: Any) -> None:
 
                 # Remove from tracking
                 del consumer_tags[data_type]
+                gm_telemetry.record_consumer_stopped()
 
                 logger.info(
                     "✅ Consumer successfully canceled",
@@ -257,10 +264,12 @@ async def cancel_all_consumers() -> None:
         queue = queues.get(data_type)
         if queue is None:
             consumer_tags.pop(data_type, None)
+            gm_telemetry.record_consumer_stopped()
             continue
         try:
             await queue.cancel(consumer_tag, nowait=True)
             consumer_tags.pop(data_type, None)
+            gm_telemetry.record_consumer_stopped()
         except Exception as e:
             logger.warning(
                 "⚠️ Failed to cancel consumer during shutdown",
@@ -481,6 +490,7 @@ async def _recover_consumers() -> None:
                     if handler:
                         consumer_tag = await queues[data_type].consume(handler, consumer_tag=f"{SERVICE_NAME}-{data_type}")
                         consumer_tags[data_type] = consumer_tag
+                        gm_telemetry.record_consumer_started()
                         # Only un-complete a type that actually has a backlog, so
                         # genuinely-finished types stay marked complete.
                         if data_type in pending_counts:
@@ -516,6 +526,8 @@ async def _recover_consumers() -> None:
         # died with the now-closed connection. Leaving them behind would keep
         # len(consumer_tags) > 0 forever, permanently gating off both recovery
         # routes (stuck-check requires 0 tags) while health still reads healthy.
+        for _ in consumer_tags:
+            gm_telemetry.record_consumer_stopped()
         consumer_tags.clear()
 
 
@@ -1602,6 +1614,8 @@ def make_message_handler(
 ) -> Any:
     """Create a RabbitMQ message handler for the given data type."""
 
+    entity = gm_telemetry.entity_for(data_type)
+
     async def handler(message: AbstractIncomingMessage) -> None:
         if shutdown_requested:
             # Leave the delivery UNACKED — never nack(requeue=True) here. The
@@ -1615,6 +1629,14 @@ def make_message_handler(
             return
 
         record_id = "unknown"
+        # messaging.client.consumed.messages normally comes from
+        # common.rabbitmq_resilient.process_message_with_retry — this service acks/nacks
+        # directly instead, so it is recorded locally in the `finally` below, once per
+        # delivery regardless of which branch handled it (mirrors that wrapper: `error_type`
+        # stays None unless this handler itself raised or rejected the record).
+        destination = gm_telemetry.consumed_destination(message)
+        consumed_error_type: str | None = None
+        started = time.perf_counter()
         try:
             logger.debug("🔄 Received message", data_type=data_type[:-1])
             record: dict[str, Any] = loads(message.body)
@@ -1641,6 +1663,10 @@ def make_message_handler(
                     # Messages nacked later by _process_*_batch (e.g. missing 'id') are included.
                     message_counts[data_type] += 1
                     last_message_time[data_type] = time.time()
+                # groovemap.pipeline.messages is not recorded here: in batch mode the
+                # per-record outcome (processed/skipped/failed) is only known once the batch
+                # is flushed, so Neo4jBatchProcessor records groovemap.pipeline.batch.* for
+                # this data instead.
                 return
 
             record = normalize_record(data_type, record)
@@ -1651,6 +1677,8 @@ def make_message_handler(
             # sets id=None when the raw message lacks an id field.
             if not record.get("id"):
                 logger.error("❌ Message missing 'id' field", data_type=data_type)
+                consumed_error_type = "MissingIdError"
+                gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
                 await message.nack(requeue=False)
                 return
 
@@ -1682,6 +1710,7 @@ def make_message_handler(
 
             message_counts[data_type] += 1
             last_message_time[data_type] = time.time()
+            gm_telemetry.record_message(entity, "processed" if updated else "skipped", time.perf_counter() - started)
             if message_counts[data_type] % progress_interval == 0:
                 logger.info(
                     f"📊 Processed {data_type} in Neo4j",
@@ -1699,6 +1728,8 @@ def make_message_handler(
                     record_id=record_id,
                 )
         except (ServiceUnavailable, SessionExpired, DatabaseUnavailableError) as e:
+            consumed_error_type = type(e).__name__
+            gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
             logger.warning(
                 f"⚠️ Neo4j unavailable, will retry {data_type[:-1]} message",
                 error=str(e),
@@ -1712,6 +1743,8 @@ def make_message_handler(
             except Exception as nack_error:
                 logger.warning("⚠️ Failed to nack message", error=str(nack_error))
         except Exception as e:
+            consumed_error_type = type(e).__name__
+            gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
             logger.error(
                 f"❌ Failed to process {data_type[:-1]} message",
                 record_id=record_id,
@@ -1721,6 +1754,8 @@ def make_message_handler(
                 await message.nack(requeue=True)
             except Exception as nack_error:
                 logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+        finally:
+            gm_telemetry.record_consumed_message(destination, consumed_error_type)
 
     return handler
 
@@ -1840,6 +1875,7 @@ async def main() -> None:
     signal.signal(signal.SIGTERM, signal_handler)
 
     setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
+    setup_telemetry(TELEMETRY_SERVICE_NAME)
     logger.info("🚀 Starting GrooveMap discogs-graph-enricher service")
 
     # Add startup delay for dependent services
@@ -1991,6 +2027,7 @@ async def main() -> None:
         # Start consumers for all data types
         for data_type, handler in HANDLERS.items():
             consumer_tags[data_type] = await queues[data_type].consume(handler, consumer_tag=f"{SERVICE_NAME}-{data_type}")
+            gm_telemetry.record_consumer_started()
 
         logger.info(
             f"🚀 GrooveMap {SERVICE_NAME} started! Connected to AMQP broker ({len(DATA_TYPES)} fanout exchanges). "
@@ -2093,6 +2130,11 @@ def cli() -> None:
     except Exception as e:
         logger.error("❌ Application error", error=str(e))
     finally:
+        # Called here rather than inside main(): main() has several early `return`s (config
+        # error, Neo4j/AMQP connection failure) that exit before its own try/finally block, so
+        # this is the one place reached on every shutdown path. shutdown_telemetry() is a plain
+        # synchronous call (safe outside the closed event loop) and never raises.
+        shutdown_telemetry()
         logger.info("✅ GrooveMap discogs-graph-enricher shutdown complete")
 
 

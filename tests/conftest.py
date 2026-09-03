@@ -1,15 +1,96 @@
-"""Pytest configuration for graphinator tests."""
+"""Pytest configuration for graphinator tests.
+
+The telemetry suites assert on what an in-memory OpenTelemetry provider recorded, so they must
+not inherit the ambient OpenTelemetry configuration. `OTEL_SDK_DISABLED=true` in particular
+turns every SDK meter into a no-op, which would make those assertions fail silently. CI runners
+set these variables to keep their own instrumentation quiet, so an unisolated suite would pass
+on a developer's machine and fail there.
+"""
 
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractQueue
+from common import telemetry
+from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
+from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+from graphinator import telemetry as gm_telemetry
 
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
+
+    from opentelemetry.sdk.metrics.export import Metric
+
+
+# Every standard OpenTelemetry variable that changes what the SDK records or exports.
+OTEL_ENVIRONMENT = (
+    "OTEL_EXPORTER_OTLP_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_METRICS_EXEMPLAR_FILTER",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_RESOURCE_ATTRIBUTES",
+    "OTEL_SDK_DISABLED",
+    "OTEL_SERVICE_NAME",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_otel_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Run every test against a known-empty OpenTelemetry configuration."""
+    for name in OTEL_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
+    yield
+
+
+class Collector:
+    """An in-memory OpenTelemetry provider plus helpers for reading what was recorded."""
+
+    def __init__(self) -> None:
+        self.reader = InMemoryMetricReader()
+        self.provider = SdkMeterProvider(metric_readers=[self.reader])
+
+    def metrics(self) -> dict[str, Metric]:
+        """Collect once and return every recorded metric by name."""
+        data = self.reader.get_metrics_data()
+        if data is None:
+            return {}
+        return {
+            metric.name: metric
+            for resource_metrics in data.resource_metrics
+            for scope_metrics in resource_metrics.scope_metrics
+            for metric in scope_metrics.metrics
+        }
+
+    def points(self, name: str) -> list[Any]:
+        """Return the data points recorded for one metric name."""
+        metric = self.metrics().get(name)
+        return [] if metric is None else list(metric.data.data_points)
+
+    def attributes(self, name: str) -> list[dict[str, Any]]:
+        """Return the attribute dicts recorded for one metric name."""
+        return [dict(point.attributes) for point in self.points(name)]
+
+
+@pytest.fixture
+def collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[Collector]:
+    """Install an in-memory provider and make gm_telemetry build instruments against it.
+
+    Every graphinator instrument is built lazily from the currently installed
+    ``common.telemetry`` provider (mirrors ``common.runtime_metrics``), so this both installs
+    the provider and bumps its generation counter to invalidate any cache built earlier.
+    """
+    active = Collector()
+    monkeypatch.setattr(telemetry, "_provider", active.provider)
+    monkeypatch.setattr(telemetry, "_generation", telemetry.provider_generation() + 1)
+    gm_telemetry.reset_instruments()
+    yield active
+    monkeypatch.setattr(telemetry, "_provider", None)
+    gm_telemetry.reset_instruments()
 
 
 @pytest.fixture
