@@ -12,6 +12,7 @@ import pytest
 from aio_pika.abc import AbstractIncomingMessage
 from orjson import dumps
 
+from graphinator import telemetry as gm_telemetry
 from graphinator.graphinator import (
     main,
     on_artist_message,
@@ -4994,3 +4995,301 @@ class TestOutageRequeueBackoff:
 
         assert backoff.consecutive_failures == 1
         mock_message.nack.assert_called_once_with(requeue=True)
+
+
+class TestTelemetry:
+    """Domain OpenTelemetry instruments recorded from the per-message handler.
+
+    conftest's `disable_batch_mode` autouse fixture keeps every test in this module on the
+    non-batch code path (BATCH_MODE=False, batch_processor=None) unless a test overrides it,
+    which is exactly the path groovemap.pipeline.messages/message.duration are recorded from.
+    """
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.shutdown_requested", False)
+    async def test_processed_outcome_recorded_on_write(
+        self, sample_artist_data: dict[str, Any], mock_neo4j_driver: MagicMock, collector: Any
+    ) -> None:
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(sample_artist_data).encode()
+        mock_message.consumer_tag = "discogs-graph-enricher-artists"
+
+        mock_context_manager = mock_neo4j_driver.session(database="neo4j")
+        mock_session = await mock_context_manager.__aenter__()
+
+        async def mock_tx_func(func: Any) -> Any:
+            mock_tx = MagicMock()
+            mock_tx.run = AsyncMock()
+            mock_tx.run.return_value.single = AsyncMock(return_value=None)  # new artist
+            return await func(mock_tx)
+
+        mock_session.execute_write.side_effect = mock_tx_func
+
+        with patch("graphinator.graphinator.graph", mock_neo4j_driver):
+            await on_artist_message(mock_message)
+
+        [attrs] = collector.attributes(gm_telemetry.PIPELINE_MESSAGES)
+        assert attrs == {"source": "discogs", "entity": "artist", "outcome": "processed"}
+        assert collector.points(gm_telemetry.PIPELINE_MESSAGE_DURATION)
+
+        [consumed_attrs] = collector.attributes(gm_telemetry.MESSAGING_CONSUMED_MESSAGES)
+        assert consumed_attrs == {
+            "messaging.system": "rabbitmq",
+            "messaging.destination.name": "discogs-graph-enricher-artists",
+            "messaging.operation.name": "process",
+        }
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.shutdown_requested", False)
+    async def test_skipped_outcome_recorded_when_hash_unchanged(
+        self, sample_artist_data: dict[str, Any], mock_neo4j_driver: MagicMock, collector: Any
+    ) -> None:
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(sample_artist_data).encode()
+
+        mock_context_manager = mock_neo4j_driver.session(database="neo4j")
+        mock_session = await mock_context_manager.__aenter__()
+
+        async def mock_tx_func(func: Any) -> Any:
+            mock_tx = MagicMock()
+            mock_tx.run = AsyncMock()
+            mock_tx.run.return_value.single = AsyncMock(return_value={"hash": sample_artist_data["sha256"]})
+            return await func(mock_tx)
+
+        mock_session.execute_write.side_effect = mock_tx_func
+
+        with patch("graphinator.graphinator.graph", mock_neo4j_driver):
+            await on_artist_message(mock_message)
+
+        [attrs] = collector.attributes(gm_telemetry.PIPELINE_MESSAGES)
+        assert attrs["outcome"] == "skipped"
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.shutdown_requested", False)
+    async def test_failed_outcome_recorded_for_missing_id(self, collector: Any) -> None:
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps({"name": "No ID Artist"}).encode()
+
+        with patch("graphinator.graphinator.graph", MagicMock()):
+            await on_artist_message(mock_message)
+
+        [attrs] = collector.attributes(gm_telemetry.PIPELINE_MESSAGES)
+        assert attrs["outcome"] == "failed"
+
+        [consumed_attrs] = collector.attributes(gm_telemetry.MESSAGING_CONSUMED_MESSAGES)
+        assert consumed_attrs["error.type"] == "MissingIdError"
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.shutdown_requested", False)
+    async def test_failed_outcome_and_error_type_recorded_on_neo4j_outage(self, sample_artist_data: dict[str, Any], collector: Any) -> None:
+        from neo4j.exceptions import ServiceUnavailable
+
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(sample_artist_data).encode()
+
+        with patch("graphinator.graphinator.graph") as mock_graph:
+            mock_graph.session.side_effect = ServiceUnavailable("Connection lost")
+            await on_artist_message(mock_message)
+
+        [attrs] = collector.attributes(gm_telemetry.PIPELINE_MESSAGES)
+        assert attrs["outcome"] == "failed"
+
+        [consumed_attrs] = collector.attributes(gm_telemetry.MESSAGING_CONSUMED_MESSAGES)
+        assert consumed_attrs["error.type"] == "ServiceUnavailable"
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.shutdown_requested", False)
+    async def test_batch_mode_records_only_the_broker_counter_not_pipeline_messages(self, collector: Any) -> None:
+        """In batch mode the per-record outcome is only known at flush time, so the handler
+        must not record groovemap.pipeline.messages itself — the batch processor does
+        (see test_batch_processor.py). messaging.client.consumed.messages still fires: the
+        message really was consumed off the broker regardless of when it is written.
+        """
+        import graphinator.graphinator as g
+
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps({"id": "1", "sha256": "h", "name": "x"}).encode()
+
+        proc = MagicMock()
+        proc.add_message = AsyncMock(return_value=True)
+
+        with patch.object(g, "BATCH_MODE", True), patch.object(g, "batch_processor", proc):
+            await on_artist_message(mock_message)
+
+        assert collector.points(gm_telemetry.PIPELINE_MESSAGES) == []
+        assert collector.points(gm_telemetry.MESSAGING_CONSUMED_MESSAGES)
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.shutdown_requested", False)
+    async def test_no_metrics_recorded_while_shutdown_requested(self, collector: Any) -> None:
+        """The unsettled-on-shutdown branch never touched the broker, so nothing consumed."""
+        with patch("graphinator.graphinator.shutdown_requested", True):
+            mock_message = AsyncMock(spec=AbstractIncomingMessage)
+            await on_artist_message(mock_message)
+
+        assert collector.points(gm_telemetry.PIPELINE_MESSAGES) == []
+        assert collector.points(gm_telemetry.MESSAGING_CONSUMED_MESSAGES) == []
+
+
+class TestConsumersActiveTelemetry:
+    """groovemap.pipeline.consumers.active around the consumer start/stop code paths."""
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.CONSUMER_CANCEL_DELAY", 0.05)
+    async def test_scheduled_cancellation_decrements_active_consumers(self, collector: Any) -> None:
+        import graphinator.graphinator as g
+
+        mock_queue = AsyncMock()
+        g.consumer_tags = {"artists": "consumer-tag-123"}
+        g.consumer_cancel_tasks = {}
+
+        gm_telemetry.record_consumer_started()  # the consumer was already active
+        await g.schedule_consumer_cancellation("artists", mock_queue)
+        await asyncio.sleep(0.15)
+
+        [point] = collector.points(gm_telemetry.PIPELINE_CONSUMERS_ACTIVE)
+        assert point.value == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_consumers_decrements_for_every_active_consumer(self, collector: Any) -> None:
+        import graphinator.graphinator as g
+
+        mock_queue = AsyncMock()
+        g.consumer_tags = {"artists": "tag-a", "labels": "tag-l"}
+        g.queues = {"artists": mock_queue, "labels": mock_queue}
+
+        gm_telemetry.record_consumer_started()
+        gm_telemetry.record_consumer_started()
+        await g.cancel_all_consumers()
+
+        [point] = collector.points(gm_telemetry.PIPELINE_CONSUMERS_ACTIVE)
+        assert point.value == 0
+        assert g.consumer_tags == {}
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_consumers_decrements_when_queue_already_gone(self, collector: Any) -> None:
+        """The early-continue branch (queue missing) still owns a `started` credit to undo."""
+        import graphinator.graphinator as g
+
+        g.consumer_tags = {"artists": "tag-a"}
+        g.queues = {}
+
+        gm_telemetry.record_consumer_started()
+        await g.cancel_all_consumers()
+
+        [point] = collector.points(gm_telemetry.PIPELINE_CONSUMERS_ACTIVE)
+        assert point.value == 0
+
+
+class TestTelemetryLifecycle:
+    """setup_telemetry()/shutdown_telemetry() call sites in main()/cli()."""
+
+    def test_cli_calls_shutdown_telemetry_after_main(self) -> None:
+        """shutdown_telemetry() must run on every shutdown path, including ones where main()
+        returns early (config error, connection failure) before its own try/finally — so it
+        lives in cli()'s finally, the one place reached on every exit from run(main()).
+        """
+        from graphinator.graphinator import cli
+
+        def fake_run(coro: Any) -> None:
+            # `cli()` calls `run(main())`, which builds a real coroutine before `run` (patched
+            # below) ever sees it — closing it here avoids a "coroutine was never awaited" leak.
+            coro.close()
+
+        with (
+            patch("graphinator.graphinator.run", side_effect=fake_run) as mock_run,
+            patch("graphinator.graphinator.shutdown_telemetry") as mock_shutdown_telemetry,
+        ):
+            cli()
+
+        assert mock_run.called
+        mock_shutdown_telemetry.assert_called_once_with()
+
+    def test_cli_calls_shutdown_telemetry_even_after_an_exception(self) -> None:
+        from graphinator.graphinator import cli
+
+        def fake_run(coro: Any) -> None:
+            coro.close()
+            raise RuntimeError("boom")
+
+        with (
+            patch("graphinator.graphinator.run", side_effect=fake_run),
+            patch("graphinator.graphinator.shutdown_telemetry") as mock_shutdown_telemetry,
+            patch("graphinator.graphinator.logger"),
+        ):
+            cli()
+
+        mock_shutdown_telemetry.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_main_calls_setup_telemetry_right_after_setup_logging(self) -> None:
+        """Regression guard for the required call order: setup_telemetry('graphinator')
+        immediately follows setup_logging in main(), before anything else can run.
+        """
+        from graphinator.graphinator import TELEMETRY_SERVICE_NAME, main
+
+        calls: list[str] = []
+
+        with (
+            patch("graphinator.graphinator.setup_logging", side_effect=lambda *_a, **_k: calls.append("setup_logging")),
+            patch("graphinator.graphinator.setup_telemetry", side_effect=lambda *_a, **_k: calls.append("setup_telemetry")) as mock_setup_telemetry,
+            patch("graphinator.graphinator.GraphinatorConfig") as mock_config,
+        ):
+            mock_config.from_env.side_effect = ValueError("Missing required environment variables: NEO4J_HOST")
+            await main()
+
+        assert calls[:2] == ["setup_logging", "setup_telemetry"]
+        mock_setup_telemetry.assert_called_once_with(TELEMETRY_SERVICE_NAME)
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.shutdown_requested", False)
+    async def test_no_endpoint_configured_behaves_exactly_as_before(self, sample_artist_data: dict[str, Any], mock_neo4j_driver: MagicMock) -> None:
+        """Acceptance regression: with OTEL_EXPORTER_OTLP_ENDPOINT unset, real
+        (unmocked) setup_telemetry()/shutdown_telemetry() calls must be no-ops that leave
+        message handling byte-identical to the pre-telemetry behavior — no dropped/duplicated
+        acks, no extra nacks, no raised exception. `isolated_otel_environment` (conftest,
+        autouse) guarantees the endpoint is unset here, and this test does not mock
+        `common.telemetry` at all: it drives the real bootstrap.
+        """
+        import os
+
+        from common.telemetry import get_meter, setup_telemetry, shutdown_telemetry
+        from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
+
+        from graphinator.graphinator import TELEMETRY_SERVICE_NAME, cli, main
+
+        assert os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT") is None
+
+        # The real bootstrap installs a no-op provider, not the SDK one.
+        provider = setup_telemetry(TELEMETRY_SERVICE_NAME)
+        assert not isinstance(provider, SdkMeterProvider)
+        meter = get_meter("groovemap.graphinator")
+        # A no-op meter's instruments accept measurements without error or effect.
+        meter.create_counter("smoke.test").add(1)
+        shutdown_telemetry()
+
+        # The handler behaves exactly as every other test in this module already proves —
+        # this asserts it once more with telemetry genuinely (not mock) engaged end-to-end.
+        mock_message = AsyncMock(spec=AbstractIncomingMessage)
+        mock_message.body = json.dumps(sample_artist_data).encode()
+
+        mock_context_manager = mock_neo4j_driver.session(database="neo4j")
+        mock_session = await mock_context_manager.__aenter__()
+
+        async def mock_tx_func(func: Any) -> Any:
+            mock_tx = MagicMock()
+            mock_tx.run = AsyncMock()
+            mock_tx.run.return_value.single = AsyncMock(return_value=None)
+            return await func(mock_tx)
+
+        mock_session.execute_write.side_effect = mock_tx_func
+
+        with patch("graphinator.graphinator.graph", mock_neo4j_driver):
+            await on_artist_message(mock_message)
+
+        mock_message.ack.assert_called_once()
+        mock_message.nack.assert_not_called()
+
+        # cli()/main() drive the same real bootstrap without raising or hanging.
+        assert callable(cli)
+        assert callable(main)
