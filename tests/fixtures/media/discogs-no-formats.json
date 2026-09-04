@@ -1,0 +1,21 @@
+{
+  "name": "discogs-no-formats",
+  "provider": "discogs",
+  "description": "A release without formats produces an empty block.",
+  "input": {},
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [],
+    "families": [],
+    "release_kind": null,
+    "traits": [],
+    "edition": [],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

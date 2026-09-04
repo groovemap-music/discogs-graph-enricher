@@ -2,8 +2,8 @@
 
 `discogs-graph-enricher` is the GrooveMap service that consumes versioned Discogs
 catalog events and projects them into Neo4j. It owns the Discogs-derived artist,
-label, master, release, genre, style, and credit nodes and the relationships between
-them. It does not download Discogs exports or serve the public API.
+label, master, release, genre, style, media, and credit nodes and the relationships
+between them. It does not download Discogs exports or serve the public API.
 
 ```mermaid
 flowchart LR

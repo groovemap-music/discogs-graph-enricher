@@ -27,6 +27,15 @@ from orjson import loads
 from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor
 from graphinator.config import GraphinatorConfig
+from graphinator.media_projection import (
+    MEDIA_SOURCE,
+    MERGE_MEDIA_CYPHER,
+    PRUNE_ISSUED_ON_CYPHER,
+    issued_on_rows,
+    media_families,
+    prune_record,
+    resolve_media_block,
+)
 from graphinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
     DATA_TYPES,
@@ -1446,14 +1455,18 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         return False  # No update needed
 
     formats = [f["name"] for f in record.get("formats", []) if isinstance(f, dict) and "name" in f]
+    # `r.formats` is the deprecated raw-name alias, still written unchanged for one minor
+    # version; `r.media_families` is the canonical list property (ADR 0007).
+    media_block = resolve_media_block(record)
     await tx.run(
         "MERGE (r:Release {id: $id}) "
-        "ON CREATE SET r.title = $title, r.year = $year, r.formats = $formats, r.sha256 = $sha256 "
-        "ON MATCH SET r.title = $title, r.year = $year, r.formats = $formats, r.sha256 = $sha256",
+        "ON CREATE SET r.title = $title, r.year = $year, r.formats = $formats, r.media_families = $media_families, r.sha256 = $sha256 "
+        "ON MATCH SET r.title = $title, r.year = $year, r.formats = $formats, r.media_families = $media_families, r.sha256 = $sha256",
         id=record["id"],
         title=record.get("title", "Unknown Release"),
         year=record.get("year"),
         formats=formats,
+        media_families=media_families(media_block),
         sha256=record["sha256"],
     )
 
@@ -1504,6 +1517,19 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         target_key="name",
         keep=[st for st in (record.get("styles") or []) if st],
     )
+
+    # Project the canonical media block onto Medium/MediaFamily nodes and ISSUED_ON
+    # edges (ADR 0007). ISSUED_ON carries a `source`, so its prune is scoped to this
+    # provider's edges and cannot use the generic helper above. The prune runs even when
+    # the release asserts no media — the empty keep-list is the "all media removed" case.
+    media_rows = issued_on_rows(record["id"], media_block)
+    await tx.run(
+        PRUNE_ISSUED_ON_CYPHER,
+        records=[prune_record(record["id"], media_rows)],
+        source=MEDIA_SOURCE,
+    )
+    if media_rows:
+        await tx.run(MERGE_MEDIA_CYPHER, rows=media_rows, source=MEDIA_SOURCE)
 
     # Handle artist relationships (normalized to list of {"id": ...} dicts)
     artists: list[dict[str, Any]] | None = record.get("artists")

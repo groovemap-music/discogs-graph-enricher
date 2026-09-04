@@ -1,0 +1,108 @@
+{
+  "name": "discogs-box-set-cd-and-vinyl",
+  "provider": "discogs",
+  "description": "Box Set is a container, not a medium; the real media are sibling entries.",
+  "input": {
+    "formats": [
+      {
+        "name": "Box Set",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "Limited Edition",
+            "Numbered"
+          ]
+        }
+      },
+      {
+        "name": "CD",
+        "qty": "2",
+        "descriptions": {
+          "description": [
+            "Album",
+            "Remastered"
+          ]
+        }
+      },
+      {
+        "name": "Vinyl",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "LP",
+            "Picture Disc"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "optical",
+        "medium": "optical_cd",
+        "qty": 2,
+        "size_inches": null,
+        "speed_rpm": null,
+        "channels": null,
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "CD",
+          "descriptions": [
+            "Album",
+            "Remastered"
+          ],
+          "text": null
+        }
+      },
+      {
+        "family": "vinyl",
+        "medium": "vinyl_12",
+        "qty": 1,
+        "size_inches": 12,
+        "speed_rpm": null,
+        "channels": null,
+        "codec": null,
+        "variants": [],
+        "appearance": [
+          "picture_disc"
+        ],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Vinyl",
+          "descriptions": [
+            "LP",
+            "Picture Disc"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "optical",
+      "vinyl"
+    ],
+    "release_kind": "album",
+    "traits": [],
+    "edition": [
+      "limited",
+      "numbered",
+      "remastered"
+    ],
+    "packaging": null,
+    "container": "box_set",
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}
