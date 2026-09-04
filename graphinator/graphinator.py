@@ -26,23 +26,23 @@ from orjson import loads
 
 from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor
-from graphinator.catalog_contract import (
+from graphinator.config import GraphinatorConfig
+from graphinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
     DATA_TYPES,
 )
-from graphinator.catalog_contract import (
+from graphinator.queue_names import (
     dead_letter_exchange_name as catalog_dead_letter_exchange_name,
 )
-from graphinator.catalog_contract import (
+from graphinator.queue_names import (
     dead_letter_queue_name as catalog_dead_letter_queue_name,
 )
-from graphinator.catalog_contract import (
+from graphinator.queue_names import (
     exchange_name as catalog_exchange_name,
 )
-from graphinator.catalog_contract import (
+from graphinator.queue_names import (
     queue_name as catalog_queue_name,
 )
-from graphinator.config import GraphinatorConfig
 
 
 if TYPE_CHECKING:
@@ -432,7 +432,7 @@ async def _recover_consumers() -> None:
             # Declare per-data-type fanout exchanges and consumer-owned queues
             queues = {}
             for data_type in DATA_TYPES:
-                exchange_name = catalog_exchange_name("discogs", data_type)
+                exchange_name = catalog_exchange_name(data_type)
                 queue_name = catalog_queue_name("graphinator", data_type)
                 dlx_name = catalog_dead_letter_exchange_name("graphinator", data_type)
                 dlq_name = catalog_dead_letter_queue_name("graphinator", data_type)
@@ -1989,7 +1989,7 @@ async def main() -> None:
         # Declare per-data-type fanout exchanges and consumer-owned queues
         queues = {}
         for data_type in DATA_TYPES:
-            exchange_name = catalog_exchange_name("discogs", data_type)
+            exchange_name = catalog_exchange_name(data_type)
             queue_name = catalog_queue_name("graphinator", data_type)
             dlx_name = catalog_dead_letter_exchange_name("graphinator", data_type)
             dlq_name = catalog_dead_letter_queue_name("graphinator", data_type)
