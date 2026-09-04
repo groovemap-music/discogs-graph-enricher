@@ -1978,8 +1978,10 @@ class TestReleaseTransactionLogic:
         # 7. Style relationships
         # 8. Genre-style connections
         # ...plus 5 prune queries (BY/ON/DERIVED_FROM/Genre-IS/Style-IS) that drop
-        # associations the record's new version no longer asserts (discogsography-bd0u).
-        assert mock_tx.run.call_count == 13
+        # associations the record's new version no longer asserts (discogsography-bd0u),
+        # plus the ISSUED_ON prune, which runs for every release (gm-…-sq6.2). This
+        # record carries no media, so no Medium MERGE follows it.
+        assert mock_tx.run.call_count == 14
         mock_message.ack.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2106,8 +2108,9 @@ class TestReleaseTransactionLogic:
         # 4. Person SAME_AS relationships (for Bob Ludwig who has artist_id)
         # ...plus the 5 release prune queries (discogsography-bd0u), which run even when
         # the record asserts no artists/labels/master/genres/styles — that is exactly the
-        # "every association was removed" case.
-        assert mock_tx.run.call_count == 9
+        # "every association was removed" case, and the ISSUED_ON prune, which runs on the
+        # same terms (gm-…-sq6.2). No media on this record means no Medium MERGE.
+        assert mock_tx.run.call_count == 10
         mock_message.ack.assert_called_once()
 
         # Verify credits cypher was called with correct data

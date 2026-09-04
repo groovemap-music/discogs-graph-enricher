@@ -1,0 +1,59 @@
+{
+  "name": "discogs-shellac-10-inch",
+  "provider": "discogs",
+  "description": "A 10\" shellac disc gets the 78 RPM default from its medium.",
+  "input": {
+    "formats": [
+      {
+        "name": "Shellac",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "10\"",
+            "Mono"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "shellac",
+        "medium": "shellac_10",
+        "qty": 1,
+        "size_inches": 10,
+        "speed_rpm": 78,
+        "channels": "mono",
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Shellac",
+          "descriptions": [
+            "10\"",
+            "Mono"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "shellac"
+    ],
+    "release_kind": null,
+    "traits": [],
+    "edition": [],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

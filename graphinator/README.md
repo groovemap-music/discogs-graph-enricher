@@ -138,8 +138,9 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 1. **Release** - Album/single releases
 
-   - Properties: id, title, year, formats, sha256
-   - Relationships: BY (to Artist), ON (to Label), DERIVED_FROM (to Master), IS (to Genre/Style)
+   - Properties: id, title, year, media_families, formats†, sha256
+   - Relationships: BY (to Artist), ON (to Label), DERIVED_FROM (to Master), IS (to Genre/Style), ISSUED_ON (to Medium)
+   - †`formats` is the deprecated raw Discogs format names, retained for one minor version; `media_families` is the canonical replacement (ADR 0007)
 
 1. **Master** - Master recordings
 
@@ -156,6 +157,16 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
    - Properties: name, release_count\*, artist_count\*, label_count\*, genre_count\*, first_year\*
    - Relationships: PART_OF (to Genre)
    - \*Pre-computed by `compute_genre_style_stats()` (see [Pre-Computed Node Properties](#-pre-computed-node-properties))
+
+1. **Medium** - Canonical physical or digital media a release was issued on
+
+   - Properties: id, family, label
+   - Relationships: IN_FAMILY (to MediaFamily)
+   - Ids and labels come from the vendored media taxonomy (ADR 0007), so `vinyl_12` means the same thing here as in the relational store and the API
+
+1. **MediaFamily** - The family a medium belongs to (`vinyl`, `optical`, `digital`, ...)
+
+   - Properties: name
 
 1. **Person** - Credited personnel (producers, engineers, mastering engineers, session musicians, designers, managers)
 
@@ -179,6 +190,8 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 - `ALIAS_OF` - Artist is an alias of another artist
 - `SUBLABEL_OF` - Label is a sublabel of a parent label
 - `PART_OF` - Style belongs to a genre
+- `ISSUED_ON` - Release was issued on a medium (properties: `qty`, `source`). `source` records which provider asserted the edge and is part of the merge pattern, so each catalog writes and prunes only its own edges and the MusicBrainz enricher's edges over the same Medium nodes are left intact
+- `IN_FAMILY` - Medium belongs to a media family
 - `CREDITED_ON` - Person credited on a release (properties: `role`, `category`)
 - `SAME_AS` - Person is the same entity as an Artist (linked via Discogs artist ID)
 
@@ -186,6 +199,36 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 - `COLLECTED` - User has this release in their collection
 - `WANTS` - User wants this release
+
+### Canonical Media Projection
+
+Every releases event carries an additive `media` block (ADR 0007). Both the single-record
+and the batched write path run the same two Cypher statements from
+`graphinator/media_projection.py`, so the two paths cannot drift apart:
+
+1. A prune that deletes this release's `ISSUED_ON` edges whose target medium the new
+   version of the record no longer asserts. It is scoped to `rel.source = "discogs"`, and
+   it runs even when a release asserts no media at all — the empty keep-list is how the
+   "all media removed" correction is applied.
+1. A `MERGE` that creates the `Medium` and `MediaFamily` nodes, the `IN_FAMILY` edge, and
+   the `ISSUED_ON` edge, then sets `qty` on it.
+
+`source` is part of the `ISSUED_ON` merge pattern rather than a property set afterwards.
+Medium nodes are shared across catalogs, so a release both this service and the
+MusicBrainz enricher know about carries one edge per provider to the same node. Merging
+on the medium alone would match whichever edge already existed and overwrite the other
+catalog's assertion.
+
+Two entries resolving to the same canonical medium become one edge whose `qty` is their
+sum, because `ISSUED_ON` is keyed on (release, medium, source). A release whose formats
+are all unmapped gets no edges and an empty `media_families`.
+
+Events from a pre-cutover producer carry no `media` block. Rather than leave those
+releases with a `formats` property and no medium edges, the service derives a best-effort
+block from the raw format names and their descriptors with
+`common.media.legacy_format_names_to_media`. That fallback reads flat names instead of
+re-implementing the producer's mapping rules: this service is a consumer of the taxonomy,
+not a second implementation of it.
 
 ## Processing Logic
 

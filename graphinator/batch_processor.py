@@ -18,6 +18,15 @@ from common.db_resilience import DatabaseUnavailableError
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 
 from graphinator import telemetry as gm_telemetry
+from graphinator.media_projection import (
+    MEDIA_SOURCE,
+    MERGE_MEDIA_CYPHER,
+    PRUNE_ISSUED_ON_CYPHER,
+    issued_on_rows,
+    media_families,
+    prune_record,
+    resolve_media_block,
+)
 
 
 if TYPE_CHECKING:
@@ -1055,6 +1064,13 @@ class Neo4jBatchProcessor:
                     # of re-enqueue on Neo4j failure
                     release_data = dict(msg.data)
                     release_data["format_names"] = [f["name"] for f in msg.data.get("formats", []) if isinstance(f, dict) and "name" in f]
+                    # Canonical media projection (ADR 0007). `format_names` above stays
+                    # the deprecated raw-name alias for one minor version; the rows here
+                    # drive the Medium/MediaFamily nodes and ISSUED_ON edges, and are
+                    # computed once per release so the write below is a flat UNWIND.
+                    media_block = resolve_media_block(msg.data)
+                    release_data["media_families"] = media_families(media_block)
+                    release_data["media_rows"] = issued_on_rows(release_data["id"], media_block)
                     # Per-release metadata bag — populated only with non-null
                     # keys. The cypher uses `SET r += release.metadata`, which
                     # merges only the keys present, so absent fields don't wipe
@@ -1086,6 +1102,7 @@ class Neo4jBatchProcessor:
                     SET r.title = release.title,
                         r.year = release.year,
                         r.formats = release.format_names,
+                        r.media_families = release.media_families,
                         r.sha256 = release.sha256,
                         r += release.metadata
                     """,
@@ -1286,6 +1303,21 @@ class Neo4jBatchProcessor:
                         """,
                         pairs=genre_style_data,
                     )
+
+                # Project the canonical media block onto Medium/MediaFamily nodes and
+                # ISSUED_ON edges (ADR 0007), with the same statements the single-record
+                # path runs. ISSUED_ON carries a `source`, so its prune is scoped to this
+                # provider's edges and cannot use _prune_stale_edges; it runs for every
+                # release in the batch, including those asserting no media — the empty
+                # keep-list is the "all media removed" case.
+                await tx.run(
+                    PRUNE_ISSUED_ON_CYPHER,
+                    records=[prune_record(release["id"], release["media_rows"]) for release in releases_to_process],
+                    source=MEDIA_SOURCE,
+                )
+                media_rows = [row for release in releases_to_process for row in release["media_rows"]]
+                if media_rows:
+                    await tx.run(MERGE_MEDIA_CYPHER, rows=media_rows, source=MEDIA_SOURCE)
 
                 # Process credits (extraartists) — Person nodes and CREDITED_ON relationships
                 credit_data = []

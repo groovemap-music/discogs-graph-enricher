@@ -1,0 +1,66 @@
+{
+  "name": "discogs-api-flat-descriptions",
+  "provider": "discogs",
+  "description": "The Discogs API shape carries descriptions as a flat array and the same mapper output.",
+  "input": {
+    "formats": [
+      {
+        "name": "Vinyl",
+        "qty": "1",
+        "descriptions": [
+          "12\"",
+          "33 ⅓ RPM",
+          "EP",
+          "Test Pressing",
+          "White Label"
+        ]
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "vinyl",
+        "medium": "vinyl_12",
+        "qty": 1,
+        "size_inches": 12,
+        "speed_rpm": 33.33,
+        "channels": null,
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Vinyl",
+          "descriptions": [
+            "12\"",
+            "33 ⅓ RPM",
+            "EP",
+            "Test Pressing",
+            "White Label"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "vinyl"
+    ],
+    "release_kind": "ep",
+    "traits": [],
+    "edition": [
+      "test_pressing",
+      "white_label"
+    ],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

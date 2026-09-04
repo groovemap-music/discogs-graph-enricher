@@ -1,0 +1,72 @@
+{
+  "name": "discogs-2xlp-gatefold-reissue",
+  "provider": "discogs",
+  "description": "A 2xLP gatefold reissue with a colour note in the free text field.",
+  "input": {
+    "formats": [
+      {
+        "name": "Vinyl",
+        "qty": "2",
+        "text": "Blue Vinyl",
+        "descriptions": {
+          "description": [
+            "LP",
+            "Album",
+            "Reissue",
+            "Remastered",
+            "Gatefold",
+            "Numbered"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "vinyl",
+        "medium": "vinyl_12",
+        "qty": 2,
+        "size_inches": 12,
+        "speed_rpm": null,
+        "channels": null,
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Vinyl",
+          "descriptions": [
+            "LP",
+            "Album",
+            "Reissue",
+            "Remastered",
+            "Gatefold",
+            "Numbered"
+          ],
+          "text": "Blue Vinyl"
+        }
+      }
+    ],
+    "families": [
+      "vinyl"
+    ],
+    "release_kind": "album",
+    "traits": [],
+    "edition": [
+      "numbered",
+      "reissue",
+      "remastered"
+    ],
+    "packaging": "gatefold",
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

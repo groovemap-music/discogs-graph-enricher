@@ -1,0 +1,61 @@
+{
+  "name": "discogs-file-flac",
+  "provider": "discogs",
+  "description": "A born-digital release with a codec descriptor and an ignored bitrate descriptor.",
+  "input": {
+    "formats": [
+      {
+        "name": "File",
+        "qty": "12",
+        "descriptions": {
+          "description": [
+            "FLAC",
+            "Album",
+            "24 Bit"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "digital",
+        "medium": "digital_file",
+        "qty": 12,
+        "size_inches": null,
+        "speed_rpm": null,
+        "channels": null,
+        "codec": "flac",
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "File",
+          "descriptions": [
+            "FLAC",
+            "Album",
+            "24 Bit"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "digital"
+    ],
+    "release_kind": "album",
+    "traits": [],
+    "edition": [],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}
