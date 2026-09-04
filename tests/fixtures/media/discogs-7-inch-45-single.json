@@ -1,0 +1,63 @@
+{
+  "name": "discogs-7-inch-45-single",
+  "provider": "discogs",
+  "description": "A 7\" 45 RPM stereo single in the normalized event shape (descriptions wrapped in a description object).",
+  "input": {
+    "formats": [
+      {
+        "name": "Vinyl",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "7\"",
+            "45 RPM",
+            "Single",
+            "Stereo"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "vinyl",
+        "medium": "vinyl_7",
+        "qty": 1,
+        "size_inches": 7,
+        "speed_rpm": 45,
+        "channels": "stereo",
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Vinyl",
+          "descriptions": [
+            "7\"",
+            "45 RPM",
+            "Single",
+            "Stereo"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "vinyl"
+    ],
+    "release_kind": "single",
+    "traits": [],
+    "edition": [],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

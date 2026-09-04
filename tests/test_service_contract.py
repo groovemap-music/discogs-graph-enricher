@@ -3,7 +3,7 @@
 from pathlib import Path
 
 import graphinator.graphinator as service
-from graphinator.catalog_contract import AMQP_EXCHANGE_TYPE, DATA_TYPES, DISCOGS_EXCHANGE_PREFIX
+from graphinator.queue_names import AMQP_EXCHANGE_TYPE, DATA_TYPES, DISCOGS_EXCHANGE_PREFIX
 
 
 ROOT = Path(__file__).parent.parent

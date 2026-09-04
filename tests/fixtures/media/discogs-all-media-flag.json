@@ -1,0 +1,74 @@
+{
+  "name": "discogs-all-media-flag",
+  "provider": "discogs",
+  "description": "All Media is a release-level flag, never an item.",
+  "input": {
+    "formats": [
+      {
+        "name": "All Media",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "Compilation",
+            "Promo"
+          ]
+        }
+      },
+      {
+        "name": "Cassette",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "Mixtape"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "tape",
+        "medium": "tape_cassette",
+        "qty": 1,
+        "size_inches": null,
+        "speed_rpm": null,
+        "channels": null,
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Cassette",
+          "descriptions": [
+            "Mixtape"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "tape"
+    ],
+    "release_kind": null,
+    "traits": [
+      "compilation",
+      "mixtape"
+    ],
+    "edition": [
+      "promo"
+    ],
+    "packaging": null,
+    "container": null,
+    "flags": [
+      "all_media"
+    ],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

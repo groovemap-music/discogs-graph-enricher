@@ -1,0 +1,38 @@
+{
+  "name": "discogs-unknown-format",
+  "provider": "discogs",
+  "description": "An unknown format name lands in unmapped with no item; release facts from its descriptors still apply.",
+  "input": {
+    "formats": [
+      {
+        "name": "Holographic Cube",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "Album",
+            "Unheard Of Descriptor"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [],
+    "families": [],
+    "release_kind": "album",
+    "traits": [],
+    "edition": [],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [
+        "Holographic Cube"
+      ],
+      "descriptions": [
+        "Unheard Of Descriptor"
+      ]
+    }
+  }
+}

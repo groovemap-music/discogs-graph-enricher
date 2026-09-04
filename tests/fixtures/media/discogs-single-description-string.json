@@ -1,0 +1,55 @@
+{
+  "name": "discogs-single-description-string",
+  "provider": "discogs",
+  "description": "A single description arrives as a string, not a list, in the normalized shape.",
+  "input": {
+    "formats": [
+      {
+        "name": "CD",
+        "qty": "1",
+        "descriptions": {
+          "description": "Album"
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "optical",
+        "medium": "optical_cd",
+        "qty": 1,
+        "size_inches": null,
+        "speed_rpm": null,
+        "channels": null,
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "CD",
+          "descriptions": [
+            "Album"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "optical"
+    ],
+    "release_kind": "album",
+    "traits": [],
+    "edition": [],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

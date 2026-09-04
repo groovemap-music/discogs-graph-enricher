@@ -1,0 +1,63 @@
+{
+  "name": "discogs-hybrid-sacd",
+  "provider": "discogs",
+  "description": "A Discogs Hybrid format resolves to the SACD medium with the hybrid layer variant.",
+  "input": {
+    "formats": [
+      {
+        "name": "Hybrid",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "SACD",
+            "Album",
+            "Multichannel"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "optical",
+        "medium": "optical_sacd",
+        "qty": 1,
+        "size_inches": null,
+        "speed_rpm": null,
+        "channels": "multichannel",
+        "codec": null,
+        "variants": [
+          "hybrid_layer"
+        ],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Hybrid",
+          "descriptions": [
+            "SACD",
+            "Album",
+            "Multichannel"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "optical"
+    ],
+    "release_kind": "album",
+    "traits": [],
+    "edition": [],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}

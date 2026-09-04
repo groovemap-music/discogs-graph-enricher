@@ -1,0 +1,61 @@
+{
+  "name": "discogs-vinyl-size-unknown",
+  "provider": "discogs",
+  "description": "Vinyl without a size descriptor resolves to the unspecified vinyl medium.",
+  "input": {
+    "formats": [
+      {
+        "name": "Vinyl",
+        "qty": "1",
+        "descriptions": {
+          "description": [
+            "Album",
+            "Limited Edition"
+          ]
+        }
+      }
+    ]
+  },
+  "expected": {
+    "taxonomy_version": "1",
+    "items": [
+      {
+        "family": "vinyl",
+        "medium": "vinyl_unspecified",
+        "qty": 1,
+        "size_inches": null,
+        "speed_rpm": null,
+        "channels": null,
+        "codec": null,
+        "variants": [],
+        "appearance": [],
+        "position": null,
+        "track_count": null,
+        "source": {
+          "provider": "discogs",
+          "name": "Vinyl",
+          "descriptions": [
+            "Album",
+            "Limited Edition"
+          ],
+          "text": null
+        }
+      }
+    ],
+    "families": [
+      "vinyl"
+    ],
+    "release_kind": "album",
+    "traits": [],
+    "edition": [
+      "limited"
+    ],
+    "packaging": null,
+    "container": null,
+    "flags": [],
+    "unmapped": {
+      "formats": [],
+      "descriptions": []
+    }
+  }
+}
