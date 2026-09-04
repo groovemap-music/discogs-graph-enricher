@@ -7,7 +7,7 @@ them. It does not download Discogs exports or serve the public API.
 
 ```mermaid
 flowchart LR
-    ING[catalog-ingestion] -->|groovemap-discogs.* events| RMQ[(RabbitMQ)]
+    ING[discogs-ingestion] -->|groovemap-discogs.* events| RMQ[(RabbitMQ)]
     RMQ --> DGE[discogs-graph-enricher]
     DGE -->|idempotent batch writes| NEO[(Neo4j)]
     DGE -->|health :8001 and structured logs| OPS[operators]
@@ -37,7 +37,7 @@ Some identifiers intentionally remain stable across the repository extraction:
   contract migration so in-flight messages are not stranded. It is not the service,
   image, health identity, log identity, or ephemeral RabbitMQ consumer tag.
 - `groovemap-discogs` is the versioned AMQP exchange prefix shared with
-  `catalog-ingestion`.
+  `discogs-ingestion`.
 - `discogsography-*` strings that remain in code or regression-test comments are
   historical issue identifiers. They are provenance for specific failure fixes, not
   active product branding or wire values.
@@ -67,7 +67,7 @@ runtime composition and credentials; this repository owns the image and its appl
 contract.
 
 This consumer makes no HTTP requests to Discogs and therefore emits no Discogs
-`User-Agent`. Discogs HTTP identity belongs to the upstream `catalog-ingestion` service;
+`User-Agent`. Discogs HTTP identity belongs to the upstream `discogs-ingestion` service;
 all identity emitted here uses GrooveMap and `discogs-graph-enricher`.
 
 ## Development
@@ -91,7 +91,7 @@ token; personal access tokens are not accepted.
 
 ## Contracts
 
-- Catalog-event contract: v1, promoted byte-for-byte from `catalog-ingestion`.
+- Catalog-event contract: v1, promoted byte-for-byte from `discogs-ingestion`.
 - Persistence compatibility: v1, promoted from `database-schema`.
 
 `just source-check` verifies both promoted files and the generated Python binding by
