@@ -140,7 +140,7 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
    - Properties: id, title, year, media_families, formats†, sha256
    - Relationships: BY (to Artist), ON (to Label), DERIVED_FROM (to Master), IS (to Genre/Style), ISSUED_ON (to Medium)
-   - †`formats` is the deprecated raw Discogs format names, retained for one minor version; `media_families` is the canonical replacement (ADR 0007)
+   - †`formats` is the deprecated raw Discogs format names, retained for one minor version; `media_families` is the canonical replacement ([ADR 0007][adr-0007]). See [Database schema: the media graph model](../docs/database-schema.md) for the full deprecation note.
 
 1. **Master** - Master recordings
 
@@ -162,7 +162,7 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
    - Properties: id, family, label
    - Relationships: IN_FAMILY (to MediaFamily)
-   - Ids and labels come from the vendored media taxonomy (ADR 0007), so `vinyl_12` means the same thing here as in the relational store and the API
+   - Ids and labels come from the vendored media taxonomy ([ADR 0007][adr-0007]), so `vinyl_12` means the same thing here as in the relational store and the API
 
 1. **MediaFamily** - The family a medium belongs to (`vinyl`, `optical`, `digital`, ...)
 
@@ -202,7 +202,12 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 ### Canonical Media Projection
 
-Every releases event carries an additive `media` block (ADR 0007). Both the single-record
+> 📖 For the authoritative description of the media graph model — including the
+> source-scoped re-processing prune, the legacy fallback for events without `media`,
+> and the `Release.formats` deprecation — see
+> [Database schema: the media graph model](../docs/database-schema.md).
+
+Every releases event carries an additive `media` block ([ADR 0007][adr-0007]). Both the single-record
 and the batched write path run the same two Cypher statements from
 `graphinator/media_projection.py`, so the two paths cannot drift apart:
 
@@ -341,6 +346,11 @@ RETURN member.name
 // Find all pressings of a master recording
 MATCH (r:Release)-[:DERIVED_FROM]->(m:Master {title: "Kind of Blue"})
 RETURN r.title, r.year, r.formats
+
+// Find labels that issued releases on shellac
+MATCH (l:Label)<-[:ON]-(r:Release)-[:ISSUED_ON {source: "discogs"}]->(:Medium)-[:IN_FAMILY]->(:MediaFamily {name: "shellac"})
+RETURN DISTINCT l.name
+ORDER BY l.name
 ```
 
 ## Performance Optimization
@@ -405,3 +415,5 @@ in the `deployment` repository for the full cross-service metric catalog and das
 - Poison records are isolated from healthy batch records
 - Shutdown cancels consumers before unsettled deliveries can be requeued
 - Comprehensive exception logging
+
+[adr-0007]: https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md
