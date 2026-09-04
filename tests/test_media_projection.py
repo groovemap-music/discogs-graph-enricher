@@ -12,10 +12,14 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from graphinator.batch_processor import Neo4jBatchProcessor, PendingMessage
 from graphinator.graphinator import process_release
@@ -497,6 +501,10 @@ async def test_malformed_formats_do_not_break_the_legacy_fallback() -> None:
 MERGE_PATTERN = re.compile(r"MERGE \(r\)-\[e:ISSUED_ON(?: \{([^}]*)\})?\]->\(m\)")
 SET_CLAUSE = re.compile(r"\be\.(\w+) = (row\.\w+|\$\w+)")
 
+PRUNE_WHERE_CLAUSE = re.compile(r"WHERE\s+(?P<clause>.+?)\s*\nDELETE", re.DOTALL)
+PRUNE_FIELD_EQUALS_PARAM = re.compile(r"rel\.(\w+)\s*=\s*\$(\w+)")
+PRUNE_KEEP_EXCLUSION = re.compile(r"NOT\s+m\.id\s+IN\s+record\.keep")
+
 
 def _value(expression: str, row: dict[str, Any], params: dict[str, Any]) -> Any:
     """Resolve a Cypher expression against the statement's row and parameters."""
@@ -519,16 +527,48 @@ def merge_key(cypher: str, params: dict[str, Any]) -> dict[str, Any]:
     return key
 
 
+def prune_conditions(cypher: str) -> list[Callable[[dict[str, Any], dict[str, Any], list[Any]], bool]]:
+    """Return the prune statement's `WHERE` conjuncts as edge-matching predicates.
+
+    Parsed straight out of the real Cypher — not hand-mirrored — so a scoping conjunct
+    dropped from `PRUNE_ISSUED_ON_CYPHER` (say, `rel.source = $source`) drops out of the
+    replay's delete condition too, rather than the replay always deleting by whatever rule
+    this test happened to encode by hand. Each conjunct takes `(edge, params, keep)` where
+    `keep` is the keep-list for the edge's own release, and all conjuncts must hold for the
+    edge to be deleted.
+    """
+    match = PRUNE_WHERE_CLAUSE.search(cypher)
+    assert match is not None, "the prune statement no longer has a WHERE clause"
+    conjuncts = [part.strip() for part in match.group("clause").split(" AND ")]
+
+    predicates: list[Callable[[dict[str, Any], dict[str, Any], list[Any]], bool]] = []
+    for conjunct in conjuncts:
+        field_match = PRUNE_FIELD_EQUALS_PARAM.fullmatch(conjunct)
+        if field_match:
+            field, param = field_match.groups()
+            predicates.append(lambda edge, params, _keep, field=field, param=param: edge.get(field) == params[param])
+            continue
+        if PRUNE_KEEP_EXCLUSION.fullmatch(conjunct):
+            predicates.append(lambda edge, _params, keep: edge["medium"] not in keep)
+            continue
+        raise AssertionError(f"unrecognised prune WHERE conjunct: {conjunct!r}")
+    return predicates
+
+
 def replay(tx: RecordingTx, existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Apply the recorded media writes to a starting set of ISSUED_ON edges."""
     edges = [dict(edge) for edge in existing]
 
     for call in tx.media_prunes:
-        keep = {record["release_id"]: record["keep"] for record in call.params["records"]}
+        keep_by_release = {record["release_id"]: record["keep"] for record in call.params["records"]}
+        predicates = prune_conditions(call.cypher)
         edges = [
             edge
             for edge in edges
-            if not (edge["source"] == call.params["source"] and edge["release_id"] in keep and edge["medium"] not in keep[edge["release_id"]])
+            if not (
+                edge["release_id"] in keep_by_release
+                and all(predicate(edge, call.params, keep_by_release[edge["release_id"]]) for predicate in predicates)
+            )
         ]
 
     for call in tx.media_merges:
