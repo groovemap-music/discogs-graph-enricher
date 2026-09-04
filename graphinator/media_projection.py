@@ -24,7 +24,7 @@ from __future__ import annotations
 from typing import Any
 
 import structlog
-from common.media import flatten_descriptions, legacy_format_names_to_media, medium_label
+from common.media import flatten_descriptions, legacy_format_names_to_media, map_discogs_formats, medium_label
 
 
 logger = structlog.get_logger(__name__)
@@ -78,20 +78,34 @@ def resolve_media_block(record: dict[str, Any]) -> dict[str, Any]:
 
     Post-cutover producers put the block on the event and it is covered by the record
     hash, so it is used as-is. A pre-cutover producer sends only the raw ``formats``
-    list; deriving a best-effort block from the format names and their descriptors keeps
-    the graph from being half-populated during the rollout — the alternative is releases
-    with a ``formats`` property and no Medium edges at all.
+    list; deriving a best-effort block from it keeps the graph from being half-populated
+    during the rollout — the alternative is releases with a ``formats`` property and no
+    Medium edges at all.
 
-    The fallback is deliberately the flat-name mapper rather than the full Discogs
-    mapper: the enricher is a consumer of the taxonomy, not a second implementation of
-    the producer's mapping rules.
+    When every ``formats`` entry is an object, the raw list is handed to
+    ``common.media.map_discogs_formats`` — the same shared mapper a post-cutover producer
+    runs — rather than re-derived from flattened names. That is what keeps a quantity
+    like a 2xLP's ``qty`` (and other per-entry structure: ``text``, nested
+    ``descriptions``) alive through the fallback instead of being discarded. The
+    enricher stays a consumer of the taxonomy, not a second implementation of the
+    producer's mapping rules: this is the same function, called on data closer to what
+    the producer received.
+
+    Some pre-cutover records have already lost that structure — ``formats`` flattened to
+    a bare list of names, or the odd non-object entry — and there the only recoverable
+    signal is the names themselves, so the name-only fallback is kept for that malformed
+    shape.
     """
     media = record.get("media")
     if isinstance(media, dict):
         return media
 
+    formats = record.get("formats")
+    if isinstance(formats, list) and all(isinstance(entry, dict) for entry in formats):
+        return map_discogs_formats(formats)
+
     names: list[str] = []
-    for entry in record.get("formats") or []:
+    for entry in formats or []:
         if not isinstance(entry, dict):
             continue
         name = entry.get("name")
