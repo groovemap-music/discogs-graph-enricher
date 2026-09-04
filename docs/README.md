@@ -6,6 +6,7 @@ the Neo4j knowledge graph.
 ## Runtime contracts
 
 - [Service configuration and graph model](../graphinator/README.md)
+- [Database schema: the media graph model](database-schema.md)
 - [Consumer cancellation and drain behavior](consumer-cancellation.md)
 - [File and extraction completion](file-completion-tracking.md)
 - [Neo4j and RabbitMQ resilience](database-resilience.md)
