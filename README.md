@@ -42,6 +42,19 @@ Some identifiers intentionally remain stable across the repository extraction:
   historical issue identifiers. They are provenance for specific failure fixes, not
   active product branding or wire values.
 
+## Telemetry
+
+The service pushes OpenTelemetry metrics and traces to a collector over OTLP/HTTP-protobuf and
+serves no Prometheus scrape route. Configuration is standard OpenTelemetry environment
+variables only; with `OTEL_EXPORTER_OTLP_ENDPOINT` unset nothing is recorded and nothing is
+exported. Domain metrics cover per-message and per-batch pipeline work, the process's own CPU,
+memory, threads, and garbage collection arrive with the runtime instrumentation, and event-loop
+lag is sampled once a second. Each delivery is processed inside a `process {queue}` CONSUMER
+span joined to the trace `discogs-ingestion` started, and each Neo4j batch flush is a
+`flush neo4j {entity}` span linked to the deliveries it wrote. See the
+[service reference](graphinator/README.md#opentelemetry-metrics) for the instrument and span
+catalog.
+
 ## Failure and drain behavior
 
 - Transient Neo4j failures are retried with bounded backoff without spending the

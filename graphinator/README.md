@@ -68,10 +68,14 @@ IDLE_LOG_INTERVAL=300               # Seconds between idle status logs (default:
 # Logging
 LOG_LEVEL=INFO                      # Logging level (default: INFO)
 
-# OpenTelemetry metrics (standard OTEL vars only — no GrooveMap-specific ones)
+# OpenTelemetry metrics and traces (standard OTEL vars only — no GrooveMap-specific ones)
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318  # Unset disables export (default: unset)
 OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=                # Metrics-only endpoint override (default: falls back to OTEL_EXPORTER_OTLP_ENDPOINT)
+OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=                 # Traces-only endpoint override (default: falls back to OTEL_EXPORTER_OTLP_ENDPOINT)
 OTEL_METRICS_EXPORTER=otlp                          # otlp or none (default: otlp)
+OTEL_TRACES_EXPORTER=otlp                           # otlp or none (default: otlp)
+OTEL_TRACES_SAMPLER=parentbased_traceidratio        # Sampler name (default: parentbased_traceidratio)
+OTEL_TRACES_SAMPLER_ARG=1.0                         # Sampling ratio (default: 1.0; production turns it down)
 OTEL_METRIC_EXPORT_INTERVAL=15000                   # Push interval in milliseconds (default: SDK default, 60000)
 OTEL_SERVICE_NAME=graphinator                        # Overrides the service.name resource attribute (default: graphinator)
 OTEL_RESOURCE_ATTRIBUTES=service.namespace=groovemap,deployment.environment.name=dev  # Extra resource attributes (default: empty)
@@ -364,17 +368,19 @@ ORDER BY l.name
 
 - Health endpoint at `http://localhost:8001/health`
 - Structured JSON logging in `/logs/discogs-graph-enricher.log`
-- OpenTelemetry metrics pushed to a collector (see below); no `/metrics` scrape route
+- OpenTelemetry metrics and traces pushed to a collector (see below); no `/metrics` scrape route
 - Error tracking with detailed messages
 
 ### OpenTelemetry metrics
 
 The service calls `common.telemetry.setup_telemetry("graphinator")` right after
-`setup_logging` and `shutdown_telemetry()` on shutdown. With `OTEL_EXPORTER_OTLP_ENDPOINT`
-unset (the default), telemetry installs a no-op provider and the service behaves exactly as
-it would without the `otel` extra — nothing is recorded, nothing is exported, startup is
-unaffected. Metrics are pushed over OTLP/HTTP-protobuf; the service exposes no Prometheus
-scrape endpoint (the health server's `/metrics` route stays disabled).
+`setup_logging`, `common.telemetry.start_event_loop_monitor()` from the loop `main()` runs on,
+and `shutdown_telemetry()` on shutdown. With `OTEL_EXPORTER_OTLP_ENDPOINT` unset (the
+default), telemetry installs no-op providers for both signals and the service behaves exactly
+as it would without the `otel` extra — nothing is recorded, nothing is exported, startup is
+unaffected. The two signals are independent: `OTEL_TRACES_EXPORTER=none` leaves metrics
+flowing with no spans created. Both are pushed over OTLP/HTTP-protobuf; the service exposes no
+Prometheus scrape endpoint (the health server's `/metrics` route stays disabled).
 
 Domain instruments, recorded from the per-message handler (non-batch mode) and the batch
 processor (`NEO4J_BATCH_MODE=true`, the default):
@@ -403,6 +409,57 @@ wrappers already in use once telemetry is configured — no code here calls them
 | --- | --- |
 | `db.client.operation.duration` | `AsyncResilientNeo4jDriver.session()`, on every `graph.session(...)` use |
 | `groovemap.pipeline.reconnects` | `AsyncResilientRabbitMQ`, on each RabbitMQ reconnect |
+
+### Runtime metrics
+
+`setup_telemetry` installs `opentelemetry-instrumentation-system-metrics` with the
+process-scoped subset, so the service reports its own resource use without a line of code
+here. No `system.*` host metric is collected — node-exporter owns the host.
+
+| Instrument | Kind, unit | Attributes |
+| --- | --- | --- |
+| `process.cpu.time` | observable counter, s | `type=user\|system` |
+| `process.cpu.utilization` | observable gauge, ratio | none |
+| `process.memory.usage` | observable up-down counter, By | none |
+| `process.memory.virtual` | observable up-down counter, By | none |
+| `process.thread.count` | observable up-down counter | none |
+| `process.open_file_descriptor.count` | observable up-down counter | none |
+| `process.context_switches` | observable counter | `type=involuntary\|voluntary` |
+| `cpython.gc.collections` | observable counter | `generation`, `cpython.gc.generation` |
+| `groovemap.runtime.event_loop.lag` | histogram, s | none |
+
+`groovemap.runtime.event_loop.lag` is the one that needs a call:
+`start_event_loop_monitor()` runs in `main()` immediately after `setup_telemetry`, sampling
+the loop every second. Every consumer, batch flush, and maintenance task shares that loop, so
+it is the signal that explains a pipeline slowing down while Neo4j and RabbitMQ both look
+healthy.
+
+### Spans
+
+Tracing follows the same env-var contract as metrics and shares
+`OTEL_EXPORTER_OTLP_ENDPOINT`. W3C TraceContext propagation means a record's whole path —
+`discogs-ingestion` reading the export, publishing to RabbitMQ, this service writing it into
+Neo4j — is one trace.
+
+| Span | Kind | Attributes | Opened by |
+| --- | --- | --- | --- |
+| `process {queue}` | `CONSUMER` | `messaging.system=rabbitmq`, `messaging.destination.name`, `messaging.operation.name=process`, `error.type` on failure | the per-message handler, from the `traceparent` in the AMQP headers |
+| `flush neo4j {entity}` | `INTERNAL` | `db.system.name=neo4j`, `groovemap.entity`, `outcome=processed\|failed`, `error.type` on failure | `Neo4jBatchProcessor._flush_queue_locked`, via `common.tracing.flush_span` |
+| `{db.operation.name} neo4j` | `CLIENT` | `db.system.name`, `db.operation.name`, `error.type` on failure | `AsyncResilientNeo4jDriver`, nested under whichever span above is open |
+
+The CONSUMER span is opened locally for the same reason
+`messaging.client.consumed.messages` is: this service settles its own deliveries instead of
+going through `common.rabbitmq_resilient.process_message_with_retry`, which is what would
+otherwise open it. A message whose headers carry no readable `traceparent` starts a new trace
+rather than failing the delivery.
+
+A batch flush happens long after the deliveries it covers have been acknowledged, so each
+pending message carries its delivery span's context and the flush span links back to at most
+64 of them — a ten-thousand-record batch would otherwise carry ten thousand links into the
+collector. Span names stay low-cardinality: the queue name comes from the consumer tag, never
+a routing key, and no span carries a record id, a Cypher statement, or an exception payload.
+A failure sets status `ERROR` with `error.type` and nothing else. Per-span call counts and
+durations are derived by the collector's `spanmetrics` connector, never emitted here.
 
 See [`docs/observability.md`](https://github.com/groovemap-music/deployment/blob/main/docs/observability.md)
 in the `deployment` repository for the full cross-service metric catalog and dashboards.
