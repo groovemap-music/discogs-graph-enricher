@@ -13,16 +13,25 @@ low-cardinality sets — never ids, record contents, or free text.
 ``messaging.client.consumed.messages`` is normally emitted by
 ``common.rabbitmq_resilient.process_message_with_retry``, but this service acks/nacks messages
 itself instead of going through that wrapper, so :func:`record_consumed_message` reproduces the
-same metric name and attribute shape locally.
+same metric name and attribute shape locally. :func:`consume_span` does the same for the
+CONSUMER span that wrapper would otherwise open, built from the stable ``common`` tracing
+surface (``get_tracer`` and ``extract_context``) rather than from the wrapper's own private
+helper, which carries no compatibility promise.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from threading import RLock
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from common.telemetry import get_meter, provider_generation
+from common.tracing import extract_context, get_tracer
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator, Mapping
 
 
 logger = logging.getLogger(__name__)
@@ -39,6 +48,10 @@ PIPELINE_BATCH_SIZE = "groovemap.pipeline.batch.size"
 PIPELINE_BATCH_FLUSH_DURATION = "groovemap.pipeline.batch.flush.duration"
 PIPELINE_CONSUMERS_ACTIVE = "groovemap.pipeline.consumers.active"
 MESSAGING_CONSUMED_MESSAGES = "messaging.client.consumed.messages"
+
+# The attribute a flush span carries alongside its metric twin; the same closed set
+# `record_batch_flush` writes onto groovemap.pipeline.batch.*.
+OUTCOME_ATTRIBUTE = "outcome"
 
 # Maps the plural queue/data-type names used throughout graphinator to the singular entity
 # name used in metric attributes, matching the shared `entity` vocabulary.
@@ -191,3 +204,112 @@ def record_consumed_message(destination: str, error_type: str | None = None) -> 
         _instrument(MESSAGING_CONSUMED_MESSAGES).add(1, attributes)
     except Exception:  # pragma: no cover - defensive
         logger.debug("Could not record %s", MESSAGING_CONSUMED_MESSAGES, exc_info=True)
+
+
+def _mark_error(span: Any, error_type: str) -> None:
+    """Fail a span with ``error.type`` only — never a message, a stack trace, or a payload.
+
+    The span helpers here switch the SDK's own exception recording off, so this is what
+    replaces it: the exception's class name and a status, and nothing that could carry a
+    record id or a Cypher statement into the collector.
+    """
+    if span is None:
+        return
+    try:
+        from opentelemetry.trace import Status, StatusCode  # noqa: PLC0415
+
+        span.set_attribute("error.type", error_type)
+        span.set_status(Status(StatusCode.ERROR))
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not mark a span as failed", exc_info=True)
+
+
+def mark_consumed_error(span: Any, error_type: str | None) -> None:
+    """Fail the CONSUMER span for a delivery this handler rejected or could not process.
+
+    The handler settles its own deliveries and swallows the exception, so the span never sees
+    one propagate; ``error_type`` is the same value that goes onto
+    ``messaging.client.consumed.messages``. ``None`` leaves the span successful.
+    """
+    if error_type is not None:
+        _mark_error(span, error_type)
+
+
+def mark_flush_outcome(span: Any, outcome: str, error: BaseException | None = None) -> None:
+    """Record ``outcome`` on a flush span, failing it with ``error.type`` when one is given.
+
+    ``outcome`` is the closed set :func:`record_batch_flush` uses — ``processed`` or
+    ``failed`` — so a flush span and its duration histogram carry the identical value.
+    """
+    if span is None:
+        return
+    try:
+        span.set_attribute(OUTCOME_ATTRIBUTE, outcome)
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not record the flush span outcome", exc_info=True)
+    if error is not None:
+        _mark_error(span, type(error).__name__)
+
+
+@contextmanager
+def consume_span(destination: str, headers: Mapping[str, Any] | None = None) -> Iterator[Any]:
+    """Open the CONSUMER span for one delivery: ``process {destination}``.
+
+    The span is a child of the W3C trace context carried in the AMQP ``headers``, which is what
+    puts the extractor's ``publish`` span and this service's processing in one trace. Headers
+    that carry no readable context simply start a new trace: a broken ``traceparent`` must
+    never fail the message that delivered it.
+
+    ``destination`` is :func:`consumed_destination`'s low-cardinality queue name, the same
+    value ``messaging.client.consumed.messages`` carries. Yields ``None`` when the tracer could
+    not start a span, so callers must tolerate it; the helpers here already do.
+    """
+    attributes = {
+        "messaging.system": MESSAGING_SYSTEM,
+        "messaging.destination.name": destination,
+        "messaging.operation.name": "process",
+    }
+    try:
+        from opentelemetry.trace import SpanKind  # noqa: PLC0415
+
+        manager = get_tracer(INSTRUMENTATION_SCOPE).start_as_current_span(
+            f"process {destination}",
+            context=extract_context(headers) if headers else None,
+            kind=SpanKind.CONSUMER,
+            attributes=attributes,
+            # The conventions allow a status and an `error.type`, not an exception event
+            # carrying the message and the traceback, so both SDK defaults are switched off
+            # and `mark_consumed_error` writes what is allowed instead.
+            record_exception=False,
+            set_status_on_exception=False,
+        )
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not start the process span", exc_info=True)
+        yield None
+        return
+
+    with manager as span:
+        try:
+            yield span
+        except BaseException as exc:
+            _mark_error(span, type(exc).__name__)
+            raise
+
+
+def span_context_of(span: Any) -> Any:
+    """Return a span's context for later linking, or None when there is nothing to link.
+
+    A batch flush happens long after the delivery span it covers has ended, so the context is
+    captured when the message is queued and carried on the pending message. A non-recording
+    span is dropped here rather than linked, because a link to an unsampled span tells an
+    operator nothing and still costs the collector a payload.
+    """
+    if span is None:
+        return None
+    try:
+        if not span.is_recording():
+            return None
+        return span.get_span_context()
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Could not read a span context for linking", exc_info=True)
+        return None

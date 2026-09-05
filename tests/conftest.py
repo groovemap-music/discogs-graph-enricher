@@ -5,6 +5,12 @@ not inherit the ambient OpenTelemetry configuration. `OTEL_SDK_DISABLED=true` in
 turns every SDK meter into a no-op, which would make those assertions fail silently. CI runners
 set these variables to keep their own instrumentation quiet, so an unisolated suite would pass
 on a developer's machine and fail there.
+
+The same applies to the tracing half. The library's bootstrap *writes* `OTEL_TRACES_SAMPLER`
+and `OTEL_TRACES_SAMPLER_ARG` when they are unset, and an inherited `OTEL_TRACES_SAMPLER_ARG=0`
+would drop every span a test expects, so those and `OTEL_PROPAGATORS` are scrubbed too. `spans`
+installs an in-memory TracerProvider so the `process` and `flush` spans can be read back
+without a collector.
 """
 
 from typing import TYPE_CHECKING, Any
@@ -15,6 +21,9 @@ from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractQueue
 from common import telemetry
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
 from graphinator import telemetry as gm_telemetry
 
@@ -24,18 +33,24 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from opentelemetry.sdk.metrics.export import Metric
+    from opentelemetry.sdk.trace import ReadableSpan
 
 
 # Every standard OpenTelemetry variable that changes what the SDK records or exports.
 OTEL_ENVIRONMENT = (
     "OTEL_EXPORTER_OTLP_ENDPOINT",
     "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT",
+    "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
     "OTEL_METRICS_EXEMPLAR_FILTER",
     "OTEL_METRICS_EXPORTER",
     "OTEL_METRIC_EXPORT_INTERVAL",
+    "OTEL_PROPAGATORS",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_SDK_DISABLED",
     "OTEL_SERVICE_NAME",
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_TRACES_SAMPLER",
+    "OTEL_TRACES_SAMPLER_ARG",
 )
 
 
@@ -91,6 +106,47 @@ def collector(monkeypatch: pytest.MonkeyPatch) -> Iterator[Collector]:
     yield active
     monkeypatch.setattr(telemetry, "_provider", None)
     gm_telemetry.reset_instruments()
+
+
+class SpanCollector:
+    """An in-memory TracerProvider whose finished spans can be read back by name."""
+
+    def __init__(self) -> None:
+        self.exporter = InMemorySpanExporter()
+        self.provider = SdkTracerProvider()
+        self.provider.add_span_processor(SimpleSpanProcessor(self.exporter))
+
+    def spans(self) -> tuple[ReadableSpan, ...]:
+        """Return every span that has finished so far, in completion order."""
+        return self.exporter.get_finished_spans()
+
+    def names(self) -> list[str]:
+        """Return the finished span names, in completion order."""
+        return [span.name for span in self.spans()]
+
+    def named(self, name: str) -> list[ReadableSpan]:
+        """Return every finished span carrying one name."""
+        return [span for span in self.spans() if span.name == name]
+
+    def only(self, name: str) -> ReadableSpan:
+        """Return the one span carrying ``name``, asserting there is exactly one."""
+        matching = self.named(name)
+        assert len(matching) == 1, f"expected exactly one {name!r} span, saw {self.names()}"
+        return matching[0]
+
+
+@pytest.fixture
+def spans(monkeypatch: pytest.MonkeyPatch) -> Iterator[SpanCollector]:
+    """Make the span helpers record into an in-memory provider, not the global one.
+
+    ``common.tracing.get_tracer`` reads the installed provider at call time, so replacing it
+    here is enough for both the graphinator helpers and the wrappers' own spans.
+    """
+    collector = SpanCollector()
+    monkeypatch.setattr(telemetry, "_tracer_provider", collector.provider)
+    assert telemetry.tracer_provider() is collector.provider
+    yield collector
+    monkeypatch.setattr(telemetry, "_tracer_provider", None)
 
 
 @pytest.fixture
