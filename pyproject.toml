@@ -22,7 +22,7 @@ license-files = ["LICENSE"]
 dependencies = [
     "aio-pika>=10.0.1",
     "groovemap-runtime[neo4j,otel,rabbitmq]==0.1.0",
-    "neo4j-rust-ext>=6.2.0.0",
+    "neo4j-rust-ext>=6.3.0.0",
     "orjson>=3.12.0",
     "structlog>=26.1.0",
 ]
@@ -48,7 +48,7 @@ dev = [
     "pytest-cov>=7.1.0",
     "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
-    "ruff>=0.16.4",
+    "ruff>=0.16.6",
 ]
 
 [tool.hatch.build.targets.wheel]
