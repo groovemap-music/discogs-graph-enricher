@@ -199,8 +199,8 @@ class TestOnArtistMessage:
 
         captured: dict[str, Any] = {}
 
-        async def fake_add(*args: Any) -> bool:
-            # add_message(data_type, record, ack_callback, nack_callback)
+        async def fake_add(*args: Any, **_kwargs: Any) -> bool:
+            # add_message(data_type, record, ack_callback, nack_callback, span_context=...)
             captured["nack"] = args[3]
             return True
 

@@ -20,7 +20,7 @@ from common import (
 )
 from common.credit_roles import categorize_role
 from common.db_resilience import DatabaseUnavailableError
-from common.telemetry import setup_telemetry, shutdown_telemetry
+from common.telemetry import setup_telemetry, shutdown_telemetry, start_event_loop_monitor
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from orjson import loads
 
@@ -1663,125 +1663,136 @@ def make_message_handler(
         destination = gm_telemetry.consumed_destination(message)
         consumed_error_type: str | None = None
         started = time.perf_counter()
-        try:
-            logger.debug("🔄 Received message", data_type=data_type[:-1])
-            record: dict[str, Any] = loads(message.body)
+        # The CONSUMER span for this delivery. It joins the trace the extractor's publish
+        # span started, through the W3C context in the AMQP headers, so a record's whole
+        # path is one trace; headers carrying no readable context start a new one. Every
+        # db span the Neo4j wrapper opens below nests inside it, and in batch mode the
+        # span's context is carried on the pending message so the eventual flush span can
+        # link back to it.
+        with gm_telemetry.consume_span(destination, getattr(message, "headers", None)) as span:
+            try:
+                logger.debug("🔄 Received message", data_type=data_type[:-1])
+                record: dict[str, Any] = loads(message.body)
 
-            if await check_file_completion(record, data_type, message):
-                return
+                if await check_file_completion(record, data_type, message):
+                    return
 
-            if BATCH_MODE and batch_processor is not None:
-                accepted = await batch_processor.add_message(
-                    data_type,
-                    record,
-                    message.ack,
-                    # requeue=False: this callback nacks permanently-invalid
-                    # input (unknown data_type, missing 'id', normalize failure,
-                    # poison batch) — send it straight to the DLQ instead of
-                    # cycling x-delivery-limit (20) futile redeliveries. Transient
-                    # failures are handled by _flush_queue's re-enqueue+backoff,
-                    # which never nacks.
-                    lambda: message.nack(requeue=False),
+                if BATCH_MODE and batch_processor is not None:
+                    accepted = await batch_processor.add_message(
+                        data_type,
+                        record,
+                        message.ack,
+                        # requeue=False: this callback nacks permanently-invalid
+                        # input (unknown data_type, missing 'id', normalize failure,
+                        # poison batch) — send it straight to the DLQ instead of
+                        # cycling x-delivery-limit (20) futile redeliveries. Transient
+                        # failures are handled by _flush_queue's re-enqueue+backoff,
+                        # which never nacks.
+                        lambda: message.nack(requeue=False),
+                        # This delivery's span has ended by the time the batch is written, so
+                        # its context rides along and the flush span links back to it.
+                        span_context=gm_telemetry.span_context_of(span),
+                    )
+                    if accepted:
+                        # Note: message_counts tracks received (not processed) messages in
+                        # batch mode. Actual processed count is in batch_processor.processed_counts.
+                        # Messages nacked later by _process_*_batch (e.g. missing 'id') are included.
+                        message_counts[data_type] += 1
+                        last_message_time[data_type] = time.time()
+                    # groovemap.pipeline.messages is not recorded here: in batch mode the
+                    # per-record outcome (processed/skipped/failed) is only known once the batch
+                    # is flushed, so Neo4jBatchProcessor records groovemap.pipeline.batch.* for
+                    # this data instead.
+                    return
+
+                record = normalize_record(data_type, record)
+
+                # Validate required 'id' field — nack with requeue=False to avoid
+                # infinite requeue loop for malformed messages (matches tableinator).
+                # Check both missing key and None value since normalize_record
+                # sets id=None when the raw message lacks an id field.
+                if not record.get("id"):
+                    logger.error("❌ Message missing 'id' field", data_type=data_type)
+                    consumed_error_type = "MissingIdError"
+                    gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
+                    await message.nack(requeue=False)
+                    return
+
+                record_id = record.get("id", "unknown")
+                record_name = record.get(name_field, default_name)
+
+                logger.debug(
+                    f"🔄 Processing {data_type[:-1]}",
+                    record_id=record_id,
+                    record_name=record_name,
                 )
-                if accepted:
-                    # Note: message_counts tracks received (not processed) messages in
-                    # batch mode. Actual processed count is in batch_processor.processed_counts.
-                    # Messages nacked later by _process_*_batch (e.g. missing 'id') are included.
-                    message_counts[data_type] += 1
-                    last_message_time[data_type] = time.time()
-                # groovemap.pipeline.messages is not recorded here: in batch mode the
-                # per-record outcome (processed/skipped/failed) is only known once the batch
-                # is flushed, so Neo4jBatchProcessor records groovemap.pipeline.batch.* for
-                # this data instead.
-                return
 
-            record = normalize_record(data_type, record)
+                if graph is None:
+                    raise RuntimeError("Neo4j driver not initialized")
 
-            # Validate required 'id' field — nack with requeue=False to avoid
-            # infinite requeue loop for malformed messages (matches tableinator).
-            # Check both missing key and None value since normalize_record
-            # sets id=None when the raw message lacks an id field.
-            if not record.get("id"):
-                logger.error("❌ Message missing 'id' field", data_type=data_type)
-                consumed_error_type = "MissingIdError"
+                async with graph.session(database="neo4j") as session:
+
+                    async def tx_fn(tx: Any) -> bool:
+                        return bool(await process_fn(tx, record))
+
+                    updated = await session.execute_write(tx_fn)
+
+                # Ack first, then increment counters — avoids double-ack-then-nack
+                # if ack raises (exception handler would attempt nack on already-acked msg)
+                await message.ack()
+
+                # Neo4j answered — clear the outage backoff.
+                outage_backoff.reset()
+
+                message_counts[data_type] += 1
+                last_message_time[data_type] = time.time()
+                gm_telemetry.record_message(entity, "processed" if updated else "skipped", time.perf_counter() - started)
+                if message_counts[data_type] % progress_interval == 0:
+                    logger.info(
+                        f"📊 Processed {data_type} in Neo4j",
+                        message_counts=message_counts[data_type],
+                    )
+
+                if updated:
+                    logger.debug(
+                        f"💾 Updated {data_type[:-1]} in Neo4j",
+                        record_id=record_id,
+                    )
+                else:
+                    logger.debug(
+                        f"🔄 Skipped {data_type[:-1]} (no changes needed)",
+                        record_id=record_id,
+                    )
+            except (ServiceUnavailable, SessionExpired, DatabaseUnavailableError) as e:
+                consumed_error_type = type(e).__name__
                 gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
-                await message.nack(requeue=False)
-                return
-
-            record_id = record.get("id", "unknown")
-            record_name = record.get(name_field, default_name)
-
-            logger.debug(
-                f"🔄 Processing {data_type[:-1]}",
-                record_id=record_id,
-                record_name=record_name,
-            )
-
-            if graph is None:
-                raise RuntimeError("Neo4j driver not initialized")
-
-            async with graph.session(database="neo4j") as session:
-
-                async def tx_fn(tx: Any) -> bool:
-                    return bool(await process_fn(tx, record))
-
-                updated = await session.execute_write(tx_fn)
-
-            # Ack first, then increment counters — avoids double-ack-then-nack
-            # if ack raises (exception handler would attempt nack on already-acked msg)
-            await message.ack()
-
-            # Neo4j answered — clear the outage backoff.
-            outage_backoff.reset()
-
-            message_counts[data_type] += 1
-            last_message_time[data_type] = time.time()
-            gm_telemetry.record_message(entity, "processed" if updated else "skipped", time.perf_counter() - started)
-            if message_counts[data_type] % progress_interval == 0:
-                logger.info(
-                    f"📊 Processed {data_type} in Neo4j",
-                    message_counts=message_counts[data_type],
+                logger.warning(
+                    f"⚠️ Neo4j unavailable, will retry {data_type[:-1]} message",
+                    error=str(e),
                 )
-
-            if updated:
-                logger.debug(
-                    f"💾 Updated {data_type[:-1]} in Neo4j",
+                # Pause before requeueing — x-delivery-limit=20 is a budget with no
+                # time dimension, so unthrottled requeues dead-letter valid records
+                # within minutes of a Neo4j outage (discogsography-rb05).
+                await outage_backoff.wait()
+                try:
+                    await message.nack(requeue=True)
+                except Exception as nack_error:
+                    logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+            except Exception as e:
+                consumed_error_type = type(e).__name__
+                gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
+                logger.error(
+                    f"❌ Failed to process {data_type[:-1]} message",
                     record_id=record_id,
+                    error=str(e),
                 )
-            else:
-                logger.debug(
-                    f"🔄 Skipped {data_type[:-1]} (no changes needed)",
-                    record_id=record_id,
-                )
-        except (ServiceUnavailable, SessionExpired, DatabaseUnavailableError) as e:
-            consumed_error_type = type(e).__name__
-            gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
-            logger.warning(
-                f"⚠️ Neo4j unavailable, will retry {data_type[:-1]} message",
-                error=str(e),
-            )
-            # Pause before requeueing — x-delivery-limit=20 is a budget with no
-            # time dimension, so unthrottled requeues dead-letter valid records
-            # within minutes of a Neo4j outage (discogsography-rb05).
-            await outage_backoff.wait()
-            try:
-                await message.nack(requeue=True)
-            except Exception as nack_error:
-                logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-        except Exception as e:
-            consumed_error_type = type(e).__name__
-            gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
-            logger.error(
-                f"❌ Failed to process {data_type[:-1]} message",
-                record_id=record_id,
-                error=str(e),
-            )
-            try:
-                await message.nack(requeue=True)
-            except Exception as nack_error:
-                logger.warning("⚠️ Failed to nack message", error=str(nack_error))
-        finally:
-            gm_telemetry.record_consumed_message(destination, consumed_error_type)
+                try:
+                    await message.nack(requeue=True)
+                except Exception as nack_error:
+                    logger.warning("⚠️ Failed to nack message", error=str(nack_error))
+            finally:
+                gm_telemetry.mark_consumed_error(span, consumed_error_type)
+                gm_telemetry.record_consumed_message(destination, consumed_error_type)
 
     return handler
 
@@ -1902,6 +1913,11 @@ async def main() -> None:
 
     setup_logging(SERVICE_NAME, log_file=Path(f"/logs/{SERVICE_NAME}.log"))
     setup_telemetry(TELEMETRY_SERVICE_NAME)
+    # Sample event-loop lag from this loop. Every consumer, flush, and maintenance task runs
+    # on it, so a loop that stops scheduling promptly is the one signal that explains a
+    # pipeline slowing down while Neo4j and RabbitMQ both look healthy. Returns None (and
+    # costs nothing) when metrics export is off.
+    start_event_loop_monitor()
     logger.info("🚀 Starting GrooveMap discogs-graph-enricher service")
 
     # Add startup delay for dependent services
