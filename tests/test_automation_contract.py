@@ -9,6 +9,10 @@ AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
 PYTHON_LIBRARIES_REVISION = "455523ec388fdb9862d7aca65d9434aa7073dcb5"
 
 
+def _maintained_markdown() -> list[Path]:
+    return [ROOT / "README.md", ROOT / "graphinator" / "README.md", *sorted((ROOT / "docs").glob("*.md"))]
+
+
 def test_reusable_workflows_are_immutably_pinned() -> None:
     expected = {
         "ci.yml": "reusable-ci.yml",
@@ -43,7 +47,7 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
         "language: python",
         "setup-command: just setup",
         "check-command: just check",
-        "coverage-command: just test",
+        "coverage-command: just coverage",
         "audit-command: just audit",
         "license-command: just license-check",
         "secret-scan-command: just secret-scan",
@@ -116,6 +120,82 @@ def test_required_regression_suites_remain_in_the_full_gate() -> None:
         source = (ROOT / relative_path).read_text()
         for test_name in test_names:
             assert f"def {test_name}(" in source
+
+
+def test_validation_recipes_use_locked_narrow_capabilities() -> None:
+    justfile = (ROOT / "Justfile").read_text()
+
+    assert "uv run ruff format --check ." in justfile
+    assert "uv run ruff check ." in justfile
+    assert "uvx --from ruff" not in justfile
+    assert "contract-check:" in justfile
+    assert "coverage: test" in justfile
+    assert "secret-scan:" in justfile
+    assert "--version-files-only" in justfile
+    assert "--files-only" not in justfile
+
+
+def test_documentation_uses_current_owners_and_runtime_identifiers() -> None:
+    documentation = "\n".join(path.read_text() for path in _maintained_markdown())
+
+    assert "https://github.com/groovemap-music/discogs-ingestion" in documentation
+    assert "catalog-ingestion" not in documentation
+    for queue in (
+        "groovemap-discogs-graphinator-artists",
+        "groovemap-discogs-graphinator-labels",
+        "groovemap-discogs-graphinator-masters",
+        "groovemap-discogs-graphinator-releases",
+    ):
+        assert queue in documentation
+    for metric in (
+        "groovemap.pipeline.messages",
+        "groovemap.pipeline.message.duration",
+        "groovemap.pipeline.batch.size",
+        "groovemap.pipeline.batch.flush.duration",
+        "groovemap.pipeline.consumers.active",
+        "messaging.client.consumed.messages",
+        "db.client.operation.duration",
+        "groovemap.pipeline.reconnects",
+        "groovemap.runtime.event_loop.lag",
+    ):
+        assert metric in documentation
+
+
+def test_documentation_local_links_and_recipe_paths_resolve() -> None:
+    for markdown in _maintained_markdown():
+        source = markdown.read_text()
+        for target in re.findall(r"(?<!!)\[[^]]+\]\(([^)]+)\)", source):
+            target = target.split("#", 1)[0]
+            if not target or target.startswith(("http://", "https://", "mailto:")):
+                continue
+            assert (markdown.parent / target).resolve().exists(), f"broken link in {markdown.relative_to(ROOT)}: {target}"
+
+        for test_path in re.findall(r"tests/test_[A-Za-z0-9_]+\.py", source):
+            assert (ROOT / test_path).is_file(), f"missing recipe path in {markdown.relative_to(ROOT)}: {test_path}"
+
+
+def test_completion_mermaid_diagrams_preserve_runtime_ordering() -> None:
+    cancellation = (ROOT / "docs" / "consumer-cancellation.md").read_text()
+    completion = (ROOT / "docs" / "file-completion-tracking.md").read_text()
+
+    assert cancellation.count("```mermaid") == 1
+    assert cancellation.count("```") == 4  # Mermaid plus the verification command block.
+    assert cancellation.index("drain that entity batch queue") < cancellation.index("ack file_complete")
+    assert cancellation.index("ack file_complete") < cancellation.index("cancel that entity consumer")
+
+    assert completion.count("```mermaid") == 1
+    assert completion.count("```") == 4  # Mermaid plus the verification command block.
+    ordered_steps = (
+        "drain signalling entity queue",
+        "persist entity signal in Neo4j",
+        "ack final signal",
+        "start detached single-flight maintenance",
+        "drain all four batch queues",
+        "remove unresolved stubs",
+        "refresh genre, style, and label aggregates",
+    )
+    positions = [completion.index(step) for step in ordered_steps]
+    assert positions == sorted(positions)
 
 
 def test_no_renovate_or_legacy_claude_workflow_exists() -> None:
