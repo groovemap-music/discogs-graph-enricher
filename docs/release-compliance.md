@@ -1,8 +1,10 @@
 # Release compliance
 
-`just check` validates formatting, linting, types, tests and coverage, promoted contracts,
-immutable automation, package construction and installation, MIT metadata, secret scans, and
-version consistency. `just audit` performs the network-backed Python vulnerability audit.
+`just --summary` lists the repository-owned recipe surface. `just source-check` runs
+the locked Ruff formatting and lint capabilities plus promoted-contract validation.
+`just check` adds types, tests and coverage, immutable automation, package construction
+and installation, MIT metadata, the narrowly named secret scan, and a version-bump
+preview. `just audit` performs the network-backed Python vulnerability audit.
 
 `just image` builds `discogs-graph-enricher:local`, verifies its installed service import, and
 checks its numeric non-root runtime identity. `just release-dry-run` produces local checksums,
