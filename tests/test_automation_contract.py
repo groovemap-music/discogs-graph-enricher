@@ -43,7 +43,7 @@ def test_dependabot_pull_requests_run_the_ordinary_required_ci_graph() -> None:
         "language: python",
         "setup-command: just setup",
         "check-command: just check",
-        "coverage-command: just test",
+        "coverage-command: just coverage",
         "audit-command: just audit",
         "license-command: just license-check",
         "secret-scan-command: just secret-scan",
@@ -116,6 +116,19 @@ def test_required_regression_suites_remain_in_the_full_gate() -> None:
         source = (ROOT / relative_path).read_text()
         for test_name in test_names:
             assert f"def {test_name}(" in source
+
+
+def test_validation_recipes_use_locked_narrow_capabilities() -> None:
+    justfile = (ROOT / "Justfile").read_text()
+
+    assert "uv run ruff format --check ." in justfile
+    assert "uv run ruff check ." in justfile
+    assert "uvx --from ruff" not in justfile
+    assert "contract-check:" in justfile
+    assert "coverage: test" in justfile
+    assert "secret-scan:" in justfile
+    assert "--version-files-only" in justfile
+    assert "--files-only" not in justfile
 
 
 def test_no_renovate_or_legacy_claude_workflow_exists() -> None:
