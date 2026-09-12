@@ -1,155 +1,77 @@
 # Consumer cancellation and draining
 
-<div align="center">
+`discogs-graph-enricher` owns four RabbitMQ consumers, one for each Discogs entity
+type. The current producer is
+[`discogs-ingestion`](https://github.com/groovemap-music/discogs-ingestion); this
+document begins at delivery to this service's durable queues.
 
-**Automatic consumer lifecycle management for completed file processing**
-
-Last Updated: March 2026
-
-</div>
-
-## Overview
-
-`discogs-graph-enricher` cancels each RabbitMQ consumer after its Discogs file has
-completed processing. This frees broker resources while leaving other queues available
-to finish and makes active versus completed work explicit in health data and logs.
-
-## How It Works
-
-### Consumer Cancellation Lifecycle
+## Per-queue completion
 
 ```mermaid
 sequenceDiagram
-    participant EXT as catalog-ingestion
     participant RMQ as RabbitMQ
-    participant CONS as discogs-graph-enricher
-    participant TIMER as Cancellation Timer
+    participant DGE as discogs-graph-enricher
+    participant NEO as Neo4j
 
-    EXT->>RMQ: Publish file_complete to fanout exchange
-    RMQ->>CONS: Deliver file_complete via consumer queue
-    CONS->>CONS: Mark file as complete (🎉)
-    CONS->>TIMER: Schedule cancellation (300s grace period)
-
-    Note over CONS,TIMER: Grace period (5 minutes)
-
-    TIMER-->>CONS: Grace period expired
-    CONS->>RMQ: Cancel consumer for queue
-    CONS->>CONS: Update active consumers list
-    CONS->>CONS: Log consumer status
-
-    Note over CONS: Connection remains open<br/>for other queues
-
-    style EXT fill:#fff9c4
-    style RMQ fill:#fff3e0
-    style CONS fill:#e0f2f1
-    style TIMER fill:#ffebee
+    RMQ->>DGE: deliver file_complete for one entity type
+    DGE->>NEO: drain that entity batch queue
+    alt drain succeeds
+        DGE->>DGE: mark entity type complete
+        DGE->>RMQ: ack file_complete
+        DGE->>DGE: wait CONSUMER_CANCEL_DELAY
+        DGE->>RMQ: cancel that entity consumer
+        opt all four consumers are cancelled
+            DGE->>RMQ: close shared channel and connection
+        end
+    else records remain pending
+        DGE->>RMQ: nack file_complete with requeue=true
+    end
 ```
 
-### Process Steps
+The completion marker never overtakes its data. `flush_queue()` waits for an
+in-flight batch and drains the in-memory queue before the marker is acknowledged.
+If its bounded retries cannot drain the queue, the marker is requeued and the entity
+is not marked complete.
 
-1. When `catalog-ingestion` sends a `file_complete` message,
-   `discogs-graph-enricher`:
+`CONSUMER_CANCEL_DELAY` defaults to `300` seconds. A value of `0` disables the
+per-queue cancellation timer. Cancellation uses the queue's registered consumer tag
+and `nowait=True`; a newer completion marker replaces an existing timer for the same
+entity type. The shared RabbitMQ channel and connection remain open while any
+consumer is active and close after all four consumers are cancelled and all four
+entity types are complete.
 
-   - Mark the file as complete (shows 🎉 in progress reports)
-   - Schedule the consumer for that queue to be canceled after a grace period
-   - The default grace period is 5 minutes (300 seconds)
+When idle, the service checks queue depth every `QUEUE_CHECK_INTERVAL` seconds
+(default `3600`). If any queue has work, it reconnects and registers consumers for
+all four entity types, including types whose queues were empty at the instant of the
+depth check. Unexpectedly missing consumers are checked every
+`STUCK_CHECK_INTERVAL` seconds (default `30`) and use the same recovery path.
 
-1. After the grace period expires:
+## Process shutdown
 
-   - The consumer for that specific queue is canceled
-   - The connection and channel remain open for other queues
-   - Progress reports show which consumers are active vs. canceled
+SIGINT and SIGTERM use a separate, immediate drain path:
 
-1. Benefits:
+1. Cancel every registered consumer before doing slow teardown work.
+2. Stop progress, recovery, and periodic batch-flush tasks.
+3. Ask every batch queue to drain. Records that cannot be written stay pending; a
+   transient database outage is not converted into a dead-letter decision.
+4. Cancel delayed consumer-cancellation tasks and any detached maintenance task.
+5. Close RabbitMQ, then Neo4j, then telemetry and the health server.
 
-   - Frees up RabbitMQ resources (connections, channels, memory)
-   - Clearer monitoring - easy to see which files are still being processed
-   - Prevents unnecessary network traffic for completed queues
+This ordering stops new deliveries before the service begins flushing. It also avoids
+nacking the same delivery repeatedly while its consumer remains subscribed.
+Post-import maintenance is idempotent; if shutdown interrupts it, the next extraction
+completion signal or an operator-initiated rerun must perform it again.
 
-## Configuration
+## Operations and tests
 
-### Environment Variable
-
-- `CONSUMER_CANCEL_DELAY`: Number of seconds to wait before canceling a consumer after file completion
-  - Default: 300 (5 minutes)
-  - Set to 0 to disable consumer cancellation
-  - Can be set per service or globally
-
-### Examples
+Health is available at `http://localhost:8001/health`. Its `active_consumers`,
+`completed_files`, `message_counts`, and `current_task` fields describe the local
+process; there is no Prometheus scrape route.
 
 ```bash
-# Start the service entry point with a short grace period
-CONSUMER_CANCEL_DELAY=30 uv run discogs-graph-enricher
-
-# Disable consumer cancellation
-CONSUMER_CANCEL_DELAY=0 uv run discogs-graph-enricher
+uv run pytest tests/test_file_completion.py tests/test_shutdown_delivery_churn.py \
+  tests/test_graphinator.py
 ```
 
-## Monitoring
-
-### Progress Reports
-
-The periodic progress reports now include consumer status:
-
-```
-📊 Progress: 1000 total messages processed (🎉 Artists: 500, Labels: 500, Masters: 0, Releases: 0)
-🔧 Canceled consumers: ['artists']
-✅ Active consumers: ['labels', 'masters', 'releases']
-```
-
-### Log Messages
-
-Watch for these log messages:
-
-- `🎉 File processing complete for {type}!` - File marked as complete
-- `🔧 Canceling consumer for {type} after {delay}s grace period` - Consumer cancellation scheduled
-- `✅ Consumer for {type} successfully canceled` - Consumer successfully canceled
-- `❌ Failed to cancel consumer for {type}` - Cancellation failed (non-fatal)
-
-## Testing
-
-Run the focused regression tests:
-
-1. **test_file_completion.py** - Tests the file completion message handling
-
-```bash
-uv run pytest tests/test_file_completion.py tests/test_shutdown_delivery_churn.py
-```
-
-## Edge Cases Handled
-
-1. **Multiple Completion Messages**: If multiple completion messages are received, only one cancellation is scheduled
-1. **Service Restart**: Consumer tags are lost on restart, but the feature continues to work for new messages
-1. **Cancellation Failure**: Failures are logged but don't crash the service
-1. **Grace Period**: Ensures all in-flight messages are processed before cancellation
-
-## Technical Details
-
-- Uses aio_pika's `queue.cancel(consumer_tag, nowait=True)` to cancel consumers
-- Consumer tags are stored when consumers are created
-- Cancellation tasks are tracked to allow proper cleanup on shutdown
-- The `nowait=True` parameter prevents hanging if RabbitMQ is slow to respond
-
-## catalog-ingestion integration
-
-The upstream `catalog-ingestion` service integrates with consumer cancellation by:
-
-1. **Sending File Completion Messages**: When a file finishes processing, the extractor sends a
-   "file_complete" message
-1. **Tracking Completed Files**: The extractor maintains a `completed_files` set to avoid false stalled warnings
-1. **Progress Monitoring**: Completed files are excluded from stalled detection logic
-
-This prevents the extractors from incorrectly reporting files as "stalled" when they have actually completed processing
-and their consumers have been canceled.
-
-### Extraction Completion Signal (March 2026)
-
-After all files finish, `catalog-ingestion` sends an `extraction_complete` message to
-all Discogs fanout exchanges. `discogs-graph-enricher` uses this signal to:
-
-- **Flush remaining batches** before cleanup
-- Delete stub Neo4j nodes (no `sha256` property) created by cross-type `MERGE`
-  operations
-- Recompute the aggregate properties consumed by graph-query services
-
-This ensures database record counts match extractor counts after each run. See [File Completion Tracking](file-completion-tracking.md) and [Database Schema — Post-Extraction Cleanup](https://github.com/groovemap-music/database-schema) for details.
+See [file and extraction completion](file-completion-tracking.md) for the durable
+four-signal latch and post-import maintenance gate.

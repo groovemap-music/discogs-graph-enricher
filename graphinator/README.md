@@ -105,8 +105,9 @@ The graphinator implements intelligent batch processing for optimal Neo4j write 
 
 - **Automatic Batching**: Messages are collected into batches instead of being processed individually
 - **Dual Triggers**: Batches flush when reaching size limit (`NEO4J_BATCH_SIZE`) OR time interval (`NEO4J_BATCH_FLUSH_INTERVAL`)
-- **Graceful Shutdown**: All pending batches are flushed automatically before service shutdown
-- **Performance Gains**: 3-5x faster write throughput compared to individual transactions
+- **Graceful Shutdown**: New deliveries stop before pending batches are drained
+- **Bounded Concurrency**: At most two entity types flush concurrently, while
+  same-entity flushes are serialized
 
 **Configuration Examples:**
 
@@ -315,6 +316,8 @@ uv run discogs-graph-enricher
 
 ```bash
 # Run the repository checks
+just --summary
+just source-check
 just check
 
 # Run specific test
@@ -333,36 +336,15 @@ docker image inspect discogs-graph-enricher:local
 The release image is `ghcr.io/groovemap-music/discogs-graph-enricher`. Runtime
 composition is owned by the `deployment` repository.
 
-## Neo4j Queries
+## Performance and query ownership
 
-Example Cypher queries for exploring the data:
-
-```cypher
-// Find all releases on a label
-MATCH (r:Release)-[:ON]->(l:Label {name: "Blue Note"})
-RETURN r.title, r.year
-ORDER BY r.year
-
-// Find band members
-MATCH (member:Artist)-[:MEMBER_OF]->(band:Artist {name: "The Beatles"})
-RETURN member.name
-
-// Find all pressings of a master recording
-MATCH (r:Release)-[:DERIVED_FROM]->(m:Master {title: "Kind of Blue"})
-RETURN r.title, r.year, r.formats
-
-// Find labels that issued releases on shellac
-MATCH (l:Label)<-[:ON]-(r:Release)-[:ISSUED_ON {source: "discogs"}]->(:Medium)-[:IN_FAMILY]->(:MediaFamily {name: "shellac"})
-RETURN DISTINCT l.name
-ORDER BY l.name
-```
-
-## Performance Optimization
-
-- Connection pooling with Neo4j driver
-- Batch transactions for bulk inserts
-- Index creation on frequently queried properties
-- Efficient Cypher queries with proper node matching
+This service owns batch coordination and Discogs write projection. See the
+[graph-writer performance guide](../docs/performance-guide.md) and
+[Neo4j write-query design](../docs/query-performance-optimizations.md). Public API
+read-query performance belongs to
+[`catalog-api`](https://github.com/groovemap-music/catalog-api/blob/main/docs/performance-guide.md),
+and index creation belongs to
+[`database-schema`](https://github.com/groovemap-music/database-schema).
 
 ## Monitoring
 

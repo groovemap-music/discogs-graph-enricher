@@ -31,8 +31,9 @@ removes unresolved stub nodes, and refreshes aggregate graph statistics.
 
 Some identifiers intentionally remain stable across the repository extraction:
 
-- `graphinator` is the Python import package and the v1 catalog-contract consumer key.
-  The latter preserves durable queue names such as
+- `graphinator` is the Python import package, the v1 catalog-contract consumer key,
+  and the default OpenTelemetry `service.name` retained for compatibility. The
+  consumer key preserves durable queue names such as
   `groovemap-discogs-graphinator-artists`; renaming those queues requires a coordinated
   contract migration so in-flight messages are not stranded. It is not the service,
   image, health identity, log identity, or ephemeral RabbitMQ consumer tag.
@@ -62,8 +63,8 @@ catalog.
 - Poison records are isolated so healthy records in the same batch can complete.
 - Shutdown first cancels consumers, then drains or safely re-enqueues in-flight work;
   a delivery is never negatively acknowledged while its consumer is still subscribed.
-- Pending batch writes and detached post-import maintenance are awaited before the
-  Neo4j driver closes.
+- Pending batch writes are drained before the Neo4j driver closes. Detached
+  post-import maintenance is cancelled on shutdown and can be repeated safely.
 
 The historical failure modes are guarded by the shutdown-delivery-churn, file-completion,
 batch-drain, and transient-classification regression suites. See
@@ -80,8 +81,10 @@ runtime composition and credentials; this repository owns the image and its appl
 contract.
 
 This consumer makes no HTTP requests to Discogs and therefore emits no Discogs
-`User-Agent`. Discogs HTTP identity belongs to the upstream `discogs-ingestion` service;
-all identity emitted here uses GrooveMap and `discogs-graph-enricher`.
+`User-Agent`. Discogs HTTP identity belongs to the upstream `discogs-ingestion`
+service. Application, image, health, and log identity here use GrooveMap and
+`discogs-graph-enricher`; the retained telemetry default is documented above and can
+be overridden with `OTEL_SERVICE_NAME`.
 
 ## Development
 
@@ -91,12 +94,16 @@ lockfile records the reviewed immutable revision.
 ```bash
 mise install
 just setup
+just --summary
+just source-check
 just check
 just image
 ```
 
-`just check` uses mocked Neo4j and RabbitMQ boundaries. Live integration, load, and
-deployment checks remain separate. See the
+`just source-check` runs the locked Ruff formatter and linter plus promoted-contract
+verification. `just check` adds types, coverage, secret scanning, package and install
+checks, licenses, and a version-bump preview. It uses mocked Neo4j and RabbitMQ
+boundaries; live integration, load, and deployment checks remain separate. See the
 [service reference](graphinator/README.md) for configuration and the graph data model.
 
 Cross-repository dependency access uses a narrowly installed GitHub App and a short-lived

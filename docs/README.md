@@ -10,12 +10,12 @@ the Neo4j knowledge graph.
 - [Consumer cancellation and drain behavior](consumer-cancellation.md)
 - [File and extraction completion](file-completion-tracking.md)
 - [Neo4j and RabbitMQ resilience](database-resilience.md)
-- [Neo4j indexing](neo4j-indexing.md)
+- [Neo4j schema and index ownership](neo4j-indexing.md)
 
 ## Performance and provenance
 
 - [Performance guide](performance-guide.md)
-- [Query performance optimization record](query-performance-optimizations.md)
+- [Neo4j write-query design](query-performance-optimizations.md)
 - [Release compliance](release-compliance.md)
 - [History rewrite approval gate](history-rewrite-gate.md)
 
