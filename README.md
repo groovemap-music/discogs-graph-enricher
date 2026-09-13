@@ -97,13 +97,18 @@ just setup
 just --summary
 just source-check
 just check
+just test-integration
 just image
 ```
 
 `just source-check` runs the locked Ruff formatter and linter plus promoted-contract
 verification. `just check` adds types, coverage, secret scanning, package and install
 checks, licenses, and a version-bump preview. It uses mocked Neo4j and RabbitMQ
-boundaries; live integration, load, and deployment checks remain separate. See the
+boundaries and never opens a network connection. `just test-integration` requires Docker;
+it starts a disposable, loopback-only Neo4j container, runs representative graph writes
+and the historical multi-genre taxonomy regression, and removes the container and its
+data on exit. CI invokes this explicit integration tier on pull requests. Live load and
+deployment checks remain separate. See the
 [service reference](graphinator/README.md) for configuration and the graph data model.
 
 Cross-repository dependency access uses a narrowly installed GitHub App and a short-lived
