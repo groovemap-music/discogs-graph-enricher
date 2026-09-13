@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aio_pika.abc import AbstractChannel, AbstractConnection, AbstractQueue
 from common import telemetry
+from neo4j import AsyncDriver, AsyncManagedTransaction, AsyncResult, AsyncSession
 from opentelemetry.sdk.metrics import MeterProvider as SdkMeterProvider
 from opentelemetry.sdk.metrics.export import InMemoryMetricReader
 from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
@@ -163,17 +164,24 @@ def mock_amqp_connection() -> AsyncMock:
 
 @pytest.fixture
 def mock_neo4j_driver() -> MagicMock:
-    """Return a driver whose session follows the runtime async context contract."""
-    driver = MagicMock()
-    session = AsyncMock()
-    context = AsyncMock()
-    context.__aenter__ = AsyncMock(return_value=session)
-    context.__aexit__ = AsyncMock(return_value=None)
-    driver.session = MagicMock(return_value=context)
-    session.execute_write = AsyncMock(return_value=True)
-    session.run.return_value.single.return_value = None
-    session.close = AsyncMock()
-    driver.close = AsyncMock()
+    """Return a spec-bound driver with the real async session/transaction shape."""
+    driver = MagicMock(spec=AsyncDriver)
+    session = MagicMock(spec=AsyncSession)
+    transaction = MagicMock(spec=AsyncManagedTransaction)
+    result = MagicMock(spec=AsyncResult)
+
+    driver.session.return_value = session
+    session.__aenter__.return_value = session
+    session.__aexit__.return_value = None
+    session.run.return_value = result
+    result.__aiter__.return_value = iter(())
+    result.single.return_value = None
+    transaction.run.return_value = result
+
+    async def execute_write(transaction_function: Any, *args: Any, **kwargs: Any) -> Any:
+        return await transaction_function(transaction, *args, **kwargs)
+
+    session.execute_write.side_effect = execute_write
     return driver
 
 

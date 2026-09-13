@@ -273,6 +273,9 @@ class TestFlushQueue:
         # Should return early without error
         await processor._flush_queue("artists")
 
+        assert processor.get_stats()["pending"]["artists"] == 0
+        assert processor.batch_counts["artists"] == 0
+
     @pytest.mark.asyncio
     async def test_flush_queue_empty_messages_returns_early(self) -> None:
         """Test _flush_queue hits 'if not messages' branch when batch_size=0 (line 171)."""
@@ -517,13 +520,17 @@ class TestFlushQueue:
         # Should not raise exception
         await processor._flush_queue("artists")
 
+        ack.assert_awaited_once()
+        assert processor.processed_counts["artists"] == 1
+        assert len(processor.queues["artists"]) == 0
+
     @pytest.mark.asyncio
     async def test_flush_handles_nack_failure(self) -> None:
         """Test handling nack callback failures."""
         mock_driver, mock_session = create_async_session_mock()
         mock_session.execute_write.side_effect = RuntimeError("Error")
 
-        processor = Neo4jBatchProcessor(mock_driver)
+        processor = Neo4jBatchProcessor(mock_driver, BatchConfig(max_poison_retries=1))
 
         ack = AsyncMock()
         nack = AsyncMock(side_effect=Exception("Nack failed"))
@@ -532,6 +539,10 @@ class TestFlushQueue:
 
         # Should not raise exception
         await processor._flush_queue("artists")
+
+        nack.assert_awaited_once()
+        assert processor.processed_counts["artists"] == 0
+        assert len(processor.queues["artists"]) == 0
 
     @pytest.mark.asyncio
     async def test_flush_handles_cancelled_error_re_enqueues(self) -> None:
@@ -621,10 +632,11 @@ class TestProcessArtistsBatch:
 
         messages = [PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())]
 
-        await processor._process_artists_batch(messages)
+        nack_indices = await processor._process_artists_batch(messages)
 
         # Should only run hash check query, not updates
         assert mock_session.run.call_count == 1
+        assert nack_indices == set()
 
     @pytest.mark.asyncio
     async def test_process_artists_with_updates(self) -> None:
@@ -646,10 +658,11 @@ class TestProcessArtistsBatch:
             )
         ]
 
-        await processor._process_artists_batch(messages)
+        nack_indices = await processor._process_artists_batch(messages)
 
         # Should have called execute_write
         mock_session.execute_write.assert_called_once()
+        assert nack_indices == set()
 
     @pytest.mark.asyncio
     async def test_process_artists_with_relationships(self) -> None:
@@ -678,9 +691,10 @@ class TestProcessArtistsBatch:
             )
         ]
 
-        await processor._process_artists_batch(messages)
+        nack_indices = await processor._process_artists_batch(messages)
 
         mock_session.execute_write.assert_called_once()
+        assert nack_indices == set()
 
     @pytest.mark.asyncio
     async def test_process_artists_skips_messages_with_missing_id(self) -> None:
@@ -697,10 +711,11 @@ class TestProcessArtistsBatch:
         ]
 
         with patch("graphinator.batch_processor.logger") as mock_logger:
-            await processor._process_artists_batch(messages)
+            nack_indices = await processor._process_artists_batch(messages)
 
         mock_logger.warning.assert_called()
         mock_session.execute_write.assert_called_once()
+        assert nack_indices == {0}
 
     @pytest.mark.asyncio
     async def test_process_artists_all_missing_id_returns_early(self) -> None:
@@ -714,9 +729,10 @@ class TestProcessArtistsBatch:
         ]
 
         with patch("graphinator.batch_processor.logger"):
-            await processor._process_artists_batch(messages)
+            nack_indices = await processor._process_artists_batch(messages)
 
         mock_driver.session.assert_not_called()
+        assert nack_indices == {0, 1}
 
 
 class TestProcessLabelsBatch:
