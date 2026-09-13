@@ -16,11 +16,14 @@ service is a consumer of that taxonomy, not a second implementation of it.
 
 ## Nodes and relationships
 
-```
-(:Medium {id, family, label})                          unique on id
-(:MediaFamily {name})                                   unique on name
-(:Medium)-[:IN_FAMILY]->(:MediaFamily)
-(:Release)-[:ISSUED_ON {qty, source: "discogs"}]->(:Medium)
+```mermaid
+flowchart LR
+    RELEASE["Release"]
+    MEDIUM["Medium<br/>id — unique<br/>family<br/>label"]
+    MEDIA_FAMILY["MediaFamily<br/>name — unique"]
+
+    RELEASE -->|"ISSUED_ON<br/>qty, source: &quot;discogs&quot;"| MEDIUM
+    MEDIUM -->|IN_FAMILY| MEDIA_FAMILY
 ```
 
 - **`Medium`** — one canonical medium (`vinyl_12`, `cd`, `cassette`, ...). `id` and
