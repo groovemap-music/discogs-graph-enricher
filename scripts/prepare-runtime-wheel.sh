@@ -2,6 +2,7 @@
 set -euo pipefail
 
 expected="24704f5fd48d3ef4fff29398585e9924e225b0c5"
+expected_tree="c5b96bdeab082057480a26784ad6065497aaae9a"
 runtime_repo="${GROOVEMAP_RUNTIME_REPO:-../python-libraries}"
 runtime_checkout=
 
@@ -29,6 +30,11 @@ if ! runtime_is_valid; then
   git clone --quiet --filter=blob:none --no-checkout \
     https://github.com/groovemap-music/python-libraries.git "${runtime_repo}"
   git -C "${runtime_repo}" checkout --quiet "${expected}"
+fi
+
+if [[ "$(git -C "${runtime_repo}" rev-parse HEAD^{tree})" != "${expected_tree}" ]]; then
+  echo "groovemap-runtime tree does not match the reviewed source tree ${expected_tree}." >&2
+  exit 2
 fi
 
 mkdir -p .build/runtime

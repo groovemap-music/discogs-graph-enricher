@@ -30,3 +30,6 @@ assert compatibility["application_runtime"]["tested_version"] == "0.1.0"
 runtime_source = pyproject["tool"]["uv"]["sources"]["groovemap-runtime"]
 assert runtime_source["rev"] == runtime_attestation["source_commit"]
 assert runtime_attestation["compatibility_baseline"] == compatibility["application_runtime"]["tested_commit"]
+assert runtime_attestation["source_repository"] == "https://github.com/groovemap-music/python-libraries"
+assert len(runtime_attestation["source_tree"]) == 40
+assert set(runtime_attestation["source_tree"]) <= set("0123456789abcdef")
