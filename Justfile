@@ -31,7 +31,11 @@ typecheck:
     uv run mypy
 
 test:
-    uv run pytest --cov=graphinator --cov-report=term-missing --cov-report=xml
+    uv run pytest -m "not integration" --cov=graphinator --cov-report=term-missing --cov-report=xml
+
+# Starts and removes a disposable, loopback-only Neo4j container.
+test-integration:
+    bash scripts/test-integration.sh
 
 coverage: test
 
