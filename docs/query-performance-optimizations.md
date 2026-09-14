@@ -8,8 +8,10 @@ and its
 
 ## Projection boundaries
 
-- `Neo4jBatchProcessor` owns queueing, acknowledgement, bounded retries, adaptive
-  batch size, and flush concurrency.
+- `common.batch.AsyncBatchEngine` owns queueing, acknowledgement, bounded retries,
+  adaptive batch size, cancellation restoration, drain, and flush concurrency.
+- `Neo4jBatchProcessor` is the owner-hive adapter: it normalizes Discogs records and
+  supplies Neo4j failure classification, telemetry, and projection policy to that engine.
 - `Neo4jBatchProjector` owns record-to-parameter projection and the Cypher executed
   for artists, labels, masters, and releases.
 - `entity_projection` owns the equivalent single-record path used when
@@ -18,6 +20,8 @@ and its
   [schema guide](database-schema.md) documents only the media projection it writes.
 
 Every batch query accepts records as parameters and begins with `UNWIND $records`.
+Fix queue or delivery-settlement lifecycle defects once in `common.batch` or
+`common.delivery`; keep Cypher, Neo4j exception mapping, and graph telemetry here.
 No record value is interpolated into Cypher text. Entity nodes are matched or merged
 on stable keys, then their `sha256` values gate idempotent updates. Relationship lists
 are projected as bounded parameter arrays inside the same transaction that owns the

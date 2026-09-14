@@ -1,7 +1,6 @@
 """Tests for batch_processor module."""
 
 import asyncio
-import contextlib
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -102,518 +101,168 @@ class TestPendingMessage:
         assert msg.received_at > 0
 
 
-class TestNeo4jBatchProcessorInit:
-    """Test Neo4jBatchProcessor initialization."""
-
-    def test_initialization_with_defaults(self) -> None:
-        """Test batch processor with default config."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        assert processor.driver == mock_driver
-        assert processor.config.batch_size == 100
-        assert processor.config.flush_interval == 5.0
-        assert len(processor.queues) == 4
-        assert "artists" in processor.queues
-        assert "labels" in processor.queues
-        assert "masters" in processor.queues
-        assert "releases" in processor.queues
-
-    def test_initialization_with_custom_config(self) -> None:
-        """Test batch processor with custom config."""
-        mock_driver = MagicMock()
-        config = BatchConfig(batch_size=50, flush_interval=2.0)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        assert processor.config.batch_size == 50
-        assert processor.config.flush_interval == 2.0
-
-    def test_initialization_with_env_batch_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test batch processor reads batch size from environment."""
-        monkeypatch.setenv("NEO4J_BATCH_SIZE", "200")
-        mock_driver = MagicMock()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        assert processor.config.batch_size == 200
-
-    def test_initialization_with_invalid_env_batch_size(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test batch processor handles invalid env batch size."""
-        monkeypatch.setenv("NEO4J_BATCH_SIZE", "invalid")
-        mock_driver = MagicMock()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # Should use default
-        assert processor.config.batch_size == 100
-
-
-class TestAddMessage:
-    """Test add_message functionality."""
+class TestSharedBatchRuntimeAdapter:
+    """Owner policy plugs into common.batch without reimplementing its lifecycle."""
 
     @pytest.mark.asyncio
-    async def test_add_message_to_queue(self) -> None:
-        """Test adding a message to queue."""
-        mock_driver = MagicMock()
-        config = BatchConfig(batch_size=10)
-        processor = Neo4jBatchProcessor(mock_driver, config)
+    async def test_success_settles_each_member_once_and_updates_owner_stats(self) -> None:
+        processor = Neo4jBatchProcessor(MagicMock(), BatchConfig(batch_size=2))
+        processor._process_artists_batch = AsyncMock(return_value={1})  # type: ignore[method-assign]
+        ack_one, ack_two, reject_two = AsyncMock(), AsyncMock(), AsyncMock()
 
-        ack_callback = AsyncMock()
-        nack_callback = AsyncMock()
-        data = {"id": "123", "name": "Test Artist", "sha256": "hash123"}
+        assert await processor.add_message("artists", {"id": "1"}, ack_one, AsyncMock())
+        assert await processor.add_message("artists", {"id": "2"}, ack_two, reject_two)
 
-        with patch("graphinator.batch_processor.normalize_record", return_value=data):
-            await processor.add_message("artists", data, ack_callback, nack_callback)
-
-        assert len(processor.queues["artists"]) == 1
-
-    @pytest.mark.asyncio
-    async def test_add_message_unknown_data_type(self) -> None:
-        """Test adding message with unknown data type."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack_callback = AsyncMock()
-        nack_callback = AsyncMock()
-        data = {"id": "123"}
-
-        await processor.add_message("unknown", data, ack_callback, nack_callback)
-
-        # Should nack the message
-        nack_callback.assert_called_once()
+        ack_one.assert_awaited_once()
+        ack_two.assert_not_awaited()
+        reject_two.assert_awaited_once()
+        assert processor.get_stats()["processed"]["artists"] == 1
+        assert processor.get_stats()["batches"]["artists"] == 1
 
     @pytest.mark.asyncio
-    async def test_add_message_missing_id(self) -> None:
-        """Test that messages missing 'id' field are nacked immediately."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
+    async def test_transient_failure_is_retained_without_poison_or_settlement(self) -> None:
+        from common.db_resilience import DatabaseUnavailableError
 
-        ack_callback = AsyncMock()
-        nack_callback = AsyncMock()
-        data = {"name": "Test Artist"}
-
-        result = await processor.add_message("artists", data, ack_callback, nack_callback)
-
-        assert result is False
-        nack_callback.assert_called_once()
-        assert len(processor.queues["artists"]) == 0
-
-    @pytest.mark.asyncio
-    async def test_add_message_normalization_error(self) -> None:
-        """Test handling normalization errors."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack_callback = AsyncMock()
-        nack_callback = AsyncMock()
-        data = {"id": "123"}
-
-        with patch("graphinator.batch_processor.normalize_record", side_effect=ValueError("Invalid data")):
-            await processor.add_message("artists", data, ack_callback, nack_callback)
-
-        # Should nack the message
-        nack_callback.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_add_message_triggers_flush_on_batch_size(self) -> None:
-        """Test that adding messages triggers flush when batch size reached."""
-        mock_driver = MagicMock()
-        config = BatchConfig(batch_size=2)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Mock the flush method
-        processor._flush_queue = AsyncMock()  # type: ignore[method-assign]
-
-        ack_callback = AsyncMock()
-        nack_callback = AsyncMock()
-        data = {"id": "123", "name": "Test", "sha256": "hash"}
-
-        with patch("graphinator.batch_processor.normalize_record", return_value=data):
-            # Add first message - shouldn't flush
-            await processor.add_message("artists", data, ack_callback, nack_callback)
-            assert processor._flush_queue.call_count == 0
-
-            # Add second message - should flush
-            await processor.add_message("artists", data, ack_callback, nack_callback)
-            processor._flush_queue.assert_called_once_with("artists")
-
-    @pytest.mark.asyncio
-    async def test_add_message_triggers_flush_on_interval(self) -> None:
-        """Test that messages trigger flush after interval."""
-        mock_driver = MagicMock()
-        config = BatchConfig(batch_size=100, flush_interval=0.1)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Mock the flush method
-        processor._flush_queue = AsyncMock()  # type: ignore[method-assign]
-
-        # Set last flush time to past
-        processor.last_flush["artists"] = 0.0
-
-        ack_callback = AsyncMock()
-        nack_callback = AsyncMock()
-        data = {"id": "123", "name": "Test", "sha256": "hash"}
-
-        with patch("graphinator.batch_processor.normalize_record", return_value=data):
-            await processor.add_message("artists", data, ack_callback, nack_callback)
-
-        # Should trigger flush due to interval
-        processor._flush_queue.assert_called_once_with("artists")
-
-
-class TestFlushQueue:
-    """Test _flush_queue functionality."""
-
-    @pytest.mark.asyncio
-    async def test_flush_empty_queue(self) -> None:
-        """Test flushing an empty queue."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # Should return early without error
-        await processor._flush_queue("artists")
-
-        assert processor.get_stats()["pending"]["artists"] == 0
-        assert processor.batch_counts["artists"] == 0
-
-    @pytest.mark.asyncio
-    async def test_flush_queue_empty_messages_returns_early(self) -> None:
-        """Test _flush_queue hits 'if not messages' branch when batch_size=0 (line 171)."""
-        mock_driver = MagicMock()
-        config = BatchConfig(batch_size=0)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Add a message so queue is non-empty (passes first 'if not queue' check)
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("artists", {"id": "1", "name": "Test", "sha256": "hash"}, ack, nack)
-        processor.queues["artists"].append(msg)
-
-        # With batch_size=0, the while loop never executes, messages stays empty
-        # This hits line 170-171 (if not messages: return)
-        await processor._flush_queue("artists")
-
-        # Should return early without processing
-        ack.assert_not_called()
-        nack.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_flush_artists_batch_success(self) -> None:
-        """Test successfully flushing artists batch."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # Add messages to queue
-        ack1 = AsyncMock()
-        ack2 = AsyncMock()
-        nack1 = AsyncMock()
-        nack2 = AsyncMock()
-
-        msg1 = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack1, nack1)
-        msg2 = PendingMessage("artists", {"id": "2", "name": "Artist 2", "sha256": "hash2"}, ack2, nack2)
-
-        processor.queues["artists"].append(msg1)
-        processor.queues["artists"].append(msg2)
-
-        await processor._flush_queue("artists")
-
-        # Should acknowledge both messages
-        ack1.assert_called_once()
-        ack2.assert_called_once()
-
-        # Should have updated stats
-        assert processor.processed_counts["artists"] == 2
-        assert processor.batch_counts["artists"] == 1
-
-    @pytest.mark.asyncio
-    async def test_poison_batch_nacked_to_dlq_not_wedged(self) -> None:
-        """Regression (cu2.19): a deterministic (non-transient) batch error must
-        not be retried forever.
-
-        Before the fix, the generic except path re-enqueued the batch and backed
-        off without ever nacking, so a poison record (e.g. a data-induced Neo4j
-        ClientError) retried indefinitely; once its unacked deliveries filled the
-        prefetch window the consumer wedged permanently. After the fix, bounded
-        consecutive failures trigger a nack so the poison batch is routed to the
-        DLQ and the queue drains.
-        """
-        mock_driver = MagicMock()
-        config = BatchConfig(
-            batch_size=5,
-            max_poison_retries=3,
-            backoff_initial=0.0,
-            min_batch_size=1,
+        processor = Neo4jBatchProcessor(
+            MagicMock(),
+            BatchConfig(batch_size=1, min_batch_size=1, backoff_initial=0.001),
         )
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Deterministic non-transient failure on every batch.
         processor._process_artists_batch = AsyncMock(  # type: ignore[method-assign]
-            side_effect=ValueError("data-induced ClientError")
+            side_effect=DatabaseUnavailableError("neo4j down")
         )
+        ack, nack = AsyncMock(), AsyncMock()
 
-        acks: list[int] = []
-        nacks: list[int] = []
+        assert await processor.add_message("artists", {"id": "1"}, ack, nack)
 
-        async def ack() -> None:
-            acks.append(1)
-
-        async def nack() -> None:
-            nacks.append(1)
-
-        for i in range(2):
-            processor.queues["artists"].append(PendingMessage("artists", {"id": str(i), "name": "x", "sha256": "h"}, ack, nack))
-
-        # Drive flushes; without the fix this loop never drains the queue.
-        for _ in range(50):
-            if not processor.queues["artists"]:
-                break
-            processor._backoff_until["artists"] = 0.0  # skip backoff sleeps in test
-            await processor._flush_queue("artists")
-
-        assert not processor.queues["artists"], "poison batch permanently wedged the queue"
-        assert len(nacks) == 2, "both poison messages must be nacked to the DLQ"
-        assert acks == [], "poison messages must never be acked"
+        snapshot = processor._engine.snapshot()
+        assert snapshot["pending"]["artists"] == 1  # type: ignore[index]
+        assert snapshot["transient_attempts"]["artists"] == 1  # type: ignore[index]
+        assert snapshot["poison_attempts"]["artists"] == 0  # type: ignore[index]
+        ack.assert_not_awaited()
+        nack.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_poison_batch_nack_failure_is_logged_and_swallowed(self) -> None:
-        """A failing nack_callback on the poison path must be caught and logged (not
-        raised), so a broken channel while routing poison to the DLQ does not crash
-        the flush loop or leave per-data-type state un-reset.
-        """
-        mock_driver = MagicMock()
-        config = BatchConfig(
-            batch_size=5,
-            max_poison_retries=1,
-            backoff_initial=0.0,
-            min_batch_size=1,
+    async def test_deterministic_poison_isolated_and_rejected_once(self) -> None:
+        processor = Neo4jBatchProcessor(
+            MagicMock(),
+            BatchConfig(batch_size=1, min_batch_size=1, max_flush_retries=2, max_poison_retries=2),
         )
-        processor = Neo4jBatchProcessor(mock_driver, config)
+        processor._process_artists_batch = AsyncMock(side_effect=ValueError("poison"))  # type: ignore[method-assign]
+        ack, nack = AsyncMock(), AsyncMock()
 
-        processor._process_artists_batch = AsyncMock(  # type: ignore[method-assign]
-            side_effect=ValueError("data-induced ClientError")
+        assert await processor.add_message("artists", {"id": "1"}, ack, nack)
+
+        ack.assert_not_awaited()
+        nack.assert_awaited_once()
+        assert processor._engine.snapshot()["pending"]["artists"] == 0  # type: ignore[index]
+
+    @pytest.mark.asyncio
+    async def test_bounded_drain_retains_deterministic_work_without_settlement(self) -> None:
+        processor = Neo4jBatchProcessor(
+            MagicMock(),
+            BatchConfig(batch_size=1, min_batch_size=1, max_flush_retries=2, max_poison_retries=10),
         )
+        processor._process_artists_batch = AsyncMock(side_effect=ValueError("still poison"))  # type: ignore[method-assign]
+        delivery = PendingMessage("artists", {"id": "1"}, AsyncMock(), AsyncMock())
+        await processor._engine.submit("artists", delivery, delivery)
 
-        async def failing_nack() -> None:
-            raise RuntimeError("channel closed")
-
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "0", "name": "x", "sha256": "h"}, AsyncMock(), failing_nack))
-
-        with patch("graphinator.batch_processor.logger") as mock_logger:
-            for _ in range(10):
-                if not processor.queues["artists"]:
-                    break
-                processor._backoff_until["artists"] = 0.0
-                await processor._flush_queue("artists")
-
-        # The nack failure was logged as a warning, not propagated.
-        assert any("Failed to nack message" in str(c.args[0]) for c in mock_logger.warning.call_args_list)
-        # State was still reset and the queue drained despite the nack failure.
-        assert not processor.queues["artists"]
-        assert processor._consecutive_failures["artists"] == 0
+        assert await processor.flush_queue("artists") is False
+        assert processor._engine.snapshot()["pending"]["artists"] == 1  # type: ignore[index]
+        delivery.ack_callback.assert_not_awaited()
+        delivery.nack_callback.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_flush_labels_batch_success(self) -> None:
-        """Test successfully flushing labels batch."""
-        mock_driver, _mock_session = create_async_session_mock()
+    async def test_retry_restores_original_order(self) -> None:
+        from common.db_resilience import DatabaseUnavailableError
 
-        processor = Neo4jBatchProcessor(mock_driver)
+        seen: list[list[str]] = []
 
+        async def process(messages: list[PendingMessage]) -> set[int]:
+            seen.append([str(message.data["id"]) for message in messages])
+            if len(seen) == 1:
+                raise DatabaseUnavailableError("retry")
+            return set()
+
+        processor = Neo4jBatchProcessor(
+            MagicMock(),
+            BatchConfig(batch_size=3, min_batch_size=1, backoff_initial=0.001),
+        )
+        processor._process_artists_batch = process  # type: ignore[method-assign]
+        messages = [PendingMessage("artists", {"id": str(index)}, AsyncMock(), AsyncMock()) for index in range(3)]
+        for message in messages:
+            await processor._engine.submit("artists", message, message)
+
+        assert await processor.flush_queue("artists") is False
+        await asyncio.sleep(0.002)
+        assert await processor.flush_queue("artists") is True
+        assert seen == [["0", "1", "2"], ["0"], ["1", "2"]]
+        assert all(message.ack_callback.await_count == 1 for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_cancellation_restores_unsettled_delivery(self) -> None:
+        entered = asyncio.Event()
+
+        async def block(_messages: list[PendingMessage]) -> set[int]:
+            entered.set()
+            await asyncio.Future()
+            return set()
+
+        processor = Neo4jBatchProcessor(MagicMock(), BatchConfig(batch_size=1))
+        processor._process_artists_batch = block  # type: ignore[method-assign]
+        ack, nack = AsyncMock(), AsyncMock()
+        task = asyncio.create_task(processor.add_message("artists", {"id": "1"}, ack, nack))
+        await entered.wait()
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert processor._engine.snapshot()["pending"]["artists"] == 1  # type: ignore[index]
+        ack.assert_not_awaited()
+        nack.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_observer_failure_cannot_change_settlement(self) -> None:
+        processor = Neo4jBatchProcessor(MagicMock(), BatchConfig(batch_size=1))
+        processor._process_artists_batch = AsyncMock(return_value=set())  # type: ignore[method-assign]
         ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("labels", {"id": "1", "name": "Label 1", "sha256": "hash1"}, ack, nack)
-        processor.queues["labels"].append(msg)
 
-        await processor._flush_queue("labels")
-
-        ack.assert_called_once()
-        assert processor.processed_counts["labels"] == 1
-
-    @pytest.mark.asyncio
-    async def test_flush_masters_batch_success(self) -> None:
-        """Test successfully flushing masters batch."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("masters", {"id": "1", "title": "Master 1", "year": 2023, "sha256": "hash1"}, ack, nack)
-        processor.queues["masters"].append(msg)
-
-        await processor._flush_queue("masters")
-
-        ack.assert_called_once()
-        assert processor.processed_counts["masters"] == 1
-
-    @pytest.mark.asyncio
-    async def test_flush_releases_batch_success(self) -> None:
-        """Test successfully flushing releases batch."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("releases", {"id": "1", "title": "Release 1", "year": 1997, "sha256": "hash1"}, ack, nack)
-        processor.queues["releases"].append(msg)
-
-        await processor._flush_queue("releases")
-
-        ack.assert_called_once()
-        assert processor.processed_counts["releases"] == 1
-
-    @pytest.mark.asyncio
-    async def test_flush_handles_neo4j_unavailable(self) -> None:
-        """Test handling Neo4j unavailable during flush."""
-        from neo4j.exceptions import ServiceUnavailable
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        # Message should be back in queue for retry
-        assert len(processor.queues["artists"]) == 1
-        # Should not have acknowledged
-        ack.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_flush_handles_general_error(self) -> None:
-        """Test handling general errors during flush — messages re-enqueued for local retry."""
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = RuntimeError("Database error")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        # Messages re-enqueued to internal deque for local retry — not nack'd
-        nack.assert_not_called()
-        ack.assert_not_called()
-        assert len(processor.queues["artists"]) == 1
-
-    @pytest.mark.asyncio
-    async def test_flush_handles_ack_failure(self) -> None:
-        """Test handling ack callback failures."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack = AsyncMock(side_effect=Exception("Ack failed"))
-        nack = AsyncMock()
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        processor.queues["artists"].append(msg)
-
-        # Should not raise exception
-        await processor._flush_queue("artists")
+        with patch.object(gm_telemetry, "record_batch_flush", side_effect=RuntimeError("metrics down")):
+            assert await processor.add_message("artists", {"id": "1"}, ack, AsyncMock())
 
         ack.assert_awaited_once()
-        assert processor.processed_counts["artists"] == 1
-        assert len(processor.queues["artists"]) == 0
 
-    @pytest.mark.asyncio
-    async def test_flush_handles_nack_failure(self) -> None:
-        """Test handling nack callback failures."""
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = RuntimeError("Error")
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(__import__("neo4j").exceptions.ServiceUnavailable("down"), id="service-unavailable"),
+            pytest.param(__import__("neo4j").exceptions.SessionExpired("expired"), id="session-expired"),
+            pytest.param(
+                __import__("neo4j").exceptions.TransientError("Neo.TransientError.General.DatabaseUnavailable", "retry"), id="transient-error"
+            ),
+        ],
+    )
+    def test_neo4j_driver_failures_are_transient(self, error: BaseException) -> None:
+        from common.delivery import FailureKind
 
-        processor = Neo4jBatchProcessor(mock_driver, BatchConfig(max_poison_retries=1))
+        from graphinator.batch_processor import Neo4jFailureClassifier
 
-        ack = AsyncMock()
-        nack = AsyncMock(side_effect=Exception("Nack failed"))
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        processor.queues["artists"].append(msg)
+        assert Neo4jFailureClassifier()(error) is FailureKind.TRANSIENT
 
-        # Should not raise exception
-        await processor._flush_queue("artists")
+    def test_owner_sink_maps_projection_indices_to_terminal_results(self) -> None:
+        from common.delivery import Settlement
 
-        nack.assert_awaited_once()
-        assert processor.processed_counts["artists"] == 0
-        assert len(processor.queues["artists"]) == 0
+        async def exercise() -> None:
+            processor = Neo4jBatchProcessor(MagicMock())
+            processor._process_artists_batch = AsyncMock(return_value={1})  # type: ignore[method-assign]
+            messages = [
+                PendingMessage("artists", {"id": "1"}, AsyncMock(), AsyncMock()),
+                PendingMessage("artists", {"id": "2"}, AsyncMock(), AsyncMock()),
+            ]
+            results = await processor.write("artists", messages)
+            assert [result.settlement for result in results] == [Settlement.ACK, Settlement.REJECT]
 
-    @pytest.mark.asyncio
-    async def test_flush_handles_cancelled_error_re_enqueues(self) -> None:
-        """Test that CancelledError during flush re-enqueues messages and re-raises."""
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = asyncio.CancelledError()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg1 = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        msg2 = PendingMessage("artists", {"id": "2", "name": "Artist 2", "sha256": "hash2"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg1)
-        processor.queues["artists"].append(msg2)
-
-        with pytest.raises(asyncio.CancelledError):
-            await processor._flush_queue("artists")
-
-        # Messages should be re-enqueued, not lost
-        assert len(processor.queues["artists"]) == 2
-        # No ack or nack should have been called
-        ack.assert_not_called()
-        nack.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_flush_cancelled_while_acquiring_semaphore_re_enqueues(self) -> None:
-        """discogsography-r8hr: cancellation delivered WHILE BLOCKED on the
-        concurrency-limiter semaphore acquire — BEFORE the inner try block
-        that handles cancellation during the Neo4j write is ever entered —
-        must still re-enqueue the popped messages instead of losing them."""
-        mock_driver, mock_session = create_async_session_mock()
-
-        processor = Neo4jBatchProcessor(mock_driver)
-        processor._flush_semaphore = asyncio.Semaphore(1)
-        processor._flush_semaphore.acquire = AsyncMock(side_effect=asyncio.CancelledError())
-
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg1 = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        msg2 = PendingMessage("artists", {"id": "2", "name": "Artist 2", "sha256": "hash2"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg1)
-        processor.queues["artists"].append(msg2)
-
-        with pytest.raises(asyncio.CancelledError):
-            await processor._flush_queue("artists")
-
-        # Messages should be re-enqueued, not lost
-        assert len(processor.queues["artists"]) == 2
-        ack.assert_not_called()
-        nack.assert_not_called()
-        mock_session.execute_write.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_flush_respects_batch_size_limit(self) -> None:
-        """Test that flush respects batch size limit."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        config = BatchConfig(batch_size=2)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Add 5 messages
-        for i in range(5):
-            msg = PendingMessage("artists", {"id": str(i), "name": f"Artist {i}", "sha256": f"hash{i}"}, AsyncMock(), AsyncMock())
-            processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        # Should only process 2 messages (batch_size limit)
-        assert len(processor.queues["artists"]) == 3
-        assert processor.processed_counts["artists"] == 2
+        asyncio.run(exercise())
 
 
 class TestProcessArtistsBatch:
@@ -1291,137 +940,6 @@ class TestProcessReleasesBatch:
         assert part_of_queries == []
 
 
-class TestFlushAll:
-    """Test flush_all functionality."""
-
-    @pytest.mark.asyncio
-    async def test_flush_all_queues(self) -> None:
-        """Test flushing all queues."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # Mock flush_queue (flush_all delegates to flush_queue per data type)
-        processor.flush_queue = AsyncMock()  # type: ignore[method-assign]
-
-        await processor.flush_all()
-
-        # Should flush all 4 data types
-        assert processor.flush_queue.call_count == 4
-
-
-class TestPeriodicFlush:
-    """Test periodic_flush functionality."""
-
-    @pytest.mark.asyncio
-    async def test_periodic_flush_runs_until_shutdown(self) -> None:
-        """Test periodic flush runs and stops on shutdown."""
-        import time
-
-        mock_driver = MagicMock()
-        config = BatchConfig(flush_interval=0.1)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Mock the _flush_queue method
-        processor._flush_queue = AsyncMock()  # type: ignore[method-assign]
-
-        # Set last flush time to past so flush will be triggered
-        for data_type in processor.queues:
-            processor.last_flush[data_type] = time.time() - 1.0
-
-        # Add a message to trigger flush
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "1"}, AsyncMock(), AsyncMock()))
-
-        # Start periodic flush
-        flush_task = asyncio.create_task(processor.periodic_flush())
-
-        # Let it run for a bit
-        await asyncio.sleep(0.25)
-
-        # Shutdown
-        processor.shutdown()
-
-        # Wait for task to complete
-        await asyncio.sleep(0.15)
-
-        # Cancel task
-        flush_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await flush_task
-
-        # Should have called flush at least once
-        assert processor._flush_queue.call_count > 0
-
-    @pytest.mark.asyncio
-    async def test_periodic_flush_only_flushes_after_interval(self) -> None:
-        """Test periodic flush only flushes queues after interval."""
-        mock_driver = MagicMock()
-        config = BatchConfig(flush_interval=10.0)  # Long interval
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Mock the _flush_queue method
-        processor._flush_queue = AsyncMock()  # type: ignore[method-assign]
-
-        # Set last flush to recent
-        import time
-
-        for data_type in processor.queues:
-            processor.last_flush[data_type] = time.time()
-
-        # Start periodic flush
-        flush_task = asyncio.create_task(processor.periodic_flush())
-
-        # Wait a short time (less than interval)
-        await asyncio.sleep(0.2)
-
-        # Shutdown
-        processor.shutdown()
-        await asyncio.sleep(0.1)
-
-        # Cancel task
-        flush_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await flush_task
-
-        # Should not have flushed since interval not passed
-        assert processor._flush_queue.call_count == 0
-
-
-class TestShutdown:
-    """Test shutdown functionality."""
-
-    def test_shutdown_sets_flag(self) -> None:
-        """Test shutdown sets internal flag."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        assert processor._shutdown is False
-
-        processor.shutdown()
-
-        assert processor._shutdown is True
-
-
-class TestGetStats:
-    """Test get_stats functionality."""
-
-    def test_get_stats_returns_current_state(self) -> None:
-        """Test getting processor statistics."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # Add some test data
-        processor.processed_counts["artists"] = 100
-        processor.batch_counts["artists"] = 5
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "1"}, AsyncMock(), AsyncMock()))
-
-        stats = processor.get_stats()
-
-        assert stats["processed"]["artists"] == 100
-        assert stats["batches"]["artists"] == 5
-        assert stats["pending"]["artists"] == 1
-        assert stats["pending"]["labels"] == 0
-
-
 class TestBatchTransactionLogic:
     """Test batch transaction logic for all data types."""
 
@@ -1890,369 +1408,6 @@ class TestBatchTransactionLogic:
         assert "SET c.category = credit.category" in query
 
 
-class TestBackoffPeriodSkip:
-    """Test that _flush_queue returns early when in backoff period."""
-
-    @pytest.mark.asyncio
-    async def test_flush_queue_skips_during_backoff(self) -> None:
-        """Test _flush_queue returns early when backoff_until is in the future."""
-        import time
-
-        mock_driver, _mock_session = create_async_session_mock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # Add a message so queue is non-empty
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        processor.queues["artists"].append(msg)
-
-        # Set backoff_until to far in the future
-        processor._backoff_until["artists"] = time.time() + 9999
-
-        await processor._flush_queue("artists")
-
-        # Message should still be in queue (not processed)
-        assert len(processor.queues["artists"]) == 1
-        ack.assert_not_called()
-        nack.assert_not_called()
-
-
-class TestServiceUnavailableHandling:
-    """Test ServiceUnavailable/SessionExpired error handling in _flush_queue."""
-
-    @pytest.mark.asyncio
-    async def test_messages_put_back_in_queue_on_service_unavailable(self) -> None:
-        """Test messages are returned to queue on ServiceUnavailable."""
-        from neo4j.exceptions import ServiceUnavailable
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        ack = AsyncMock()
-        nack = AsyncMock()
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, ack, nack)
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        # Message back in queue
-        assert len(processor.queues["artists"]) == 1
-        ack.assert_not_called()
-        nack.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_transient_failures_incremented_on_service_unavailable(self) -> None:
-        """A transient outage increments the TRANSIENT counter, never the poison one.
-
-        discogsography-4lrp: both branches used to share _consecutive_failures, so
-        a database outage pre-charged the poison guard that dead-letters batches.
-        """
-        from neo4j.exceptions import ServiceUnavailable
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-        assert processor._transient_failures["artists"] == 0
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        assert processor._transient_failures["artists"] == 1
-        assert processor._consecutive_failures["artists"] == 0
-
-    @pytest.mark.asyncio
-    async def test_backoff_until_set_on_service_unavailable(self) -> None:
-        """Test _backoff_until is set to a future time on ServiceUnavailable."""
-        import time
-
-        from neo4j.exceptions import ServiceUnavailable
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        before = time.time()
-        await processor._flush_queue("artists")
-
-        assert processor._backoff_until["artists"] > before
-
-    @pytest.mark.asyncio
-    async def test_effective_batch_size_halved_on_service_unavailable(self) -> None:
-        """Test _effective_batch_size halves on ServiceUnavailable (with min_batch_size floor)."""
-        from neo4j.exceptions import ServiceUnavailable
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
-
-        config = BatchConfig(batch_size=100, min_batch_size=10)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-        assert processor._effective_batch_size["artists"] == 100
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        assert processor._effective_batch_size["artists"] == 50
-
-    @pytest.mark.asyncio
-    async def test_batch_size_floors_at_min_batch_size(self) -> None:
-        """Test batch size does not go below min_batch_size."""
-        from neo4j.exceptions import ServiceUnavailable
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
-
-        config = BatchConfig(batch_size=100, min_batch_size=10)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Set effective batch size to min already
-        processor._effective_batch_size["artists"] = 10
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        # Should stay at min_batch_size, not go lower
-        assert processor._effective_batch_size["artists"] == 10
-
-    @pytest.mark.asyncio
-    async def test_session_expired_handled_same_as_service_unavailable(self) -> None:
-        """Test SessionExpired triggers the same resilience logic."""
-        from neo4j.exceptions import SessionExpired
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = SessionExpired("Session expired")
-
-        config = BatchConfig(batch_size=100, min_batch_size=10)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        assert len(processor.queues["artists"]) == 1
-        assert processor._transient_failures["artists"] == 1
-        assert processor._consecutive_failures["artists"] == 0
-        assert processor._effective_batch_size["artists"] == 50
-
-
-class TestGeneralExceptionBackoff:
-    """Test that non-transient errors also track failures and set backoff."""
-
-    @pytest.mark.asyncio
-    async def test_general_exception_increments_failures(self) -> None:
-        """Test _consecutive_failures increments on general exception."""
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = RuntimeError("Unexpected error")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        assert processor._consecutive_failures["artists"] == 1
-
-    @pytest.mark.asyncio
-    async def test_general_exception_sets_backoff(self) -> None:
-        """Test _backoff_until is set on general exception."""
-        import time
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = RuntimeError("Unexpected error")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        before = time.time()
-        await processor._flush_queue("artists")
-
-        assert processor._backoff_until["artists"] > before
-
-    @pytest.mark.asyncio
-    async def test_general_exception_repeated_failures_increase_backoff(self) -> None:
-        """Test repeated general exceptions increase backoff exponentially."""
-        import time
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = RuntimeError("Persistent error")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # First failure
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-        await processor._flush_queue("artists")
-
-        # Reset backoff so second flush proceeds
-        processor._backoff_until["artists"] = 0.0
-
-        # Second failure (messages were nacked so add a new one)
-        msg2 = PendingMessage("artists", {"id": "2", "name": "Artist 2", "sha256": "hash2"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg2)
-        before_2 = time.time()
-        await processor._flush_queue("artists")
-
-        assert processor._consecutive_failures["artists"] == 2
-        # Second backoff should be further in the future (exponential increase)
-        assert processor._backoff_until["artists"] > before_2
-
-
-class TestSuccessRecovery:
-    """Test batch size recovery after failures."""
-
-    @pytest.mark.asyncio
-    async def test_consecutive_failures_reset_on_success(self) -> None:
-        """Test _consecutive_failures resets to 0 after a successful flush."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        config = BatchConfig(batch_size=100, min_batch_size=10)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Simulate prior failures
-        processor._consecutive_failures["artists"] = 3
-        processor._effective_batch_size["artists"] = 25
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        assert processor._consecutive_failures["artists"] == 0
-
-    @pytest.mark.asyncio
-    async def test_effective_batch_size_increases_after_success(self) -> None:
-        """Test _effective_batch_size gradually increases toward configured size after success."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        config = BatchConfig(batch_size=100, min_batch_size=10)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Simulate reduced batch size from prior failures
-        processor._effective_batch_size["artists"] = 25
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        # Should have increased (by max(10, batch_size // 10) = max(10, 10) = 10)
-        assert processor._effective_batch_size["artists"] == 35
-
-    @pytest.mark.asyncio
-    async def test_effective_batch_size_caps_at_configured_size(self) -> None:
-        """Test _effective_batch_size does not exceed configured batch_size."""
-        mock_driver, _mock_session = create_async_session_mock()
-
-        config = BatchConfig(batch_size=100, min_batch_size=10)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-
-        # Simulate batch size just below configured
-        processor._effective_batch_size["artists"] = 95
-
-        msg = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "hash1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        await processor._flush_queue("artists")
-
-        # Should cap at configured batch_size
-        assert processor._effective_batch_size["artists"] == 100
-
-
-class TestFlushQueuePublicMethod:
-    """Test the public flush_queue method that drains completely."""
-
-    @pytest.mark.asyncio
-    async def test_flush_queue_drains_completely(self) -> None:
-        """Test flush_queue calls _flush_queue repeatedly until queue is empty."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        # Add messages to queue
-        for i in range(3):
-            msg = PendingMessage("artists", {"id": str(i)}, AsyncMock(), AsyncMock())
-            processor.queues["artists"].append(msg)
-
-        call_count = 0
-
-        async def mock_flush(data_type: str) -> None:
-            nonlocal call_count
-            call_count += 1
-            # Drain one message per call to simulate batched processing
-            if processor.queues[data_type]:
-                processor.queues[data_type].popleft()
-
-        processor._flush_queue = AsyncMock(side_effect=mock_flush)  # type: ignore[method-assign]
-
-        await processor.flush_queue("artists")
-
-        assert call_count == 3
-        assert len(processor.queues["artists"]) == 0
-
-    @pytest.mark.asyncio
-    async def test_flush_queue_waits_during_backoff(self) -> None:
-        """Test flush_queue sleeps when in backoff period then continues draining."""
-        import time
-
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        msg = PendingMessage("artists", {"id": "1"}, AsyncMock(), AsyncMock())
-        processor.queues["artists"].append(msg)
-
-        # Set a small backoff in the future
-        processor._backoff_until["artists"] = time.time() + 0.05
-
-        async def mock_flush(data_type: str) -> None:
-            # Drain the queue
-            if processor.queues[data_type]:
-                processor.queues[data_type].popleft()
-
-        processor._flush_queue = AsyncMock(side_effect=mock_flush)  # type: ignore[method-assign]
-
-        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            await processor.flush_queue("artists")
-
-            # Should have called sleep for the backoff wait
-            mock_sleep.assert_called_once()
-            wait_arg = mock_sleep.call_args[0][0]
-            assert wait_arg > 0
-
-    @pytest.mark.asyncio
-    async def test_flush_queue_noop_on_empty_queue(self) -> None:
-        """Test flush_queue does nothing when queue is already empty."""
-        mock_driver = MagicMock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        processor._flush_queue = AsyncMock()  # type: ignore[method-assign]
-
-        await processor.flush_queue("artists")
-
-        # _flush_queue should never be called since queue is empty
-        processor._flush_queue.assert_not_called()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# catalog_number on Release node (P6 — GRUVAX integration)
-# ──────────────────────────────────────────────────────────────────────────────
-
-
 class TestReleaseCatalogNumber:
     """Verify the bulk graphinator pipeline propagates labels[0].catno → Release.catalog_number."""
 
@@ -2373,216 +1528,3 @@ class TestReleaseCatalogNumber:
 
         _, first_kwargs = captured[0]
         assert first_kwargs["releases"][0]["metadata"] == {"catalog_number": "PRI-001"}
-
-
-class TestSameTypeFlushSerialization:
-    """Regression (discogsography-2sm3): flushes of one data type are serialized."""
-
-    @pytest.mark.asyncio
-    async def test_flush_locks_are_created_lazily(self) -> None:
-        """asyncio.Lock must never be built in __init__ (wrong event loop)."""
-        processor = Neo4jBatchProcessor(MagicMock())
-
-        assert processor._flush_locks == {}
-
-        lock = processor._get_flush_lock("artists")
-
-        assert isinstance(lock, asyncio.Lock)
-        assert processor._get_flush_lock("artists") is lock
-
-    @pytest.mark.asyncio
-    async def test_concurrent_success_cannot_reset_poison(self) -> None:
-        """Regression (discogsography-2sm3): a concurrent healthy flush of the
-        SAME data type must not reset the poison counter.
-
-        Before the fix, `_flush_queue` had no per-data-type mutex. A failed
-        poison batch was re-enqueued at the FRONT of the deque while another
-        in-flight flush of the same type — which popped healthy messages from
-        behind it — completed afterwards and reset `_consecutive_failures` to 0.
-        The bounded poison guard therefore never reached `max_poison_retries`,
-        so the poison batch was never dead-lettered and its deliveries pinned
-        the prefetch window forever.
-        """
-        config = BatchConfig(
-            batch_size=1,
-            min_batch_size=1,
-            max_poison_retries=3,
-            backoff_initial=0.0,
-        )
-        processor = Neo4jBatchProcessor(MagicMock(), config)
-
-        async def process(messages: list[PendingMessage]) -> set[int]:
-            # Yield so concurrent flushes genuinely interleave.
-            await asyncio.sleep(0)
-            if any(msg.data.get("id") == "poison" for msg in messages):
-                raise ValueError("data-induced ClientError")
-            return set()
-
-        processor._process_artists_batch = AsyncMock(side_effect=process)  # type: ignore[method-assign]
-
-        acked: list[str] = []
-        nacked: list[str] = []
-
-        def make_msg(data_id: str) -> PendingMessage:
-            async def ack() -> None:
-                acked.append(data_id)
-
-            async def nack() -> None:
-                nacked.append(data_id)
-
-            return PendingMessage("artists", {"id": data_id, "name": "x", "sha256": "h"}, ack, nack)
-
-        processor.queues["artists"].append(make_msg("poison"))
-        for i in range(20):
-            processor.queues["artists"].append(make_msg(f"healthy-{i}"))
-
-        # Twelve concurrent flushes of the SAME data type — exactly the
-        # interleaving aio-pika's task-per-delivery model produces.
-        await asyncio.gather(*[processor._flush_queue("artists") for _ in range(12)])
-
-        assert nacked == ["poison"], "poison batch must reach the DLQ nack path"
-        assert "poison" not in acked
-
-
-class TestDrainWaitsForInFlight:
-    """Regression tests for discogsography-uo8g (drain blind to popped batches)."""
-
-    @pytest.mark.asyncio
-    async def test_in_flight_tracked_while_writing(self) -> None:
-        """A popped-but-unwritten batch is counted, not invisible."""
-        config = BatchConfig(batch_size=1, min_batch_size=1, backoff_initial=0.0)
-        processor = Neo4jBatchProcessor(MagicMock(), config)
-
-        writing = asyncio.Event()
-        release = asyncio.Event()
-
-        async def process(_messages: list[PendingMessage]) -> set[int]:
-            writing.set()
-            await release.wait()
-            return set()
-
-        processor._process_artists_batch = AsyncMock(side_effect=process)  # type: ignore[method-assign]
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "1", "name": "x", "sha256": "h"}, AsyncMock(), AsyncMock()))
-
-        flush = asyncio.create_task(processor._flush_queue("artists"))
-        await asyncio.wait_for(writing.wait(), timeout=1.0)
-
-        # The deque is empty — the batch lives in a task-local list.
-        assert not processor.queues["artists"]
-        assert processor._in_flight["artists"] == 1
-        assert processor.get_stats()["in_flight"]["artists"] == 1
-
-        release.set()
-        await asyncio.wait_for(flush, timeout=1.0)
-        assert processor._in_flight["artists"] == 0
-
-    @pytest.mark.asyncio
-    async def test_drain_blocks_on_in_flight_batch(self) -> None:
-        """flush_queue must not report drained while a write is still landing.
-
-        Before the fix the drain condition was `while self.queues.get(data_type)`,
-        so with the deque momentarily empty it returned True while a concurrent
-        release batch was still MERGE-ing stub nodes. graphinator then started
-        cleanup_all_stub_nodes(), whose DETACH DELETE raced those very writes —
-        the exact race the all-signals deferral exists to prevent.
-        """
-        config = BatchConfig(batch_size=1, min_batch_size=1, backoff_initial=0.0)
-        processor = Neo4jBatchProcessor(MagicMock(), config)
-
-        writing = asyncio.Event()
-        release = asyncio.Event()
-        completed: list[str] = []
-
-        async def process(_messages: list[PendingMessage]) -> set[int]:
-            writing.set()
-            await release.wait()
-            completed.append("write")
-            return set()
-
-        processor._process_artists_batch = AsyncMock(side_effect=process)  # type: ignore[method-assign]
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "1", "name": "x", "sha256": "h"}, AsyncMock(), AsyncMock()))
-
-        in_flight_flush = asyncio.create_task(processor._flush_queue("artists"))
-        await asyncio.wait_for(writing.wait(), timeout=1.0)
-
-        drain = asyncio.create_task(processor.flush_queue("artists"))
-        for _ in range(10):
-            await asyncio.sleep(0)
-        assert not drain.done(), "drain returned while a batch was still in flight"
-
-        release.set()
-        assert await asyncio.wait_for(drain, timeout=1.0) is True
-        await asyncio.wait_for(in_flight_flush, timeout=1.0)
-        assert completed == ["write"], "the write must complete before the drain returns"
-
-
-class TestBatchFlushTelemetry:
-    """groovemap.pipeline.batch.size / groovemap.pipeline.batch.flush.duration, recorded once
-    per flush attempt from _flush_queue_locked (the batch-mode counterpart of the per-message
-    handler's groovemap.pipeline.messages — see test_graphinator.py::TestTelemetry).
-    """
-
-    @pytest.mark.asyncio
-    async def test_successful_flush_records_processed_with_batch_size(self, collector: Any) -> None:
-        mock_driver, _mock_session = create_async_session_mock()
-        processor = Neo4jBatchProcessor(mock_driver)
-
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "1", "name": "A", "sha256": "h1"}, AsyncMock(), AsyncMock()))
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "2", "name": "B", "sha256": "h2"}, AsyncMock(), AsyncMock()))
-
-        await processor._flush_queue("artists")
-
-        [attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)
-        assert attrs == {"store": "neo4j", "entity": "artist", "outcome": "processed"}
-        [point] = collector.points(gm_telemetry.PIPELINE_BATCH_SIZE)
-        assert point.sum == 2
-
-        [duration_attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_FLUSH_DURATION)
-        assert duration_attrs == {"store": "neo4j", "entity": "artist", "outcome": "processed"}
-
-    @pytest.mark.asyncio
-    async def test_transient_neo4j_outage_records_failed(self, collector: Any) -> None:
-        from neo4j.exceptions import ServiceUnavailable
-
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = ServiceUnavailable("Neo4j down")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-        processor.queues["releases"].append(PendingMessage("releases", {"id": "1", "title": "R", "sha256": "h1"}, AsyncMock(), AsyncMock()))
-
-        await processor._flush_queue("releases")
-
-        [attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)
-        assert attrs == {"store": "neo4j", "entity": "release", "outcome": "failed"}
-        [point] = collector.points(gm_telemetry.PIPELINE_BATCH_SIZE)
-        assert point.sum == 1
-
-    @pytest.mark.asyncio
-    async def test_bounded_local_retry_records_failed(self, collector: Any) -> None:
-        mock_driver, mock_session = create_async_session_mock()
-        mock_session.execute_write.side_effect = RuntimeError("Database error")
-
-        processor = Neo4jBatchProcessor(mock_driver)
-        processor.queues["labels"].append(PendingMessage("labels", {"id": "1", "name": "L", "sha256": "h1"}, AsyncMock(), AsyncMock()))
-
-        await processor._flush_queue("labels")
-
-        [attrs] = collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)
-        assert attrs == {"store": "neo4j", "entity": "label", "outcome": "failed"}
-
-    @pytest.mark.asyncio
-    async def test_poison_batch_records_failed(self, collector: Any) -> None:
-        """The DLQ-bound poison path (max_poison_retries exhausted) is also `failed`: the
-        batch never durably wrote to Neo4j, regardless of why the write loop stopped retrying.
-        """
-        mock_driver = MagicMock()
-        config = BatchConfig(batch_size=5, max_poison_retries=1, backoff_initial=0.0, min_batch_size=1)
-        processor = Neo4jBatchProcessor(mock_driver, config)
-        processor._process_artists_batch = AsyncMock(side_effect=ValueError("data-induced ClientError"))  # type: ignore[method-assign]
-        processor.queues["artists"].append(PendingMessage("artists", {"id": "1", "name": "x", "sha256": "h"}, AsyncMock(), AsyncMock()))
-
-        await processor._flush_queue("artists")
-
-        outcomes = [attrs["outcome"] for attrs in collector.attributes(gm_telemetry.PIPELINE_BATCH_SIZE)]
-        assert outcomes == ["failed"]
-        assert not processor.queues["artists"], "the poison batch must still be nacked to the DLQ"

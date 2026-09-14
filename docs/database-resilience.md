@@ -7,6 +7,11 @@ the [shared runtime](https://github.com/groovemap-music/python-libraries) and
 [deployment](https://github.com/groovemap-music/deployment/blob/main/docs/database-resilience.md)
 repositories.
 
+Transport-neutral delivery settlement and Discogs batch lifecycle changes belong in
+`common.delivery` and `common.batch`, respectively. This repository continues to own
+the concrete Neo4j exception classification, Discogs normalization and projection,
+flush telemetry, broker QoS, completion state, and post-import maintenance.
+
 ## Failure policy
 
 ```mermaid
