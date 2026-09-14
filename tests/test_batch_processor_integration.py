@@ -74,10 +74,10 @@ class TestAsyncDriverIntegration:
             AsyncMock(),
             AsyncMock(),
         )
-        processor.queues["artists"].append(msg)
+        await processor._engine.submit("artists", msg, msg)
 
         # This should work without errors
-        await processor._flush_queue("artists")
+        await processor.flush_queue("artists")
 
         # Verify session was properly awaited and used as context manager
         mock_driver.session.assert_called()
@@ -295,10 +295,10 @@ class TestAsyncErrorConditions:
             AsyncMock(),
             AsyncMock(),
         )
-        processor.queues["artists"].append(msg)
+        await processor._engine.submit("artists", msg, msg)
 
         # Should handle error gracefully
-        await processor._flush_queue("artists")
+        await processor.flush_queue("artists")
 
         # Verify context manager exit was called
         session_context = mock_driver.session()
@@ -330,13 +330,13 @@ class TestAsyncErrorConditions:
             AsyncMock(),
             AsyncMock(),
         )
-        processor.queues["artists"].append(msg)
+        await processor._engine.submit("artists", msg, msg)
 
         # Should handle error and put message back in queue
-        await processor._flush_queue("artists")
+        await processor.flush_queue("artists")
 
         # Message should be back in queue for retry
-        assert len(processor.queues["artists"]) == 1
+        assert processor._engine.snapshot()["pending"]["artists"] == 1  # type: ignore[index]
 
 
 class TestRealisticWorkflow:
@@ -385,11 +385,11 @@ class TestRealisticWorkflow:
         msg1 = PendingMessage("artists", {"id": "1", "name": "Artist 1", "sha256": "h1"}, ack1, AsyncMock())
         msg2 = PendingMessage("artists", {"id": "2", "name": "Artist 2", "sha256": "h2"}, ack2, AsyncMock())
 
-        processor.queues["artists"].append(msg1)
-        processor.queues["artists"].append(msg2)
+        await processor._engine.submit("artists", msg1, msg1)
+        await processor._engine.submit("artists", msg2, msg2)
 
         # Process batch
-        await processor._flush_queue("artists")
+        await processor.flush_queue("artists")
 
         # Verify all async operations were performed
         assert ("hash_check_run", "awaited") in operations
