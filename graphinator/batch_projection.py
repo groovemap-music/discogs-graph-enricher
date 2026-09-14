@@ -1,8 +1,8 @@
 """Per-entity Neo4j batch projections.
 
-Queueing, flush scheduling, retry classification, and acknowledgements remain owned by
-:mod:`graphinator.batch_processor`; this module owns only record selection, Cypher,
-and parameter construction inside a supplied transaction boundary.
+Queueing, flush scheduling, retry accounting, and acknowledgements are supplied by
+:mod:`common.batch`; this module owns the sink's record selection, Cypher, and
+parameter construction inside a supplied transaction boundary.
 """
 
 from __future__ import annotations
@@ -10,7 +10,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import structlog
+from common.batch import BatchItemResult
 from common.credit_roles import categorize_role
+from common.delivery import Settlement
 
 from graphinator.media_projection import (
     MEDIA_SOURCE,
@@ -24,7 +26,7 @@ from graphinator.media_projection import (
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from graphinator.batch_processor import PendingMessage
 
@@ -38,6 +40,25 @@ class Neo4jBatchProjector:
     def __init__(self, driver: Any, projection_logger: Any = logger) -> None:
         self.driver = driver
         self.logger = projection_logger
+
+    async def write(self, key: str, payloads: Sequence[PendingMessage]) -> Sequence[BatchItemResult]:
+        """Implement the shared sink while keeping Neo4j policy local."""
+        messages = list(payloads)
+        processors = {
+            "artists": self._process_artists_batch,
+            "labels": self._process_labels_batch,
+            "masters": self._process_masters_batch,
+            "releases": self._process_releases_batch,
+        }
+        try:
+            processor = processors[key]
+        except KeyError:
+            raise ValueError(f"unsupported Discogs graph batch key: {key}") from None
+        rejected = await processor(messages)
+        return [
+            BatchItemResult(Settlement.REJECT, "failed") if index in rejected else BatchItemResult(Settlement.ACK, "processed")
+            for index in range(len(messages))
+        ]
 
     async def _process_artists_batch(self, messages: list[PendingMessage]) -> set[int]:
         """Process a batch of artist records.

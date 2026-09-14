@@ -1,19 +1,27 @@
-"""Batch processor for efficient Neo4j operations.
+"""Discogs-to-Neo4j policy adapters for the shared batch runtime.
 
-This module provides batch processing capabilities for Neo4j to improve
-performance by reducing the number of database round trips.
+The transport-neutral queue, concurrency, retry, drain, cancellation, and
+settlement lifecycle lives in :mod:`common.batch`. This module deliberately
+keeps the owner-specific policy here: Discogs normalization, Neo4j projection
+and exception classification, telemetry, and the service-facing facade.
 """
 
-import asyncio
+from __future__ import annotations
+
+import contextlib
 import os
 import time
-from collections import deque
+from contextlib import nullcontext
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from time import perf_counter
 from typing import TYPE_CHECKING, Any
 
 import structlog
 from common import normalize_record
+from common.batch import AsyncBatchEngine, BatchItemResult, BatchPolicy
 from common.db_resilience import DatabaseUnavailableError
+from common.delivery import DeliveryResult, FailureKind, Settlement
 from common.tracing import flush_span
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 
@@ -22,556 +30,295 @@ from graphinator.batch_projection import Neo4jBatchProjector
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Awaitable, Callable, Sequence
+    from types import TracebackType
 
 
 logger = structlog.get_logger(__name__)
+DATA_TYPES = ("artists", "labels", "masters", "releases")
+_CURRENT_FLUSH: ContextVar[_FlushObservation | None] = ContextVar("discogs_graph_flush", default=None)
 
 
 @dataclass
 class BatchConfig:
-    """Configuration for batch processing."""
+    """Owner configuration translated one-for-one to ``BatchPolicy``."""
 
-    batch_size: int = 100  # Number of records per batch
-    flush_interval: float = 5.0  # Seconds before force flush
-    max_pending: int = 1000  # Maximum pending records before blocking
-    max_concurrent_flushes: int = 2  # Max simultaneous Neo4j flush operations
-    min_batch_size: int = 10  # Floor for adaptive batch sizing
-    backoff_initial: float = 1.0  # Initial backoff delay on Neo4j errors (seconds)
-    backoff_max: float = 30.0  # Maximum backoff delay (seconds)
-    backoff_multiplier: float = 2.0  # Exponential backoff multiplier
-    max_flush_retries: int = 5  # Max retries per data type during flush_queue drain
-    max_poison_retries: int = 5  # Consecutive non-transient failures before nacking a poison batch to the DLQ
+    batch_size: int = 100
+    flush_interval: float = 5.0
+    max_pending: int = 1000
+    max_concurrent_flushes: int = 2
+    min_batch_size: int = 10
+    backoff_initial: float = 1.0
+    backoff_max: float = 30.0
+    backoff_multiplier: float = 2.0
+    max_flush_retries: int = 5
+    max_poison_retries: int = 5
+
+    def runtime_policy(self) -> BatchPolicy:
+        """Return the dependency-light runtime policy for this service."""
+        return BatchPolicy(
+            batch_size=self.batch_size,
+            flush_interval_s=self.flush_interval,
+            max_pending=self.max_pending,
+            max_concurrent_flushes=self.max_concurrent_flushes,
+            min_batch_size=min(self.min_batch_size, self.batch_size),
+            backoff_initial_s=self.backoff_initial,
+            backoff_max_s=self.backoff_max,
+            backoff_multiplier=self.backoff_multiplier,
+            max_drain_retries=self.max_flush_retries,
+            max_poison_retries=self.max_poison_retries,
+        )
 
 
 @dataclass
 class PendingMessage:
-    """A message pending batch processing."""
+    """Normalized owner payload plus the broker settlement callbacks."""
 
     data_type: str
     data: dict[str, Any]
-    ack_callback: Callable[[], Any]
-    nack_callback: Callable[[], Any]
+    ack_callback: Callable[[], Awaitable[None]]
+    nack_callback: Callable[[], Awaitable[None]]
     received_at: float = field(default_factory=time.time)
-    # The CONSUMER span this record arrived on, captured while that span was still open so
-    # the flush span that eventually writes the record can link back to its delivery. None
-    # whenever tracing is off or the delivery was not sampled.
     span_context: Any = None
+
+    async def ack(self) -> None:
+        await self.ack_callback()
+
+    async def nack(self, *, requeue: bool) -> None:
+        if requeue:
+            raise ValueError("batch deliveries may only be rejected without requeue")
+        await self.nack_callback()
+
+
+class Neo4jFailureClassifier:
+    """Map concrete Neo4j/wrapper outages without leaking them into the runtime."""
+
+    _transient = (ServiceUnavailable, SessionExpired, TransientError, DatabaseUnavailableError)
+
+    def __call__(self, error: BaseException) -> FailureKind:
+        observation = _CURRENT_FLUSH.get()
+        if observation is not None:
+            observation.mark_failed(error)
+        if isinstance(error, self._transient):
+            return FailureKind.TRANSIENT
+        return FailureKind.DETERMINISTIC
+
+
+class _FlushObservation:
+    """One owner-side metric/span around a shared-engine flush attempt."""
+
+    def __init__(self, observer: Neo4jBatchObserver, key: str, size: int, links: Sequence[object]) -> None:
+        self._observer = observer
+        self.key = key
+        self.size = size
+        self._started = perf_counter()
+        self._context = flush_span(gm_telemetry.STORE, gm_telemetry.entity_for(key), links=links)
+        self.span: Any = None
+        self.failed = False
+        self.error: BaseException | None = None
+        self._token: Token[_FlushObservation | None] | None = None
+
+    def __enter__(self) -> _FlushObservation:
+        self.span = self._context.__enter__()
+        self._token = _CURRENT_FLUSH.set(self)
+        return self
+
+    def mark_failed(self, error: BaseException | None = None) -> None:
+        self.failed = True
+        if error is not None:
+            self.error = error
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        if self._token is not None:
+            _CURRENT_FLUSH.reset(self._token)
+        if exc is not None:
+            self.mark_failed(exc)
+        outcome = "failed" if self.failed else "processed"
+        with contextlib.suppress(Exception):
+            gm_telemetry.mark_flush_outcome(self.span, outcome, self.error)
+        with contextlib.suppress(Exception):
+            gm_telemetry.record_batch_flush(
+                gm_telemetry.entity_for(self.key),
+                outcome,
+                self.size,
+                perf_counter() - self._started,
+            )
+        if not self.failed:
+            self._observer.batch_counts[self.key] += 1
+            self._observer.last_flush[self.key] = time.time()
+        return bool(self._context.__exit__(exc_type, exc, traceback))
+
+
+class Neo4jBatchObserver:
+    """Preserve GrooveMap metrics and flush spans behind runtime protocols."""
+
+    def __init__(self) -> None:
+        self.processed_counts = dict.fromkeys(DATA_TYPES, 0)
+        self.batch_counts = dict.fromkeys(DATA_TYPES, 0)
+        self.last_flush = dict.fromkeys(DATA_TYPES, time.time())
+
+    def consume(self, _destination: str, _headers: object | None) -> Any:
+        """Batch delivery spans are opened by the owner-hive handler."""
+        return nullcontext()
+
+    def flush(self, key: str, size: int, links: Sequence[object]) -> _FlushObservation:
+        return _FlushObservation(self, key, size, links)
+
+    def retry(
+        self,
+        *,
+        key: str,
+        kind: FailureKind,
+        attempt: int,
+        delay_s: float,
+        span: Any,
+    ) -> None:
+        if isinstance(span, _FlushObservation):
+            span.mark_failed()
+        logger.warning(
+            "Batch write retained for retry",
+            data_type=key,
+            failure_kind=kind.value,
+            attempt=attempt,
+            delay_seconds=round(delay_s, 3),
+        )
+
+    def settled(
+        self,
+        *,
+        entity: str,
+        result: DeliveryResult,
+        duration_s: float,
+        span: Any,
+    ) -> None:
+        del duration_s
+        if result.settlement is Settlement.ACK:
+            self.processed_counts[entity] += 1
+        elif result.outcome == "poison" and isinstance(span, _FlushObservation):
+            span.mark_failed()
 
 
 class Neo4jBatchProcessor:
-    """Batches Neo4j operations for improved performance.
+    """Service facade over ``AsyncBatchEngine`` with Neo4j-owned adapters."""
 
-    Instead of processing each message individually, this class accumulates
-    messages and processes them in batches, significantly reducing the
-    overhead of Neo4j transactions.
-    """
-
-    def __init__(self, driver: Any, config: BatchConfig | None = None):
-        """Initialize the batch processor.
-
-        Args:
-            driver: Neo4j driver instance
-            config: Batch processing configuration
-        """
-        self.driver = driver  # AsyncResilientNeo4jDriver
+    def __init__(self, driver: Any, config: BatchConfig | None = None) -> None:
+        self.driver = driver
         self.config = config or BatchConfig()
+        self._apply_batch_size_override()
         self._projector = Neo4jBatchProjector(driver)
+        self._classifier = Neo4jFailureClassifier()
+        self._observer = Neo4jBatchObserver()
+        self._engine: AsyncBatchEngine[str, PendingMessage] = AsyncBatchEngine(
+            DATA_TYPES,
+            policy=self.config.runtime_policy(),
+            sink=self,
+            classifier=self._classifier,
+            observer=self._observer,
+        )
 
-        # Separate queues for each data type
-        self.queues: dict[str, deque[PendingMessage]] = {
-            "artists": deque(),
-            "labels": deque(),
-            "masters": deque(),
-            "releases": deque(),
-        }
+        # Health/progress reporting reads these counters; lifecycle state stays
+        # private to the shared engine.
+        self.processed_counts = self._observer.processed_counts
+        self.batch_counts = self._observer.batch_counts
+        self.last_flush = self._observer.last_flush
 
-        # Processing stats
-        self.processed_counts: dict[str, int] = {
-            "artists": 0,
-            "labels": 0,
-            "masters": 0,
-            "releases": 0,
-        }
-        self.batch_counts: dict[str, int] = {
-            "artists": 0,
-            "labels": 0,
-            "masters": 0,
-            "releases": 0,
-        }
-        self.last_flush: dict[str, float] = {
-            "artists": time.time(),
-            "labels": time.time(),
-            "masters": time.time(),
-            "releases": time.time(),
-        }
-
-        # Shutdown flag
-        self._shutdown = False
-
-        # Concurrency limiter — prevents all 4 data types from flushing
-        # simultaneously and exhausting the Neo4j connection pool.
-        # Lazy-initialized in first async method to avoid binding to wrong event loop.
-        self._flush_semaphore: asyncio.Semaphore | None = None
-
-        # Batches of each data type currently popped from the deque but not yet
-        # written/acked. A popped batch lives in a task-local list, so queue
-        # depth alone is blind to it (discogsography-uo8g).
-        self._in_flight: dict[str, int] = {
-            "artists": 0,
-            "labels": 0,
-            "masters": 0,
-            "releases": 0,
-        }
-
-        # Per-data-type flush mutex — serializes flushes of the SAME data type.
-        # The locks are created lazily (never in __init__) because an
-        # asyncio.Lock binds to the event loop running at creation time.
-        # Without this, two flushes of one data type interleave and a healthy
-        # batch's success path resets _consecutive_failures, defeating the
-        # bounded poison guard forever (discogsography-2sm3).
-        self._flush_locks: dict[str, asyncio.Lock] = {}
-
-        # Adaptive batch sizing — reduces under Neo4j pressure, recovers on success
-        # Per-data-type so pressure on one type doesn't affect others
-        self._effective_batch_size: dict[str, int] = {
-            "artists": self.config.batch_size,
-            "labels": self.config.batch_size,
-            "masters": self.config.batch_size,
-            "releases": self.config.batch_size,
-        }
-        # Deterministic (poison) failures only — this is what gates the DLQ nack.
-        self._consecutive_failures: dict[str, int] = {
-            "artists": 0,
-            "labels": 0,
-            "masters": 0,
-            "releases": 0,
-        }
-        # Transient (outage) failures — drives backoff and adaptive batch sizing
-        # ONLY. Kept separate so a database outage can never pre-charge the poison
-        # counter and dead-letter healthy records (discogsography-4lrp).
-        self._transient_failures: dict[str, int] = {
-            "artists": 0,
-            "labels": 0,
-            "masters": 0,
-            "releases": 0,
-        }
-
-        # Backoff state — delay between retries when Neo4j is struggling
-        self._backoff_until: dict[str, float] = {
-            "artists": 0.0,
-            "labels": 0.0,
-            "masters": 0.0,
-            "releases": 0.0,
-        }
-
-        # Load batch size from environment
-        env_batch_size = os.environ.get("NEO4J_BATCH_SIZE")
-        if env_batch_size:
-            try:
-                self.config.batch_size = int(env_batch_size)
-                for dt in self._effective_batch_size:
-                    self._effective_batch_size[dt] = self.config.batch_size
-                logger.info(
-                    "🔧 Using batch size from environment",
-                    batch_size=self.config.batch_size,
-                )
-            except ValueError:
-                logger.warning(
-                    "⚠️ Invalid NEO4J_BATCH_SIZE, using default",
-                    value=env_batch_size,
-                    default=self.config.batch_size,
-                )
+    def _apply_batch_size_override(self) -> None:
+        value = os.environ.get("NEO4J_BATCH_SIZE")
+        if value is None:
+            return
+        try:
+            size = int(value)
+            if size <= 0:
+                raise ValueError
+        except ValueError:
+            logger.warning("Invalid NEO4J_BATCH_SIZE, using default", value=value, default=self.config.batch_size)
+            return
+        self.config.batch_size = size
+        self.config.min_batch_size = min(self.config.min_batch_size, size)
+        logger.info("Using batch size from environment", batch_size=size)
 
     async def add_message(
         self,
         data_type: str,
         data: dict[str, Any],
-        ack_callback: Callable[[], Any],
-        nack_callback: Callable[[], Any],
+        ack_callback: Callable[[], Awaitable[None]],
+        nack_callback: Callable[[], Awaitable[None]],
         span_context: Any = None,
     ) -> bool:
-        """Add a message to the batch queue.
-
-        Args:
-            data_type: Type of data (artists, labels, masters, releases)
-            data: The parsed message data
-            ack_callback: Callback to acknowledge the message
-            nack_callback: Callback to negative-acknowledge the message
-            span_context: The delivery's CONSUMER span context, for the flush span to link
-
-        Returns:
-            True if the message was accepted into the queue, False if nacked.
-        """
-        queue = self.queues.get(data_type)
-        if queue is None:
-            logger.error("❌ Unknown data type", data_type=data_type)
+        if data_type not in DATA_TYPES:
+            logger.error("Unknown data type", data_type=data_type)
             await nack_callback()
             return False
-
-        # Validate required 'id' field before queueing
-        data_id = data.get("id")
-        if not data_id:
-            logger.error("❌ Message missing 'id' field", data_type=data_type)
+        if not data.get("id"):
+            logger.error("Message missing 'id' field", data_type=data_type)
             await nack_callback()
             return False
-
-        # Normalize the data
         try:
-            normalized_data = normalize_record(data_type, data)
-        except Exception as e:
-            logger.error(
-                "❌ Failed to normalize data",
-                data_type=data_type,
-                error=str(e),
-            )
+            normalized = normalize_record(data_type, data)
+        except Exception as error:
+            logger.error("Failed to normalize data", data_type=data_type, error=str(error))
             await nack_callback()
             return False
 
-        # Add to queue
-        queue.append(
-            PendingMessage(
-                data_type=data_type,
-                data=normalized_data,
-                ack_callback=ack_callback,
-                nack_callback=nack_callback,
-                span_context=span_context,
-            )
-        )
-
-        # Check if we should flush (use adaptive batch size)
-        if len(queue) >= self._effective_batch_size[data_type] or time.time() - self.last_flush[data_type] >= self.config.flush_interval:
-            await self._flush_queue(data_type)
-
+        pending = PendingMessage(data_type, normalized, ack_callback, nack_callback, span_context=span_context)
+        await self._engine.submit(data_type, pending, pending, span_context=span_context)
+        snapshot = self._engine.snapshot()
+        pending_count = snapshot["pending"][data_type]  # type: ignore[index]
+        batch_size = snapshot["batch_sizes"][data_type]  # type: ignore[index]
+        if pending_count >= batch_size or time.time() - self.last_flush[data_type] >= self.config.flush_interval:
+            await self._engine.flush(data_type)
         return True
 
-    def _get_flush_lock(self, data_type: str) -> asyncio.Lock:
-        """Return the per-data-type flush mutex, creating it lazily.
+    async def flush_queue(self, data_type: str) -> bool:
+        return await self._engine.flush(data_type)
 
-        An asyncio.Lock binds to the running event loop at creation time, so it
-        must never be created in __init__ or at module scope.
-        """
-        lock = self._flush_locks.get(data_type)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._flush_locks[data_type] = lock
-        return lock
+    async def write(self, key: str, payloads: Sequence[PendingMessage]) -> Sequence[BatchItemResult]:
+        """Implement BatchSink by delegating to the local Neo4j projector."""
+        messages = list(payloads)
+        processors = {
+            "artists": self._process_artists_batch,
+            "labels": self._process_labels_batch,
+            "masters": self._process_masters_batch,
+            "releases": self._process_releases_batch,
+        }
+        try:
+            processor = processors[key]
+        except KeyError:
+            raise ValueError(f"unsupported Discogs graph batch key: {key}") from None
+        rejected = await processor(messages)
+        return [
+            BatchItemResult(Settlement.REJECT, "failed") if index in rejected else BatchItemResult(Settlement.ACK, "processed")
+            for index in range(len(messages))
+        ]
 
-    async def _wait_for_in_flight(self, data_type: str) -> None:
-        """Block until no batch of this data type is mid-write.
+    async def flush_all(self) -> bool:
+        return await self._engine.flush_all()
 
-        _flush_queue pops its batch into a task-local list before awaiting the
-        database, so an empty deque does NOT mean this type's writes are
-        committed. The per-type flush mutex is held for the whole
-        pop -> write -> ack cycle, so acquiring it gives callers the
-        happens-before edge they need (discogsography-uo8g).
-        """
-        async with self._get_flush_lock(data_type):
-            return
+    async def periodic_flush(self) -> None:
+        await self._engine.run_periodic()
 
-    async def _flush_queue(self, data_type: str) -> None:
-        """Flush one batch for a data type, serialized against other flushes of it.
+    def shutdown(self) -> None:
+        self._engine.shutdown()
 
-        Concurrent callers for the SAME data type queue on a per-type mutex.
-        Serializing them is what makes the bounded poison guard work: a failed
-        poison batch is re-enqueued at the FRONT of the deque, so the next flush
-        of that type necessarily re-includes it and increments
-        _consecutive_failures. Without the mutex, a concurrently in-flight
-        healthy batch could succeed and reset the counter to zero, so the DLQ
-        nack branch never fired and the poison batch retried forever
-        (discogsography-2sm3).
+    def get_stats(self) -> dict[str, Any]:
+        snapshot = self._engine.snapshot()
+        return {
+            "processed": self.processed_counts.copy(),
+            "batches": self.batch_counts.copy(),
+            "pending": snapshot["pending"],  # type: ignore[index]
+            "effective_batch_size": snapshot["batch_sizes"],  # type: ignore[index]
+            "configured_batch_size": self.config.batch_size,
+            "consecutive_failures": snapshot["poison_attempts"],  # type: ignore[index]
+            "transient_failures": snapshot["transient_attempts"],  # type: ignore[index]
+        }
 
-        Args:
-            data_type: The data type queue to flush
-        """
-        if not self.queues[data_type]:
-            return
-
-        async with self._get_flush_lock(data_type):
-            self._in_flight[data_type] += 1
-            try:
-                await self._flush_queue_locked(data_type)
-            finally:
-                self._in_flight[data_type] -= 1
-
-    async def _flush_queue_locked(self, data_type: str) -> None:
-        """Flush a queue by processing all pending messages.
-
-        Uses a semaphore to limit concurrent Neo4j operations across data types,
-        exponential backoff on Neo4j errors, and adaptive batch sizing.
-
-        The caller MUST hold this data type's flush lock.
-
-        Args:
-            data_type: The data type queue to flush
-        """
-        queue = self.queues[data_type]
-        if not queue:
-            return
-
-        # Skip if in backoff period for this data type
-        now = time.time()
-        if now < self._backoff_until[data_type]:
-            return
-
-        # Mark flush start to prevent concurrent add_message() calls from
-        # triggering redundant flushes while this one is in progress.
-        # On failure this is overwritten by the backoff mechanism which sets
-        # _backoff_until, preventing any flush during the delay window.
-        self.last_flush[data_type] = now
-
-        # Use effective (adaptive) batch size
-        messages: list[PendingMessage] = []
-        while queue and len(messages) < self._effective_batch_size[data_type]:
-            messages.append(queue.popleft())
-
-        if not messages:
-            return
-
-        entity = gm_telemetry.entity_for(data_type)
-        batch_start = time.time()
-        # The INTERNAL span for this flush, linked to the deliveries it covers (the library
-        # caps the links at 64, because a ten-thousand-record batch would otherwise carry ten
-        # thousand links into the collector). Every db span the Neo4j wrapper opens inside
-        # _process_*_batch nests under it, so one span shows a flush and its writes together.
-        with flush_span(gm_telemetry.STORE, entity, links=[msg.span_context for msg in messages if msg.span_context is not None]) as span:
-            success = False
-
-            # Limit concurrent Neo4j operations to prevent pool exhaustion
-            if self._flush_semaphore is None:
-                self._flush_semaphore = asyncio.Semaphore(self.config.max_concurrent_flushes)
-
-            # Acquire manually (not `async with`) so a cancellation delivered
-            # WHILE BLOCKED on the acquire itself — routine under load, since
-            # max_concurrent_flushes is small relative to potential concurrent
-            # flush callers — is caught here and re-enqueues `messages` before
-            # propagating. Semaphore.__aenter__ raises CancelledError straight out
-            # with no permit held and no enclosing handler, so `messages` (already
-            # popped off the deque above) would otherwise vanish: never written,
-            # never acked, never nacked, and invisible to the next flush
-            # (discogsography-r8hr).
-            try:
-                await self._flush_semaphore.acquire()
-            except asyncio.CancelledError:
-                for msg in reversed(messages):
-                    queue.appendleft(msg)
-                raise
-
-            try:
-                try:
-                    # Process batch based on data type.
-                    # _process_*_batch returns a set of indices that should be
-                    # nacked (e.g. messages with missing required fields).
-                    # _flush_queue is the single authority for ack/nack.
-                    nack_indices: set[int] = set()
-                    if data_type == "artists":
-                        nack_indices = await self._process_artists_batch(messages)
-                    elif data_type == "labels":
-                        nack_indices = await self._process_labels_batch(messages)
-                    elif data_type == "masters":
-                        nack_indices = await self._process_masters_batch(messages)
-                    elif data_type == "releases":
-                        nack_indices = await self._process_releases_batch(messages)
-
-                    success = True
-
-                except asyncio.CancelledError:
-                    # Re-enqueue messages before propagating cancellation (e.g. shutdown)
-                    for msg in reversed(messages):
-                        queue.appendleft(msg)
-                    raise
-
-                # TRANSIENT: the database is unreachable or the operation can succeed
-                # on a retry — never the payload's fault. DatabaseUnavailableError
-                # covers the resilient wrapper's own failures (connection could not be
-                # established, circuit breaker open), which used to surface as a bare
-                # Exception and be misread as a poison batch; TransientError covers
-                # deadlocks from concurrent MERGEs on shared nodes.
-                # See discogsography-4lrp.
-                except (
-                    ServiceUnavailable,
-                    SessionExpired,
-                    TransientError,
-                    DatabaseUnavailableError,
-                ) as e:
-                    logger.error(
-                        "❌ Neo4j connection error during batch",
-                        data_type=data_type,
-                        batch_size=len(messages),
-                        error=str(e),
-                    )
-                    # Put messages back for retry
-                    for msg in reversed(messages):
-                        queue.appendleft(msg)
-
-                    # Exponential backoff — prevent tight retry loop that worsens pool exhaustion
-                    self._transient_failures[data_type] += 1
-                    delay = min(
-                        self.config.backoff_initial * (self.config.backoff_multiplier ** (self._transient_failures[data_type] - 1)),
-                        self.config.backoff_max,
-                    )
-                    self._backoff_until[data_type] = time.time() + delay
-
-                    # Adaptive batch sizing — halve on failure (floor at min_batch_size)
-                    old_size = self._effective_batch_size[data_type]
-                    self._effective_batch_size[data_type] = max(
-                        self.config.min_batch_size,
-                        self._effective_batch_size[data_type] // 2,
-                    )
-                    if self._effective_batch_size[data_type] != old_size:
-                        logger.warning(
-                            "📉 Reduced batch size due to Neo4j pressure",
-                            old_size=old_size,
-                            new_size=self._effective_batch_size[data_type],
-                            backoff_seconds=round(delay, 1),
-                            transient_failures=self._transient_failures[data_type],
-                        )
-                    else:
-                        logger.warning(
-                            "⏳ Backing off before retry",
-                            data_type=data_type,
-                            backoff_seconds=round(delay, 1),
-                            transient_failures=self._transient_failures[data_type],
-                        )
-
-                    gm_telemetry.mark_flush_outcome(span, "failed", e)
-                    gm_telemetry.record_batch_flush(
-                        entity,
-                        "failed",
-                        len(messages),
-                        time.time() - batch_start,
-                    )
-                    # Messages are back on deque for retry — do NOT nack them
-                    return
-
-                except Exception as e:
-                    # A generic (non-transient) error is deterministic — a poison
-                    # record (e.g. a data-induced Neo4j ClientError) fails every
-                    # retry. Count consecutive failures so the local retry loop is
-                    # BOUNDED; otherwise the identical batch is re-enqueued and
-                    # retried forever, and once its unacked messages fill the
-                    # prefetch window RabbitMQ stops delivering and the consumer is
-                    # permanently wedged (never acked, never nacked).
-                    self._consecutive_failures[data_type] = self._consecutive_failures.get(data_type, 0) + 1
-
-                    if self._consecutive_failures[data_type] >= self.config.max_poison_retries:
-                        # Poison batch: stop re-enqueueing and nack the messages so
-                        # the quorum queue's x-delivery-limit / DLX routes the
-                        # persistent poison to the DLQ. _flush_queue is the single
-                        # ack/nack authority.
-                        logger.error(
-                            "❌ Poison batch — nacking to DLQ after repeated failures",
-                            data_type=data_type,
-                            batch_size=len(messages),
-                            consecutive_failures=self._consecutive_failures[data_type],
-                            error=str(e),
-                        )
-                        for msg in messages:
-                            try:
-                                await msg.nack_callback()
-                            except Exception as nack_err:
-                                logger.warning("⚠️ Failed to nack message", error=str(nack_err))
-                        # Reset per-data-type state so healthy batches behind the
-                        # poison resume normal processing.
-                        self._consecutive_failures[data_type] = 0
-                        self._transient_failures[data_type] = 0
-                        self._backoff_until[data_type] = 0.0
-                        self._effective_batch_size[data_type] = self.config.batch_size
-                        gm_telemetry.mark_flush_outcome(span, "failed", e)
-                        gm_telemetry.record_batch_flush(
-                            entity,
-                            "failed",
-                            len(messages),
-                            time.time() - batch_start,
-                        )
-                        return
-
-                    logger.error(
-                        "❌ Batch processing error",
-                        data_type=data_type,
-                        batch_size=len(messages),
-                        consecutive_failures=self._consecutive_failures[data_type],
-                        error=str(e),
-                    )
-                    # Re-enqueue messages for local retry — bounded by the poison
-                    # guard above so a deterministic error can no longer loop forever.
-                    for msg in reversed(messages):
-                        queue.appendleft(msg)
-                    # Shrink the batch to isolate the poison record and cap DLQ
-                    # collateral when the guard eventually fires.
-                    self._effective_batch_size[data_type] = max(
-                        self.config.min_batch_size,
-                        self._effective_batch_size[data_type] // 2,
-                    )
-                    # Apply backoff to prevent tight retry loop on persistent errors
-                    delay = min(
-                        self.config.backoff_initial * (self.config.backoff_multiplier ** (self._consecutive_failures[data_type] - 1)),
-                        self.config.backoff_max,
-                    )
-                    self._backoff_until[data_type] = time.time() + delay
-                    gm_telemetry.mark_flush_outcome(span, "failed", e)
-                    gm_telemetry.record_batch_flush(
-                        entity,
-                        "failed",
-                        len(messages),
-                        time.time() - batch_start,
-                    )
-                    # Messages are back on deque for retry — do NOT nack them
-                    return
-            finally:
-                self._flush_semaphore.release()
-
-            batch_duration = time.time() - batch_start
-
-            if success:
-                gm_telemetry.mark_flush_outcome(span, "processed")
-                gm_telemetry.record_batch_flush(
-                    entity,
-                    "processed",
-                    len(messages),
-                    batch_duration,
-                )
-                # Ack processed messages, nack invalid ones (e.g. missing 'id')
-                for i, msg in enumerate(messages):
-                    try:
-                        if i in nack_indices:
-                            await msg.nack_callback()
-                        else:
-                            await msg.ack_callback()
-                    except Exception as e:
-                        logger.warning("⚠️ Failed to ack/nack message", error=str(e))
-
-                self.processed_counts[data_type] += len(messages) - len(nack_indices)
-                self.batch_counts[data_type] += 1
-                self.last_flush[data_type] = time.time()
-
-                # Reset failure tracking on success
-                self._consecutive_failures[data_type] = 0
-                self._transient_failures[data_type] = 0
-
-                # Adaptive batch sizing — gradually recover toward configured size
-                if self._effective_batch_size[data_type] < self.config.batch_size:
-                    old_size = self._effective_batch_size[data_type]
-                    self._effective_batch_size[data_type] = min(
-                        self.config.batch_size,
-                        self._effective_batch_size[data_type] + max(10, self.config.batch_size // 10),
-                    )
-                    if self._effective_batch_size[data_type] != old_size:
-                        logger.info(
-                            "📈 Increased batch size after success",
-                            old_size=old_size,
-                            new_size=self._effective_batch_size[data_type],
-                        )
-
-                logger.info(
-                    "✅ Batch processed",
-                    data_type=data_type,
-                    batch_size=len(messages),
-                    duration_ms=round(batch_duration * 1000),
-                    records_per_sec=round(len(messages) / batch_duration) if batch_duration > 0 else 0,
-                    total_processed=self.processed_counts[data_type],
-                )
-
+    # Projection compatibility for focused owner tests. Queueing and settlement
+    # do not pass through these methods; the shared engine invokes sink.write.
     async def _process_artists_batch(self, messages: list[PendingMessage]) -> set[int]:
         self._projector.logger = logger
         return await self._projector._process_artists_batch(messages)
@@ -579,6 +326,14 @@ class Neo4jBatchProcessor:
     async def _process_labels_batch(self, messages: list[PendingMessage]) -> set[int]:
         self._projector.logger = logger
         return await self._projector._process_labels_batch(messages)
+
+    async def _process_masters_batch(self, messages: list[PendingMessage]) -> set[int]:
+        self._projector.logger = logger
+        return await self._projector._process_masters_batch(messages)
+
+    async def _process_releases_batch(self, messages: list[PendingMessage]) -> set[int]:
+        self._projector.logger = logger
+        return await self._projector._process_releases_batch(messages)
 
     @staticmethod
     async def _prune_stale_edges(
@@ -602,104 +357,3 @@ class Neo4jBatchProcessor:
             desired=desired,
             outgoing=outgoing,
         )
-
-    async def _process_masters_batch(self, messages: list[PendingMessage]) -> set[int]:
-        self._projector.logger = logger
-        return await self._projector._process_masters_batch(messages)
-
-    async def _process_releases_batch(self, messages: list[PendingMessage]) -> set[int]:
-        self._projector.logger = logger
-        return await self._projector._process_releases_batch(messages)
-
-    async def flush_all(self) -> bool:
-        """Flush all pending queues, draining each completely.
-
-        Returns:
-            True only if EVERY queue drained; False if any hit its retry limit
-            with messages still pending.
-        """
-        drained = True
-        for data_type in self.queues:
-            if not await self.flush_queue(data_type):
-                drained = False
-        return drained
-
-    async def flush_queue(self, data_type: str) -> bool:
-        """Fully drain a single data type queue.
-
-        Unlike _flush_queue which processes up to one batch, this loops until the
-        queue is completely empty. Yields to the event loop during backoff periods
-        instead of busy-spinning.
-
-        Enforces a retry limit so a persistent error cannot loop forever. On
-        giving up it leaves the remaining messages ON THE QUEUE — it must NEVER
-        nack them. The nack callback is `nack(requeue=False)`, which dead-letters
-        immediately and bypasses the quorum queue's x-delivery-limit budget
-        entirely, so a 30-second database blip used to send every pending record
-        straight to a DLQ nothing replays. Pending messages stay in memory and are
-        retried by periodic_flush once the database recovers; genuinely poison
-        batches are still dead-lettered by _flush_queue's poison guard.
-        See discogsography-hh7r.
-
-        Returns:
-            True if the queue drained completely, False if the retry limit was
-            reached with messages still pending — callers MUST NOT treat a False
-            return as a completed file.
-        """
-        retries = 0
-        while True:
-            # A concurrent flush may hold a popped batch that is still being
-            # written. Wait it out BEFORE judging the queue empty, or this
-            # returns while writes for this data type are still landing
-            # (discogsography-uo8g).
-            await self._wait_for_in_flight(data_type)
-            if not self.queues.get(data_type):
-                return True
-            prev_len = len(self.queues[data_type])
-            wait = self._backoff_until[data_type] - time.time()
-            if wait > 0:
-                await asyncio.sleep(wait)
-            await self._flush_queue(data_type)
-            curr_len = len(self.queues.get(data_type, []))
-            if curr_len < prev_len:
-                retries = 0
-                continue
-            retries += 1
-            if retries >= self.config.max_flush_retries:
-                logger.error(
-                    "❌ Flush retry limit reached — messages kept for retry",
-                    data_type=data_type,
-                    remaining=curr_len,
-                    max_retries=self.config.max_flush_retries,
-                )
-                return False
-
-    async def periodic_flush(self) -> None:
-        """Background task that periodically flushes queues.
-
-        This ensures messages don't sit in the queue too long
-        when message rate is low.
-        """
-        while not self._shutdown:
-            await asyncio.sleep(self.config.flush_interval)
-
-            for data_type, queue in self.queues.items():
-                if queue and time.time() - self.last_flush[data_type] >= self.config.flush_interval:
-                    await self._flush_queue(data_type)
-
-    def shutdown(self) -> None:
-        """Signal shutdown to stop periodic tasks."""
-        self._shutdown = True
-
-    def get_stats(self) -> dict[str, Any]:
-        """Get processing statistics."""
-        return {
-            "processed": self.processed_counts.copy(),
-            "batches": self.batch_counts.copy(),
-            "pending": {k: len(v) for k, v in self.queues.items()},
-            "in_flight": self._in_flight.copy(),
-            "effective_batch_size": self._effective_batch_size.copy(),
-            "configured_batch_size": self.config.batch_size,
-            "consecutive_failures": self._consecutive_failures.copy(),
-            "transient_failures": self._transient_failures.copy(),
-        }

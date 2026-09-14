@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parent.parent
 AUTOMATION_REVISION = "833cb464507678c38ab78bd4718ce697399463e9"
-PYTHON_LIBRARIES_REVISION = "455523ec388fdb9862d7aca65d9434aa7073dcb5"
+PYTHON_LIBRARIES_REVISION = "24704f5fd48d3ef4fff29398585e9924e225b0c5"
 
 
 def _maintained_markdown() -> list[Path]:
@@ -112,8 +112,8 @@ def test_required_regression_suites_remain_in_the_full_gate() -> None:
             "test_failed_drain_requeues_marker_without_marking_complete",
         ),
         "tests/test_batch_processor.py": (
-            "test_drain_blocks_on_in_flight_batch",
-            "test_transient_failures_incremented_on_service_unavailable",
+            "test_cancellation_restores_unsettled_delivery",
+            "test_transient_failure_is_retained_without_poison_or_settlement",
         ),
     }
     for relative_path, test_names in expected_tests.items():

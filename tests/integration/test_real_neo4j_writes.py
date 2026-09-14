@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from typing import Any
 from unittest.mock import AsyncMock
@@ -9,8 +10,9 @@ from unittest.mock import AsyncMock
 import pytest
 import pytest_asyncio
 from neo4j import AsyncDriver, AsyncGraphDatabase
+from neo4j.exceptions import ServiceUnavailable
 
-from graphinator.batch_processor import Neo4jBatchProcessor, PendingMessage
+from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor, PendingMessage
 
 
 pytestmark = pytest.mark.integration
@@ -19,6 +21,10 @@ pytestmark = pytest.mark.integration
 def pending(data_type: str, data: dict[str, Any]) -> PendingMessage:
     """Build one batch message; settlement belongs to the queue-level tests."""
     return PendingMessage(data_type, data, AsyncMock(), AsyncMock())
+
+
+async def enqueue(processor: Neo4jBatchProcessor, message: PendingMessage) -> None:
+    await processor._engine.submit(message.data_type, message, message)
 
 
 @pytest_asyncio.fixture
@@ -48,23 +54,21 @@ async def one(driver: AsyncDriver, query: str, **parameters: Any) -> dict[str, A
 @pytest.mark.asyncio
 async def test_artist_batch_writes_nodes_and_membership_edges(neo4j_driver: AsyncDriver) -> None:
     processor = Neo4jBatchProcessor(neo4j_driver)
-    failures = await processor._process_artists_batch(
-        [
-            pending(
-                "artists",
-                {
-                    "id": "artist-main",
-                    "name": "Main Artist",
-                    "sha256": "artist-hash",
-                    "members": [{"id": "artist-member"}],
-                    "groups": [{"id": "artist-group"}],
-                    "aliases": [{"id": "artist-alias"}],
-                },
-            )
-        ]
+    message = pending(
+        "artists",
+        {
+            "id": "artist-main",
+            "name": "Main Artist",
+            "sha256": "artist-hash",
+            "members": [{"id": "artist-member"}],
+            "groups": [{"id": "artist-group"}],
+            "aliases": [{"id": "artist-alias"}],
+        },
     )
-
-    assert failures == set()
+    await enqueue(processor, message)
+    assert await processor.flush_queue("artists") is True
+    message.ack_callback.assert_awaited_once()
+    message.nack_callback.assert_not_awaited()
     assert await one(
         neo4j_driver,
         """
@@ -82,27 +86,24 @@ async def test_artist_batch_writes_nodes_and_membership_edges(neo4j_driver: Asyn
 @pytest.mark.asyncio
 async def test_release_batch_writes_representative_catalog_edges(neo4j_driver: AsyncDriver) -> None:
     processor = Neo4jBatchProcessor(neo4j_driver)
-    failures = await processor._process_releases_batch(
-        [
-            pending(
-                "releases",
-                {
-                    "id": "release-one",
-                    "title": "Release One",
-                    "year": 2001,
-                    "sha256": "release-hash",
-                    "artists": [{"id": "artist-one"}],
-                    "labels": [{"id": "label-one"}],
-                    "master_id": "master-one",
-                    "genres": ["Electronic"],
-                    "styles": ["House"],
-                    "formats": [],
-                },
-            )
-        ]
+    message = pending(
+        "releases",
+        {
+            "id": "release-one",
+            "title": "Release One",
+            "year": 2001,
+            "sha256": "release-hash",
+            "artists": [{"id": "artist-one"}],
+            "labels": [{"id": "label-one"}],
+            "master_id": "master-one",
+            "genres": ["Electronic"],
+            "styles": ["House"],
+            "formats": [],
+        },
     )
-
-    assert failures == set()
+    await enqueue(processor, message)
+    assert await processor.flush_queue("releases") is True
+    message.ack_callback.assert_awaited_once()
     assert await one(
         neo4j_driver,
         """
@@ -124,34 +125,34 @@ async def test_release_batch_writes_representative_catalog_edges(neo4j_driver: A
 async def test_multi_genre_release_does_not_create_cartesian_part_of_edges(neo4j_driver: AsyncDriver) -> None:
     """Historical sy5k: co-occurrence must not be persisted as taxonomy."""
     processor = Neo4jBatchProcessor(neo4j_driver)
-    failures = await processor._process_releases_batch(
-        [
-            pending(
-                "releases",
-                {
-                    "id": "release-multi-genre",
-                    "title": "Ambiguous Taxonomy",
-                    "sha256": "multi-hash",
-                    "genres": ["Electronic", "Rock"],
-                    "styles": ["House"],
-                    "formats": [],
-                },
-            ),
-            pending(
-                "releases",
-                {
-                    "id": "release-single-genre",
-                    "title": "Unambiguous Taxonomy",
-                    "sha256": "single-hash",
-                    "genres": ["Electronic"],
-                    "styles": ["Techno"],
-                    "formats": [],
-                },
-            ),
-        ]
-    )
-
-    assert failures == set()
+    messages = [
+        pending(
+            "releases",
+            {
+                "id": "release-multi-genre",
+                "title": "Ambiguous Taxonomy",
+                "sha256": "multi-hash",
+                "genres": ["Electronic", "Rock"],
+                "styles": ["House"],
+                "formats": [],
+            },
+        ),
+        pending(
+            "releases",
+            {
+                "id": "release-single-genre",
+                "title": "Unambiguous Taxonomy",
+                "sha256": "single-hash",
+                "genres": ["Electronic"],
+                "styles": ["Techno"],
+                "formats": [],
+            },
+        ),
+    ]
+    for message in messages:
+        await enqueue(processor, message)
+    assert await processor.flush_queue("releases") is True
+    assert all(message.ack_callback.await_count == 1 for message in messages)
     assert await one(
         neo4j_driver,
         """
@@ -159,3 +160,71 @@ async def test_multi_genre_release_does_not_create_cartesian_part_of_edges(neo4j
         RETURN collect(DISTINCT [style.name, genre.name]) AS pairs
         """,
     ) == {"pairs": [["Techno", "Electronic"]]}
+
+
+@pytest.mark.asyncio
+async def test_real_engine_retries_transient_then_writes_once(neo4j_driver: AsyncDriver) -> None:
+    processor = Neo4jBatchProcessor(
+        neo4j_driver,
+        BatchConfig(batch_size=1, min_batch_size=1, backoff_initial=0.001),
+    )
+    project = processor._process_artists_batch
+    attempts = 0
+
+    async def transient_once(messages: list[PendingMessage]) -> set[int]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ServiceUnavailable("temporary outage")
+        return await project(messages)
+
+    processor._process_artists_batch = transient_once  # type: ignore[method-assign]
+    message = pending("artists", {"id": "retry-artist", "name": "Retry Artist", "sha256": "retry-hash"})
+    await enqueue(processor, message)
+
+    assert await processor.flush_queue("artists") is False
+    await asyncio.sleep(0.002)
+    assert await processor.flush_queue("artists") is True
+    message.ack_callback.assert_awaited_once()
+    message.nack_callback.assert_not_awaited()
+    assert (await one(neo4j_driver, "MATCH (a:Artist {id: $id}) RETURN a.name AS name", id="retry-artist"))["name"] == "Retry Artist"
+
+
+@pytest.mark.asyncio
+async def test_real_engine_isolates_poison_and_writes_healthy_tail(neo4j_driver: AsyncDriver) -> None:
+    processor = Neo4jBatchProcessor(
+        neo4j_driver,
+        BatchConfig(batch_size=2, min_batch_size=1, max_flush_retries=3, max_poison_retries=2),
+    )
+    project = processor._process_artists_batch
+
+    async def reject_named_poison(messages: list[PendingMessage]) -> set[int]:
+        if messages[0].data["id"] == "poison-artist":
+            raise ValueError("deterministic poison")
+        return await project(messages)
+
+    processor._process_artists_batch = reject_named_poison  # type: ignore[method-assign]
+    poison = pending("artists", {"id": "poison-artist", "name": "Poison", "sha256": "poison-hash"})
+    healthy = pending("artists", {"id": "healthy-artist", "name": "Healthy", "sha256": "healthy-hash"})
+    await enqueue(processor, poison)
+    await enqueue(processor, healthy)
+
+    assert await processor.flush_queue("artists") is True
+    poison.nack_callback.assert_awaited_once()
+    poison.ack_callback.assert_not_awaited()
+    healthy.ack_callback.assert_awaited_once()
+    assert (await one(neo4j_driver, "MATCH (a:Artist {id: $id}) RETURN a.name AS name", id="healthy-artist"))["name"] == "Healthy"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_real_engine_and_settles_each_member_once(neo4j_driver: AsyncDriver) -> None:
+    processor = Neo4jBatchProcessor(neo4j_driver, BatchConfig(batch_size=10))
+    messages = [pending("artists", {"id": f"shutdown-{index}", "name": f"Artist {index}", "sha256": f"hash-{index}"}) for index in range(2)]
+    for message in messages:
+        await enqueue(processor, message)
+
+    processor.shutdown()
+    assert await processor.flush_all() is True
+    assert all(message.ack_callback.await_count == 1 for message in messages)
+    assert all(message.nack_callback.await_count == 0 for message in messages)
+    assert (await one(neo4j_driver, "MATCH (a:Artist) WHERE a.id STARTS WITH 'shutdown-' RETURN count(a) AS count"))["count"] == 2

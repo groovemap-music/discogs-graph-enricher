@@ -232,6 +232,11 @@ class TestFlushSpan:
         processor._process_artists_batch = process  # type: ignore[method-assign]
         return processor
 
+    @staticmethod
+    async def _enqueue(processor: Neo4jBatchProcessor, messages: list[PendingMessage]) -> None:
+        for message in messages:
+            await processor._engine.submit("artists", message, message, span_context=message.span_context)
+
     @pytest.mark.asyncio
     async def test_links_every_member_delivery_and_records_the_processed_outcome(self, spans: SpanCollector) -> None:
         contexts = []
@@ -240,8 +245,8 @@ class TestFlushSpan:
                 contexts.append(gm_telemetry.span_context_of(span))
 
         processor = self._processor(AsyncMock(return_value=set()))
-        processor.queues["artists"].extend(self._pending(contexts))
-        await processor._flush_queue("artists")
+        await self._enqueue(processor, self._pending(contexts))
+        await processor.flush_queue("artists")
 
         flush = spans.only("flush neo4j artist")
         assert flush.kind is SpanKind.INTERNAL
@@ -258,8 +263,8 @@ class TestFlushSpan:
                 contexts.append(gm_telemetry.span_context_of(span))
 
         processor = self._processor(AsyncMock(return_value=set()))
-        processor.queues["artists"].extend(self._pending(contexts))
-        await processor._flush_queue("artists")
+        await self._enqueue(processor, self._pending(contexts))
+        await processor.flush_queue("artists")
 
         assert len(spans.only("flush neo4j artist").links) == MAX_FLUSH_LINKS
 
@@ -271,8 +276,8 @@ class TestFlushSpan:
             return set()
 
         processor = self._processor(process)
-        processor.queues["artists"].extend(self._pending([None]))
-        await processor._flush_queue("artists")
+        await self._enqueue(processor, self._pending([None]))
+        await processor.flush_queue("artists")
 
         flush = spans.only("flush neo4j artist")
         write = spans.only("execute neo4j")
@@ -284,8 +289,8 @@ class TestFlushSpan:
         from common.db_resilience import DatabaseUnavailableError
 
         processor = self._processor(AsyncMock(side_effect=DatabaseUnavailableError("neo4j is down")))
-        processor.queues["artists"].extend(self._pending([None]))
-        await processor._flush_queue("artists")
+        await self._enqueue(processor, self._pending([None]))
+        await processor.flush_queue("artists")
 
         flush = spans.only("flush neo4j artist")
         assert flush.attributes["outcome"] == "failed"
@@ -295,9 +300,9 @@ class TestFlushSpan:
     @pytest.mark.asyncio
     async def test_a_poison_batch_records_the_failed_outcome(self, spans: SpanCollector) -> None:
         processor = self._processor(AsyncMock(side_effect=ValueError("poison")))
-        processor.config.max_poison_retries = 1
-        processor.queues["artists"].extend(self._pending([None]))
-        await processor._flush_queue("artists")
+        processor._engine._policy = BatchConfig(batch_size=1000, max_poison_retries=1).runtime_policy()
+        await self._enqueue(processor, self._pending([None]))
+        await processor.flush_queue("artists")
 
         flush = spans.only("flush neo4j artist")
         assert flush.attributes["outcome"] == "failed"
@@ -306,7 +311,7 @@ class TestFlushSpan:
     @pytest.mark.asyncio
     async def test_an_empty_queue_opens_no_span(self, spans: SpanCollector) -> None:
         processor = self._processor(AsyncMock(return_value=set()))
-        await processor._flush_queue("artists")
+        await processor.flush_queue("artists")
 
         assert spans.names() == []
 

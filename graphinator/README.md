@@ -371,8 +371,8 @@ processor (`NEO4J_BATCH_MODE=true`, the default):
 | --- | --- | --- | --- |
 | `groovemap.pipeline.messages` | counter | `source=discogs`, `entity`, `outcome=processed\|skipped\|failed` | the per-message handler |
 | `groovemap.pipeline.message.duration` | histogram, s | `source`, `entity` | the per-message handler |
-| `groovemap.pipeline.batch.size` | histogram, `{items}` | `store=neo4j`, `entity`, `outcome=processed\|failed` | `Neo4jBatchProcessor._flush_queue_locked` |
-| `groovemap.pipeline.batch.flush.duration` | histogram, s | `store`, `entity`, `outcome` | `Neo4jBatchProcessor._flush_queue_locked` |
+| `groovemap.pipeline.batch.size` | histogram, `{items}` | `store=neo4j`, `entity`, `outcome=processed\|failed` | local `Neo4jBatchObserver` around `common.batch.AsyncBatchEngine` |
+| `groovemap.pipeline.batch.flush.duration` | histogram, s | `store`, `entity`, `outcome` | local `Neo4jBatchObserver` around `common.batch.AsyncBatchEngine` |
 | `groovemap.pipeline.consumers.active` | up-down counter | `source=discogs` | consumer start/stop across `main`, `_recover_consumers`, `cancel_all_consumers`, and `schedule_consumer_cancellation` |
 
 `entity` is one of `artist`, `label`, `master`, `release`.
@@ -426,7 +426,7 @@ Neo4j — is one trace.
 | Span | Kind | Attributes | Opened by |
 | --- | --- | --- | --- |
 | `process {queue}` | `CONSUMER` | `messaging.system=rabbitmq`, `messaging.destination.name`, `messaging.operation.name=process`, `error.type` on failure | the per-message handler, from the `traceparent` in the AMQP headers |
-| `flush neo4j {entity}` | `INTERNAL` | `db.system.name=neo4j`, `groovemap.entity`, `outcome=processed\|failed`, `error.type` on failure | `Neo4jBatchProcessor._flush_queue_locked`, via `common.tracing.flush_span` |
+| `flush neo4j {entity}` | `INTERNAL` | `db.system.name=neo4j`, `groovemap.entity`, `outcome=processed\|failed`, `error.type` on failure | local `Neo4jBatchObserver`, via `common.tracing.flush_span` |
 | `{db.operation.name} neo4j` | `CLIENT` | `db.system.name`, `db.operation.name`, `error.type` on failure | `AsyncResilientNeo4jDriver`, nested under whichever span above is open |
 
 The CONSUMER span is opened locally for the same reason
