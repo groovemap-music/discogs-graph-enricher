@@ -65,6 +65,10 @@ catalog.
   a delivery is never negatively acknowledged while its consumer is still subscribed.
 - Pending batch writes are drained before the Neo4j driver closes. Detached
   post-import maintenance is cancelled on shutdown and can be repeated safely.
+- Delivery settlement and Discogs batch lifecycle are shared through the immutable
+  `groovemap-runtime` `common.delivery` and `common.batch` contracts. Fix lifecycle
+  defects there once; keep Discogs normalization, Neo4j projection and exception
+  mapping, telemetry, QoS, completion state, and maintenance in this repository.
 
 The historical failure modes are guarded by the shutdown-delivery-churn, file-completion,
 batch-drain, and transient-classification regression suites. See
