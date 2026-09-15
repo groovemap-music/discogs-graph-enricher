@@ -1,7 +1,7 @@
 {
   "binding_sha256": "cfcd98aa02612889cb3e9c8eab5eb495b58ed7091dd10bca02fac0629c038e7f",
-  "contract_sha256": "d530ff04ee33224ed044db8d52c3870d97e5a69d7aa991eab41d8d8b579f5dd7",
-  "migration_transform": "Promoted from catalog-ingestion to the dedicated discogs-ingestion producer; entity vocabulary and exchange/queue naming for the discogs source are unchanged. The contract is now Discogs-only (the musicbrainz consumers move to their own producer contract) and each releases event now carries a media block alongside its raw formats list.",
-  "producer_commit": "c1bf1b4ada3ee88e1e6768a0be7fa6ed1b921831",
+  "contract_sha256": "7d5a70024272a61c520512444cd06c4a0e548a3f6bbe988a298843347fdc502a",
+  "migration_transform": "Additive within contract v1: every releases event now carries the canonical companies block (ADR 0011) alongside the identifiers and media blocks it already carried, and keeps its raw country string. Exchange and queue naming, the entity vocabulary, and the generated binding are unchanged, so the promotion is a fixture-payload change only.",
+  "producer_commit": "4fec8dd08370dea0e1b54dbf53e920793a22cb3c",
   "producer_repository": "https://github.com/groovemap-music/discogs-ingestion"
 }

@@ -2,8 +2,8 @@
 
 This consumer is pinned in both `pyproject.toml` and `uv.lock` to the reviewed
 `groovemap-runtime` source revision
-`24704f5fd48d3ef4fff29398585e9924e225b0c5`, whose Git tree is
-`c5b96bdeab082057480a26784ad6065497aaae9a`.
+`e372b6a7598ae31ee6578fdff39bc920bedd7136`, whose Git tree is
+`5dfee55fd070deb3463e5eb54944561dc969ec40`.
 
 `common.batch.AsyncBatchEngine` now owns the transport-neutral keyed queues,
 backpressure, concurrency, retry accounting, poison isolation, cancellation
