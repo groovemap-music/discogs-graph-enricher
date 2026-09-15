@@ -14,6 +14,15 @@ from common.batch import BatchItemResult
 from common.credit_roles import categorize_role
 from common.delivery import Settlement
 
+from graphinator.company_projection import (
+    COMPANY_SOURCE,
+    MERGE_COMPANY_CYPHER,
+    PRUNE_CREDITED_TO_CYPHER,
+    credit_prune_record,
+    credited_to_rows,
+    release_country,
+    resolve_companies_block,
+)
 from graphinator.media_projection import (
     MEDIA_SOURCE,
     MERGE_MEDIA_CYPHER,
@@ -569,6 +578,16 @@ class Neo4jBatchProjector:
                     media_block = resolve_media_block(msg.data)
                     release_data["media_families"] = media_families(media_block)
                     release_data["media_rows"] = issued_on_rows(release_data["id"], media_block)
+                    # Canonical companies projection (ADR 0011), computed once per release
+                    # so the writes below are flat UNWINDs. `company_rows` is None — not an
+                    # empty list — for a record carrying no canonical block, which is the
+                    # difference between "this release has no company credits" and "this
+                    # record is silent about them"; only the former is pruned.
+                    companies_block = resolve_companies_block(msg.data)
+                    release_data["company_rows"] = None if companies_block is None else credited_to_rows(release_data["id"], companies_block)
+                    # `country` is the release's country as received (ADR 0011), normalized
+                    # so a blank value removes the property rather than storing "".
+                    release_data["country"] = release_country(msg.data)
                     # Per-release metadata bag — populated only with non-null
                     # keys. The cypher uses `SET r += release.metadata`, which
                     # merges only the keys present, so absent fields don't wipe
@@ -599,6 +618,7 @@ class Neo4jBatchProjector:
                     MERGE (r:Release {id: release.id})
                     SET r.title = release.title,
                         r.year = release.year,
+                        r.country = release.country,
                         r.formats = release.format_names,
                         r.media_families = release.media_families,
                         r.sha256 = release.sha256,
@@ -816,6 +836,24 @@ class Neo4jBatchProjector:
                 media_rows = [row for release in releases_to_process for row in release["media_rows"]]
                 if media_rows:
                     await tx.run(MERGE_MEDIA_CYPHER, rows=media_rows, source=MEDIA_SOURCE)
+
+                # Project the canonical companies block onto Company nodes and CREDITED_TO
+                # edges (ADR 0011), with the same statements the single-record path runs.
+                # CREDITED_TO carries a `source`, so its prune is scoped to this provider's
+                # edges and cannot use _prune_stale_edges. Only releases that carry a
+                # canonical block take part: one asserting an EMPTY block is pruned with an
+                # empty keep-list — the "every company credit was removed" case — while one
+                # carrying no block at all is left alone.
+                company_releases = [release for release in releases_to_process if release["company_rows"] is not None]
+                if company_releases:
+                    await tx.run(
+                        PRUNE_CREDITED_TO_CYPHER,
+                        records=[credit_prune_record(release["id"], release["company_rows"]) for release in company_releases],
+                        source=COMPANY_SOURCE,
+                    )
+                    company_rows = [row for release in company_releases for row in release["company_rows"]]
+                    if company_rows:
+                        await tx.run(MERGE_COMPANY_CYPHER, companies=company_rows, source=COMPANY_SOURCE)
 
                 # Process credits (extraartists) — Person nodes and CREDITED_ON relationships
                 credit_data = []

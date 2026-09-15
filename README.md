@@ -139,4 +139,5 @@ then-applicable license.
 
 See the [documentation index](docs/README.md) and the
 [graphinator reference](graphinator/README.md) for the full graph data model,
-including [the media graph model and the `Release.formats` deprecation](docs/database-schema.md).
+including [the media graph model and the `Release.formats` deprecation](docs/database-schema.md)
+and [company credits and release country](docs/company-credits.md).
