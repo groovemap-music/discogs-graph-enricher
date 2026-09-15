@@ -4,6 +4,15 @@ from typing import Any
 
 from common.credit_roles import categorize_role
 
+from graphinator.company_projection import (
+    COMPANY_SOURCE,
+    MERGE_COMPANY_CYPHER,
+    PRUNE_CREDITED_TO_CYPHER,
+    credit_prune_record,
+    credited_to_rows,
+    release_country,
+    resolve_companies_block,
+)
 from graphinator.media_projection import (
     MEDIA_SOURCE,
     MERGE_MEDIA_CYPHER,
@@ -222,11 +231,12 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
     media_block = resolve_media_block(record)
     await tx.run(
         "MERGE (r:Release {id: $id}) "
-        "ON CREATE SET r.title = $title, r.year = $year, r.formats = $formats, r.media_families = $media_families, r.sha256 = $sha256 "
-        "ON MATCH SET r.title = $title, r.year = $year, r.formats = $formats, r.media_families = $media_families, r.sha256 = $sha256",
+        "ON CREATE SET r.title = $title, r.year = $year, r.country = $country, r.formats = $formats, r.media_families = $media_families, r.sha256 = $sha256 "
+        "ON MATCH SET r.title = $title, r.year = $year, r.country = $country, r.formats = $formats, r.media_families = $media_families, r.sha256 = $sha256",
         id=record["id"],
         title=record.get("title", "Unknown Release"),
         year=record.get("year"),
+        country=release_country(record),
         formats=formats,
         media_families=media_families(media_block),
         sha256=record["sha256"],
@@ -286,6 +296,22 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
     )
     if media_rows:
         await tx.run(MERGE_MEDIA_CYPHER, rows=media_rows, source=MEDIA_SOURCE)
+
+    # Project the canonical companies block onto Company nodes and CREDITED_TO edges
+    # (ADR 0011), with the same statements the batched path runs. Both are skipped for a
+    # record carrying no canonical block: that record is silent about company credits
+    # rather than asserting it has none, and an empty-keep prune would delete the credits
+    # a post-cutover event already wrote.
+    companies_block = resolve_companies_block(record)
+    if companies_block is not None:
+        company_rows = credited_to_rows(record["id"], companies_block)
+        await tx.run(
+            PRUNE_CREDITED_TO_CYPHER,
+            records=[credit_prune_record(record["id"], company_rows)],
+            source=COMPANY_SOURCE,
+        )
+        if company_rows:
+            await tx.run(MERGE_COMPANY_CYPHER, companies=company_rows, source=COMPANY_SOURCE)
 
     artists: list[dict[str, Any]] | None = record.get("artists")
     if artists:
