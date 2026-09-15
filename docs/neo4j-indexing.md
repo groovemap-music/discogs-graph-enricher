@@ -15,6 +15,7 @@ The graph projector matches or merges these stable keys:
 | Genre, Style, Person | `name` |
 | Medium | `id` |
 | MediaFamily | `name` |
+| Company | `id` |
 | ExtractionCompletion | `version` |
 
 The owning schema should provide the constraints and indexes appropriate to those
@@ -38,10 +39,12 @@ When changing a projector query:
 4. Run `just check` before review.
 
 ```bash
-uv run pytest tests/test_batch_processor.py tests/test_media_projection.py
+uv run pytest tests/test_batch_processor.py tests/test_media_projection.py tests/test_company_projection.py
 just check
 ```
 
 The media nodes and source-scoped relationship prune owned by this writer are
-documented in [the media graph model](database-schema.md). Query construction and
+documented in [the media graph model](database-schema.md); the `Company` nodes and the
+source-scoped `CREDITED_TO` prune, along with the `Release.country` property, are
+documented in [company credits and release country](company-credits.md). Query construction and
 batch invariants are documented in [Neo4j write-query design](query-performance-optimizations.md).

@@ -143,8 +143,9 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 1. **Release** - Album/single releases
 
-   - Properties: id, title, year, media_families, formats†, sha256
-   - Relationships: BY (to Artist), ON (to Label), DERIVED_FROM (to Master), IS (to Genre/Style), ISSUED_ON (to Medium)
+   - Properties: id, title, year, country, media_families, formats†, sha256
+   - Relationships: BY (to Artist), ON (to Label), DERIVED_FROM (to Master), IS (to Genre/Style), ISSUED_ON (to Medium), CREDITED_TO (to Company)
+   - `country` is the release's country as Discogs states it ([ADR 0011][adr-0011]), backed by a range index. See [Company credits and release country](../docs/company-credits.md)
    - †`formats` is the deprecated raw Discogs format names, retained for one minor version; `media_families` is the canonical replacement ([ADR 0007][adr-0007]). See [Database schema: the media graph model](../docs/database-schema.md) for the full deprecation note.
 
 1. **Master** - Master recordings
@@ -173,6 +174,12 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
    - Properties: name
 
+1. **Company** - Companies credited on the physical article (pressing plants, cutting rooms, mastering houses, distributors, rights holders)
+
+   - Properties: id, name
+   - Relationships: CREDITED_TO (from Release, with `role`, `role_category`, and `source` properties)
+   - `id` is the Discogs company id as a string, or a `name:`-prefixed derived id for a company Discogs gives no id ([ADR 0011][adr-0011]). The issuing label is not a company credit; it stays `(:Release)-[:ON]->(:Label)`. See [Company credits and release country](../docs/company-credits.md)
+
 1. **Person** - Credited personnel (producers, engineers, mastering engineers, session musicians, designers, managers)
 
    - Properties: name, credit_count
@@ -198,6 +205,7 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 - `ISSUED_ON` - Release was issued on a medium (properties: `qty`, `source`). `source` records which provider asserted the edge and is part of the merge pattern, so each catalog writes and prunes only its own edges and the MusicBrainz enricher's edges over the same Medium nodes are left intact
 - `IN_FAMILY` - Medium belongs to a media family
 - `CREDITED_ON` - Person credited on a release (properties: `role`, `category`)
+- `CREDITED_TO` - Release credited to a company that made the physical article (properties: `role`, `role_category`, `source`). `role` and `source` are both part of the merge pattern, so a company credited under two roles is two edges to one node and each catalog writes and prunes only its own edges
 - `SAME_AS` - Person is the same entity as an Artist (linked via Discogs artist ID)
 
 #### Created by API Syncer
@@ -239,6 +247,39 @@ block from the raw format names and their descriptors with
 `common.media.legacy_format_names_to_media`. That fallback reads flat names instead of
 re-implementing the producer's mapping rules: this service is a consumer of the taxonomy,
 not a second implementation of it.
+
+### Canonical Company Credit Projection
+
+> 📖 For the authoritative description of the company-credit graph model — including the
+> derived id for a company Discogs gives no id, the pair-keyed prune, and why a record
+> carrying no canonical block is left alone — see
+> [Company credits and release country](../docs/company-credits.md).
+
+Every releases event from a post-cutover producer carries an additive `companies` block
+([ADR 0011][adr-0011]). Both the single-record and the batched write path run the same two
+Cypher statements from `graphinator/company_projection.py`, so the two paths cannot drift
+apart:
+
+1. A prune that deletes this release's `CREDITED_TO` edges whose `[company id, role]` pair
+   the new version of the record no longer asserts. It is scoped to
+   `e.source = "discogs"`, and it runs for a release asserting an empty block — the empty
+   keep-list is how the "all company credits removed" correction is applied.
+1. A `MERGE` that creates the `Company` node and the `CREDITED_TO` edge, then sets
+   `role_category` on it.
+
+The keep-list is pairs rather than bare company ids because `role` is part of the merge
+pattern: a plant that also distributed the record has two edges to one node, and dropping
+one of those roles upstream has to delete exactly that edge.
+
+Neither statement runs for a record that carries no canonical block — a pre-cutover event,
+or one whose `companies` key still holds the raw Discogs list. Such a record is silent
+about company credits rather than asserting it has none, and pruning on that silence would
+delete credits a post-cutover event already wrote. Unlike media, there is no best-effort
+fallback: the producer's role mapping is fixed by conformance fixtures, and re-deriving it
+here would make this service a second implementation of it.
+
+`Release.country` is written alongside, from the event's raw `country` string, in both
+paths and in both the `ON CREATE` and `ON MATCH` branches of the single-record write.
 
 ## Processing Logic
 
@@ -456,3 +497,4 @@ in the `deployment` repository for the full cross-service metric catalog and das
 - Comprehensive exception logging
 
 [adr-0007]: https://github.com/groovemap-music/design/blob/main/docs/adr/0007-canonical-media-taxonomy.md
+[adr-0011]: https://github.com/groovemap-music/design/blob/main/docs/adr/0011-catalog-identifiers-and-manufacturing-credits.md

@@ -162,6 +162,146 @@ async def test_multi_genre_release_does_not_create_cartesian_part_of_edges(neo4j
     ) == {"pairs": [["Techno", "Electronic"]]}
 
 
+def companies(*items: tuple[str, int | None, str, str]) -> dict[str, Any]:
+    """Build a canonical companies block from (name, discogs id, role, category) tuples."""
+    return {
+        "companies_version": "1",
+        "items": [
+            {
+                "name": name,
+                "discogs_id": discogs_id,
+                "role": role,
+                "role_category": category,
+                "catno": None,
+                "source": {"provider": "discogs", "entity_type": None},
+            }
+            for name, discogs_id, role, category in items
+        ],
+        "role_categories": sorted({category for *_, category in items}),
+        "unmapped": {"roles": []},
+    }
+
+
+@pytest.mark.asyncio
+async def test_company_credits_survive_correction_by_company_and_role_pair(neo4j_driver: AsyncDriver) -> None:
+    """The prune's `[co.id, e.role] IN record.keep` is list-pair Cypher a mock cannot check.
+
+    The corrected record keeps Damont as its distributor and drops it as its plant, so the
+    prune has to delete exactly one of the two edges to that one node. It also drops the
+    cutting room entirely, and it names a plant Discogs gives no id — the derived
+    `name:`-keyed node the uniqueness constraint has to accept.
+    """
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    original = pending(
+        "releases",
+        {
+            "id": "release-credits",
+            "title": "Pressed Somewhere",
+            "sha256": "credits-hash-1",
+            "country": "UK",
+            "formats": [],
+            "companies": companies(
+                ("Damont", 12345, "Pressed By", "pressing"),
+                ("Damont", 12345, "Distributed By", "distribution"),
+                ("Utopia Studios", 266218, "Lacquer Cut At", "lacquer"),
+            ),
+        },
+    )
+    await enqueue(processor, original)
+    assert await processor.flush_queue("releases") is True
+
+    # `collect` has no order guarantee, so every credit assertion below sorts its rows.
+    written = await one(
+        neo4j_driver,
+        """
+        MATCH (:Release {id: $id})-[e:CREDITED_TO]->(co:Company)
+        RETURN collect([co.id, co.name, e.role, e.role_category, e.source]) AS credits
+        """,
+        id="release-credits",
+    )
+    assert sorted(written["credits"]) == [
+        ["12345", "Damont", "Distributed By", "distribution", "discogs"],
+        ["12345", "Damont", "Pressed By", "pressing", "discogs"],
+        ["266218", "Utopia Studios", "Lacquer Cut At", "lacquer", "discogs"],
+    ]
+
+    corrected = pending(
+        "releases",
+        {
+            "id": "release-credits",
+            "title": "Pressed Somewhere",
+            "sha256": "credits-hash-2",
+            "country": "US",
+            "formats": [],
+            "companies": companies(
+                ("Damont", 12345, "Distributed By", "distribution"),
+                ("Sound Performance", None, "Pressed By", "pressing"),
+            ),
+        },
+    )
+    await enqueue(processor, corrected)
+    assert await processor.flush_queue("releases") is True
+
+    surviving = await one(
+        neo4j_driver,
+        """
+        MATCH (release:Release {id: $id})
+        OPTIONAL MATCH (release)-[e:CREDITED_TO]->(co:Company)
+        RETURN release.country AS country, collect([co.id, e.role]) AS credits
+        """,
+        id="release-credits",
+    )
+    assert surviving["country"] == "US"
+    assert sorted(surviving["credits"]) == [["12345", "Distributed By"], ["name:sound performance", "Pressed By"]]
+
+
+@pytest.mark.asyncio
+async def test_a_release_with_no_companies_block_keeps_the_credits_already_written(neo4j_driver: AsyncDriver) -> None:
+    """A pre-cutover record is silent about credits, so neither statement runs for it."""
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    await enqueue(
+        processor,
+        pending(
+            "releases",
+            {
+                "id": "release-silent",
+                "title": "Already Credited",
+                "sha256": "silent-hash-1",
+                "country": "UK",
+                "formats": [],
+                "companies": companies(("Damont", 12345, "Pressed By", "pressing")),
+            },
+        ),
+    )
+    assert await processor.flush_queue("releases") is True
+
+    await enqueue(
+        processor,
+        pending(
+            "releases",
+            {
+                "id": "release-silent",
+                "title": "Already Credited",
+                "sha256": "silent-hash-2",
+                "formats": [],
+                "companies": [{"id": 12345, "name": "Damont", "entity_type_name": "Pressed By"}],
+            },
+        ),
+    )
+    assert await processor.flush_queue("releases") is True
+
+    kept = await one(
+        neo4j_driver,
+        """
+        MATCH (release:Release {id: $id})
+        OPTIONAL MATCH (release)-[e:CREDITED_TO]->(co:Company)
+        RETURN release.country AS country, collect([co.id, e.role]) AS credits
+        """,
+        id="release-silent",
+    )
+    assert kept == {"country": None, "credits": [["12345", "Pressed By"]]}
+
+
 @pytest.mark.asyncio
 async def test_real_engine_retries_transient_then_writes_once(neo4j_driver: AsyncDriver) -> None:
     processor = Neo4jBatchProcessor(
