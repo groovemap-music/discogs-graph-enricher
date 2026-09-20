@@ -408,7 +408,7 @@ class TestCheckConsumersUnexpectedlyDead:
         import graphinator.graphinator
 
         graphinator.graphinator.consumer_tags = {}
-        graphinator.graphinator.completed_files = {"artists"}  # Not all complete
+        graphinator.graphinator.completed_files = {"artists"}  # Labels, masters, and releases are still pending.
         graphinator.graphinator.message_counts = {"artists": 10, "labels": 0, "masters": 0, "releases": 0}
 
         from graphinator.graphinator import check_consumers_unexpectedly_dead
@@ -1417,7 +1417,7 @@ class TestCheckFileCompletionMaintenanceFailure:
     async def test_acks_and_retries_in_task_when_compute_stats_fails(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
         """compute_genre_style_stats fails → still ack; the detached task retries."""
         mock_cleanup.return_value = True
-        mock_compute.return_value = False  # stats computation failed at scale
+        mock_compute.return_value = False  # Simulate a failed stats computation; the detached task must retry.
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         completion_data = {"type": "extraction_complete", "version": "20260101"}
 

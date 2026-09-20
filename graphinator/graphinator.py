@@ -1566,7 +1566,7 @@ async def main() -> None:
     # Initialize resilient RabbitMQ connection manager (not connecting yet)
     rabbitmq_manager = AsyncResilientRabbitMQ(
         connection_url=config.amqp_connection,
-        max_retries=10,  # More retries for startup
+        max_retries=10,  # Startup needs extra attempts while the broker becomes ready.
         heartbeat=600,
         connection_attempts=10,
         retry_delay=5.0,
