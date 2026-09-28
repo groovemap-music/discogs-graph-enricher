@@ -67,6 +67,8 @@ IDLE_LOG_INTERVAL=300               # Seconds between idle status logs (default:
 
 # Logging
 LOG_LEVEL=INFO                      # Logging level (default: INFO)
+LOG_FILE_MAX_BYTES=104857600        # Bytes before the /logs file sink rotates (default: 100 MiB)
+LOG_FILE_BACKUP_COUNT=5             # Rotated log files retained alongside the active one (default: 5)
 
 # OpenTelemetry metrics and traces (standard OTEL vars only — no GrooveMap-specific ones)
 OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318  # Unset disables export (default: unset)
