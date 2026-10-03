@@ -1493,7 +1493,7 @@ class TestScheduleConsumerCancellation:
         await asyncio.sleep(0.2)
 
         # Consumer should be cancelled
-        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=True)
+        mock_queue.cancel.assert_called_once_with("consumer-tag-123", nowait=False, timeout=5.0)
 
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.CONSUMER_CANCEL_DELAY", 0.1)
@@ -2889,9 +2889,10 @@ class TestCloseRabbitMQConnectionErrors:
 
             await close_rabbitmq_connection()
 
-        # Should not raise; connection should be set to None anyway
-        assert graphinator.graphinator.active_connection is None
+        # Failed teardown retains the handle so recovery can retry it.
+        assert graphinator.graphinator.active_connection is mock_connection
         assert graphinator.graphinator.active_channel is None
+        assert graphinator.graphinator.consumer_recovery_requested
 
 
 class TestPeriodicQueueCheckerExceptions:
@@ -4237,7 +4238,7 @@ class TestProgressIntervalLog:
 
 
 class TestCloseRabbitMQOuterException:
-    """Test outer exception handling in close_rabbitmq_connection (lines 231-232)."""
+    """Teardown failures request recovery and retain retryable state."""
 
     @pytest.mark.asyncio
     async def test_outer_exception_logged(self) -> None:
@@ -4245,7 +4246,7 @@ class TestCloseRabbitMQOuterException:
         import graphinator.graphinator
 
         graphinator.graphinator.active_channel = None
-        graphinator.graphinator.active_connection = None
+        graphinator.graphinator.active_connection = AsyncMock()
 
         with patch("graphinator.graphinator.logger") as mock_logger:
             mock_logger.info.side_effect = Exception("Logger failed unexpectedly")
@@ -4253,9 +4254,9 @@ class TestCloseRabbitMQOuterException:
 
             await close_rabbitmq_connection()
 
-        mock_logger.error.assert_called()
-        error_str = " ".join(str(c) for c in mock_logger.error.call_args_list)
-        assert "Error" in error_str
+        mock_logger.warning.assert_called()
+        error_str = " ".join(str(c) for c in mock_logger.warning.call_args_list)
+        assert "teardown failed" in error_str
 
 
 class TestScheduleConsumerCancellationException:
@@ -5170,8 +5171,8 @@ class TestConsumersActiveTelemetry:
         assert g.consumer_tags == {}
 
     @pytest.mark.asyncio
-    async def test_cancel_all_consumers_decrements_when_queue_already_gone(self, collector: Any) -> None:
-        """The early-continue branch (queue missing) still owns a `started` credit to undo."""
+    async def test_cancel_all_consumers_retains_credit_without_confirmation(self, collector: Any) -> None:
+        """Missing handles do not prove that the broker stopped the consumer."""
         import graphinator.graphinator as g
 
         g.consumer_tags = {"artists": "tag-a"}
@@ -5181,7 +5182,9 @@ class TestConsumersActiveTelemetry:
         await g.cancel_all_consumers()
 
         [point] = collector.points(gm_telemetry.PIPELINE_CONSUMERS_ACTIVE)
-        assert point.value == 0
+        assert point.value == 1
+        assert g.consumer_tags == {"artists": "tag-a"}
+        assert g.consumer_recovery_requested
 
 
 class TestTelemetryLifecycle:
