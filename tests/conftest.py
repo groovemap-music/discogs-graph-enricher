@@ -276,6 +276,10 @@ def reset_global_state() -> Iterator[None]:
         g.current_task = None
         g.current_progress = 0.0
         g.consumer_tags = {}
+        g.consumer_cancel_tasks = {}
+        g.consumer_recovery_requested = False
+        g.active_connection = None
+        g.active_channel = None
         g.completed_files = set()
         g.queues = {}
         g.idle_mode = False

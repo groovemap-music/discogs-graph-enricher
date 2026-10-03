@@ -35,8 +35,14 @@ is not marked complete.
 
 `CONSUMER_CANCEL_DELAY` defaults to `300` seconds. A value of `0` disables the
 per-queue cancellation timer. Cancellation uses the queue's registered consumer tag
-and `nowait=True`; a newer completion marker replaces an existing timer for the same
-entity type. The shared RabbitMQ channel and connection remain open while any
+and waits for `CancelOk` (`nowait=False`) with a five-second timeout. A tag and
+its active-consumer metric are removed only after confirmation, or after confirmed
+channel/connection teardown. Failed or timed-out cancels retain the tag and request
+recovery at the next stuck-check interval, even when tags remain present; health
+reports unhealthy while recovery is requested. A newer completion marker replaces
+an existing timer for the same entity type. When records arrive again, the type's
+completion flag and old timer are cleared so the next extraction stays subscribed
+and stuck detection re-arms. The shared RabbitMQ channel and connection remain open while any
 consumer is active and close after all four consumers are cancelled and all four
 entity types are complete.
 
@@ -50,7 +56,10 @@ depth check. Unexpectedly missing consumers are checked every
 
 SIGINT and SIGTERM use a separate, immediate drain path:
 
-1. Cancel every registered consumer before doing slow teardown work.
+1. Stop delayed cancellation timers and cancel every registered consumer before
+   doing slow teardown work. Concurrent confirmation waits share a five-second
+   budget; failures are logged and do not block teardown. Connection/channel
+   teardown is also bounded to five seconds.
 2. Stop progress, recovery, and periodic batch-flush tasks.
 3. Ask every batch queue to drain. Records that cannot be written stay pending; a
    transient database outage is not converted into a dead-letter decision.
