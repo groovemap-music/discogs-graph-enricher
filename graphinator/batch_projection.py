@@ -23,6 +23,7 @@ from graphinator.company_projection import (
     release_country,
     resolve_companies_block,
 )
+from graphinator.master_reference import usable_master_id
 from graphinator.media_projection import (
     MEDIA_SOURCE,
     MERGE_MEDIA_CYPHER,
@@ -349,8 +350,7 @@ class Neo4jBatchProjector:
         nack_indices: set[int] = set()
         all_masters = []
         for i, msg in enumerate(messages):
-            master_id = msg.data.get("id")
-            if not master_id:
+            if usable_master_id(msg.data.get("id")) is None:
                 self.logger.warning(
                     "⚠️ Message missing required 'id' field, will nack",
                     data_keys=list(msg.data.keys()),
@@ -658,7 +658,7 @@ class Neo4jBatchProjector:
                     rel_type="DERIVED_FROM",
                     target_label="Master",
                     target_key="id",
-                    desired=lambda r: [str(r["master_id"])] if r.get("master_id") else [],
+                    desired=lambda r: [m] if (m := usable_master_id(r.get("master_id"))) is not None else [],
                 )
                 await self._prune_stale_edges(
                     tx,
@@ -728,12 +728,12 @@ class Neo4jBatchProjector:
                 # Process master relationships (Release)-[:DERIVED_FROM]->(Master)
                 master_data = []
                 for release in releases_to_process:
-                    master_id = release.get("master_id")
-                    if master_id:
+                    master_id = usable_master_id(release.get("master_id"))
+                    if master_id is not None:
                         master_data.append(
                             {
                                 "release_id": release["id"],
-                                "master_id": str(master_id),
+                                "master_id": master_id,
                             }
                         )
                 if master_data:

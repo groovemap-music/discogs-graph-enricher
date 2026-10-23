@@ -13,6 +13,7 @@ from graphinator.company_projection import (
     release_country,
     resolve_companies_block,
 )
+from graphinator.master_reference import usable_master_id
 from graphinator.media_projection import (
     MEDIA_SOURCE,
     MERGE_MEDIA_CYPHER,
@@ -242,6 +243,8 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         sha256=record["sha256"],
     )
 
+    master_id = usable_master_id(record.get("master_id"))
+
     await _prune_stale_edges(
         tx,
         "Release",
@@ -267,7 +270,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         rel_type="DERIVED_FROM",
         target_label="Master",
         target_key="id",
-        keep=[record["master_id"]] if record.get("master_id") else [],
+        keep=[master_id] if master_id is not None else [],
     )
     await _prune_stale_edges(
         tx,
@@ -333,8 +336,7 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
                 release_id=record["id"],
             )
 
-    master_id = record.get("master_id")
-    if master_id:
+    if master_id is not None:
         await tx.run(
             "MATCH (r:Release {id: $id}) MERGE (m_r:Master {id: $m_id}) MERGE (r)-[:DERIVED_FROM]->(m_r)",
             id=record["id"],
