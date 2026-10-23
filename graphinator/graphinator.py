@@ -32,6 +32,7 @@ from graphinator.entity_projection import (
     process_master,
     process_release,
 )
+from graphinator.master_reference import NO_MASTER_ID
 from graphinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
     DATA_TYPES,
@@ -827,6 +828,11 @@ async def run_post_import_maintenance() -> bool:
             if maintenance_ok and graph is not None and not await cleanup_all_stub_nodes():
                 maintenance_ok = False
 
+            # Drop the fake (:Master {id: "0"}) a graph loaded before the sentinel fix
+            # may still carry. Idempotent, and a no-op on a graph built since.
+            if maintenance_ok and graph is not None and not await cleanup_sentinel_master():
+                maintenance_ok = False
+
             # All releases are now imported — compute aggregate stats on
             # Genre/Style/Label nodes. Skipped when the queues never drained: the
             # counts would be computed over a graph that is still being written.
@@ -1243,6 +1249,61 @@ async def cleanup_stub_nodes(data_type: str) -> bool:
             data_type=data_type,
             error=str(e),
         )
+        return False
+
+    return True
+
+
+async def cleanup_sentinel_master() -> bool:
+    """Delete the fake ``(:Master {id: "0"})`` projected from Discogs' "no master" sentinel.
+
+    Backstop only: the projection no longer creates it (see
+    :mod:`graphinator.master_reference`). A graph loaded before that fix has one node
+    that every masterless release points at, millions of ``DERIVED_FROM`` edges deep,
+    which :func:`cleanup_stub_nodes` never collects because it only deletes ISOLATED
+    stubs. The edges go first, in chunks, so no single transaction has to detach a
+    node that large; the now-edgeless node is deleted last. Idempotent.
+
+    Returns:
+        True if the sweep succeeded (or there is nothing to do), False if it failed —
+        so the caller can retry.
+    """
+    if graph is None:
+        return True
+
+    def _build_edge_cypher(batch_size: int | None) -> str:
+        return f"""
+    MATCH (:Master {{id: '{NO_MASTER_ID}'}})-[rel]-()
+    CALL {{
+        WITH rel
+        DELETE rel
+    }} IN TRANSACTIONS OF {batch_size} ROWS
+    """
+
+    def _build_node_cypher(_batch_size: int | None) -> str:
+        return f"MATCH (m:Master {{id: '{NO_MASTER_ID}'}}) DETACH DELETE m"
+
+    try:
+        edge_summary = await _run_maintenance_query(
+            _build_edge_cypher,
+            "Sentinel Master edge cleanup",
+            batch_size=STUB_CLEANUP_BATCH_SIZE,
+        )
+        if edge_summary is None:
+            return False
+        node_summary = await _run_maintenance_query(_build_node_cypher, "Sentinel Master node cleanup")
+        if node_summary is None:
+            return False
+
+        if node_summary.counters.nodes_deleted > 0:
+            logger.info(
+                "🧹 Removed the sentinel Master node projected from Discogs master_id 0",
+                edges_deleted=edge_summary.counters.relationships_deleted,
+            )
+        else:
+            logger.info("✅ No sentinel Master node to clean up")
+    except Exception as e:
+        logger.error("❌ Failed to clean up the sentinel Master node", error=str(e))
         return False
 
     return True

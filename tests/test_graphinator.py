@@ -1308,6 +1308,7 @@ class TestCheckFileCompletionComputeGenreStyleStats:
     """Test that check_file_completion calls compute_genre_style_stats for releases."""
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.cleanup_sentinel_master", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_calls_compute_genre_style_stats_for_releases(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
@@ -1412,6 +1413,7 @@ class TestCheckFileCompletionMaintenanceFailure:
         graphinator.graphinator.graph = None
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.cleanup_sentinel_master", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_acks_and_retries_in_task_when_compute_stats_fails(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
