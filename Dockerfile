@@ -49,9 +49,10 @@ ENV HOME=/home/groovemap \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/app/.venv/bin:$PATH"
 
+# 8001 is the health role port for graph enrichers; HEALTH_PORT overrides it at runtime.
 EXPOSE 8001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD ["/app/.venv/bin/python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8001/health', timeout=5).read()"]
+    CMD ["/app/.venv/bin/python", "-c", "import os; from urllib.request import urlopen; urlopen('http://127.0.0.1:%s/health' % os.environ.get('HEALTH_PORT', '8001'), timeout=5).read()"]
 
 USER 1000:1000
 ENTRYPOINT ["/app/.venv/bin/discogs-graph-enricher"]

@@ -5301,3 +5301,50 @@ class TestTelemetryLifecycle:
         # cli()/main() drive the same real bootstrap without raising or hanging.
         assert callable(cli)
         assert callable(main)
+
+
+class TestMainHealthPort:
+    """main() binds the health server to the configured port."""
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.start_event_loop_monitor")
+    @patch("graphinator.graphinator.setup_telemetry")
+    @patch("graphinator.graphinator.signal.signal")
+    @patch("graphinator.graphinator.setup_logging")
+    @patch("graphinator.graphinator.HealthServer")
+    async def test_health_server_uses_health_port(
+        self,
+        mock_health_server: MagicMock,
+        _mock_setup_logging: MagicMock,
+        _mock_signal: MagicMock,
+        _mock_telemetry: MagicMock,
+        _mock_monitor: MagicMock,
+    ) -> None:
+        env = {"STARTUP_DELAY": "0", "HEALTH_PORT": "9123", "NEO4J_HOST": "h", "NEO4J_USERNAME": "u", "NEO4J_PASSWORD": "p"}
+        with (
+            patch.dict("os.environ", env),
+            patch("graphinator.graphinator.AsyncResilientNeo4jDriver", side_effect=RuntimeError("stop")),
+            contextlib.suppress(RuntimeError),
+        ):
+            await main()
+        assert mock_health_server.call_args.args[0] == 9123
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.start_event_loop_monitor")
+    @patch("graphinator.graphinator.setup_telemetry")
+    @patch("graphinator.graphinator.signal.signal")
+    @patch("graphinator.graphinator.setup_logging")
+    @patch("graphinator.graphinator.HealthServer")
+    async def test_invalid_health_port_fails_before_serving(
+        self,
+        mock_health_server: MagicMock,
+        _mock_setup_logging: MagicMock,
+        _mock_signal: MagicMock,
+        _mock_telemetry: MagicMock,
+        _mock_monitor: MagicMock,
+    ) -> None:
+        env = {"STARTUP_DELAY": "0", "HEALTH_PORT": "nope", "NEO4J_HOST": "h", "NEO4J_USERNAME": "u", "NEO4J_PASSWORD": "p"}
+        with patch.dict("os.environ", env), patch("graphinator.graphinator.logger") as mock_logger:
+            await main()
+        mock_health_server.assert_not_called()
+        assert "Invalid HEALTH_PORT" in str(mock_logger.error.call_args_list)
