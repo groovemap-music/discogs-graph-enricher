@@ -56,7 +56,7 @@ requires a coordinated wire migration.
 
 ## Operations
 
-Health is exposed at `http://localhost:8001/health` and reports starting, healthy, or
+Health is exposed at `http://localhost:8001/health` (the role port; `HEALTH_PORT` overrides it) and reports starting, healthy, or
 unhealthy state plus active consumers, completed entity types, message counts, and the
 current task. Telemetry is pushed using OTLP/HTTP-protobuf. This service exposes no
 Prometheus `/metrics` route.

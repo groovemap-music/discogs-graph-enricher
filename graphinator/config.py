@@ -7,6 +7,23 @@ from typing import cast
 from common.config import _build_amqp_url, _build_neo4j_uri, get_secret
 
 
+DEFAULT_HEALTH_PORT = 8001
+
+
+def _health_port_from_env() -> int:
+    """Read HEALTH_PORT, defaulting to the role port when unset; reject anything else invalid."""
+    raw = getenv("HEALTH_PORT")
+    if raw is None:
+        return DEFAULT_HEALTH_PORT
+    try:
+        port = int(raw.strip())
+    except ValueError:
+        raise ValueError(f"Invalid HEALTH_PORT {raw!r}: must be an integer between 1 and 65535") from None
+    if not 1 <= port <= 65535:
+        raise ValueError(f"Invalid HEALTH_PORT {raw!r}: must be an integer between 1 and 65535")
+    return port
+
+
 @dataclass(frozen=True)
 class GraphinatorConfig:
     """Configuration for the Discogs graph enricher."""
@@ -15,6 +32,7 @@ class GraphinatorConfig:
     neo4j_host: str
     neo4j_username: str
     neo4j_password: str = field(repr=False)
+    health_port: int = DEFAULT_HEALTH_PORT
 
     @classmethod
     def from_env(cls) -> GraphinatorConfig:
@@ -37,4 +55,5 @@ class GraphinatorConfig:
             neo4j_host=_build_neo4j_uri(),
             neo4j_username=cast("str", neo4j_username),
             neo4j_password=cast("str", neo4j_password),
+            health_port=_health_port_from_env(),
         )
