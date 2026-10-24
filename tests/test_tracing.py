@@ -396,7 +396,7 @@ class TestEventLoopMonitor:
         """The monitor samples the loop main() is already running on, so it starts inside
         main() rather than at import: before the loop exists there is nothing to sample.
         """
-        from graphinator.graphinator import main
+        from graphinator.graphinator import StartupError, main
 
         monkeypatch.setenv("STARTUP_DELAY", "0")
         calls: list[str] = []
@@ -412,7 +412,8 @@ class TestEventLoopMonitor:
             patch("graphinator.graphinator.GraphinatorConfig") as mock_config,
         ):
             mock_config.from_env.side_effect = ValueError("Missing required environment variables: NEO4J_HOST")
-            await main()
+            with pytest.raises(StartupError):
+                await main()
 
         assert calls[:3] == ["setup_logging", "setup_telemetry", "start_event_loop_monitor"]
         mock_monitor.assert_called_once_with()
