@@ -1611,17 +1611,17 @@ async def main() -> None:
         logger.info(f"⏳ Waiting {startup_delay} seconds for dependent services to start...")
         await asyncio.sleep(startup_delay)
 
-    # Start health server
-    health_server = HealthServer(8001, get_health_data)
-    health_server.start_background()
-    logger.info("🏥 Health server started on port 8001")
-
-    # Initialize configuration
+    # Initialize configuration (before the health server, which binds config.health_port)
     try:
         config = GraphinatorConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
         return
+
+    # Start health server
+    health_server = HealthServer(config.health_port, get_health_data)
+    health_server.start_background()
+    logger.info(f"🏥 Health server started on port {config.health_port}")
 
     # Initialize async resilient Neo4j driver
     graph = AsyncResilientNeo4jDriver(

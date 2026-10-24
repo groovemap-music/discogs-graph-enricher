@@ -47,3 +47,9 @@ def test_image_does_not_persist_credential_placeholders() -> None:
         if instruction.startswith("ENV "):
             keys = (assignment.split("=", 1)[0] for assignment in shlex.split(instruction.removeprefix("ENV ")))
             assert not [key for key in keys if SENSITIVE_ENV.search(key)]
+
+
+def test_healthcheck_honours_health_port_with_role_default() -> None:
+    healthcheck = next(line for line in _instructions() if line.startswith("HEALTHCHECK "))
+    assert "os.environ.get('HEALTH_PORT', '8001')" in healthcheck
+    assert "EXPOSE 8001" in _instructions()

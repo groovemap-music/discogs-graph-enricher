@@ -73,7 +73,7 @@ completion signal or an operator-initiated rerun must perform it again.
 
 ## Operations and tests
 
-Health is available at `http://localhost:8001/health`. Its `active_consumers`,
+Health is available at `http://localhost:8001/health` (the role port; `HEALTH_PORT` overrides it). Its `active_consumers`,
 `completed_files`, `message_counts`, and `current_task` fields describe the local
 process; there is no Prometheus scrape route.
 
