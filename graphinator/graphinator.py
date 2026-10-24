@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import sys
 import time
 from asyncio import run
 from datetime import UTC, datetime
@@ -205,6 +206,10 @@ def get_health_data() -> dict[str, Any]:
         "completed_files": list(completed_files),
         "timestamp": datetime.now(UTC).isoformat(),
     }
+
+
+class StartupError(Exception):
+    """Startup gave up; cli() turns this into a non-zero exit so Docker's restart policy sees a failure."""
 
 
 def signal_handler(signum: int, _frame: Any) -> None:
@@ -1616,7 +1621,7 @@ async def main() -> None:
         config = GraphinatorConfig.from_env()
     except ValueError as e:
         logger.error("❌ Configuration error", error=str(e))
-        return
+        raise StartupError("configuration error") from e
 
     # Start health server
     health_server = HealthServer(config.health_port, get_health_data)
@@ -1655,7 +1660,7 @@ async def main() -> None:
 
     except Exception as e:
         logger.error("❌ Failed to connect to Neo4j", error=str(e))
-        return
+        raise StartupError("Neo4j connection failed") from e
     print(STARTUP_BANNER)
 
     # Initialize resilient RabbitMQ connection manager (not connecting yet)
@@ -1686,11 +1691,15 @@ async def main() -> None:
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(f"❌ Failed to connect to AMQP broker after {max_startup_retries} attempts: {e}")
-                return
+                raise StartupError("AMQP connection failed") from e
 
     if amqp_connection is None:
+        if shutdown_requested:
+            # A signal arrived before the broker connected: a requested stop, not a failure.
+            logger.info("🛑 Shutdown requested before AMQP connection was established")
+            return
         logger.error("❌ No AMQP connection available")
-        return
+        raise StartupError("no AMQP connection available")
 
     async with amqp_connection:
         channel = await amqp_connection.channel()
@@ -1849,20 +1858,32 @@ async def main() -> None:
 
 
 def cli() -> None:
-    """Run the async service from a console-script entry point."""
+    """Run the async service from a console-script entry point.
+
+    Exits 1 when startup gives up (StartupError) or the service dies on an unexpected error, so
+    Docker's ``restart: on-failure`` restarts it; a signal-driven shutdown exits 0.
+    """
+    exit_code = 0
     try:
         run(main())
     except KeyboardInterrupt:
         logger.warning("⚠️ Application interrupted")
+    except StartupError as e:
+        # The specific cause was already logged where it was raised.
+        logger.error("❌ Startup failed", error=str(e))
+        exit_code = 1
     except Exception as e:
         logger.error("❌ Application error", error=str(e))
+        exit_code = 1
     finally:
-        # Called here rather than inside main(): main() has several early `return`s (config
-        # error, Neo4j/AMQP connection failure) that exit before its own try/finally block, so
+        # Called here rather than inside main(): main() raises on its early give-up paths (config
+        # error, Neo4j/AMQP connection failure) before its own try/finally block, so
         # this is the one place reached on every shutdown path. shutdown_telemetry() is a plain
         # synchronous call (safe outside the closed event loop) and never raises.
         shutdown_telemetry()
         logger.info("✅ GrooveMap discogs-graph-enricher shutdown complete")
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

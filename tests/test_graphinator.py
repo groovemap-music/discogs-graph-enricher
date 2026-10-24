@@ -14,6 +14,7 @@ from orjson import dumps
 
 from graphinator import telemetry as gm_telemetry
 from graphinator.graphinator import (
+    StartupError,
     main,
     on_artist_message,
     on_label_message,
@@ -3451,20 +3452,21 @@ class TestMainConfigError:
     @patch("graphinator.graphinator.setup_logging")
     @patch("graphinator.graphinator.HealthServer")
     @patch("graphinator.graphinator.GraphinatorConfig.from_env", side_effect=ValueError("bad config"))
-    async def test_main_returns_on_config_error(
+    async def test_main_raises_on_config_error(
         self,
         _mock_from_env: MagicMock,
         mock_health_server: MagicMock,
         _mock_setup_logging: MagicMock,
         _mock_signal: MagicMock,
     ) -> None:
-        """Test main() returns after logging error when config raises ValueError."""
+        """Test main() raises StartupError after logging when config raises ValueError."""
         mock_health_instance = MagicMock()
         mock_health_server.return_value = mock_health_instance
 
         with (
             patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
             patch("graphinator.graphinator.logger") as mock_logger,
+            pytest.raises(StartupError),
         ):
             await main()
 
@@ -3481,7 +3483,7 @@ class TestMainNeo4jFailure:
     @patch("graphinator.graphinator.HealthServer")
     @patch("graphinator.graphinator.GraphinatorConfig.from_env")
     @patch("graphinator.graphinator.AsyncResilientNeo4jDriver")
-    async def test_main_returns_on_neo4j_error(
+    async def test_main_raises_on_neo4j_error(
         self,
         mock_neo4j_class: MagicMock,
         mock_from_env: MagicMock,
@@ -3489,7 +3491,7 @@ class TestMainNeo4jFailure:
         _mock_setup_logging: MagicMock,
         _mock_signal: MagicMock,
     ) -> None:
-        """Test main() returns after logging error when Neo4j session raises."""
+        """Test main() raises StartupError after logging when Neo4j session raises."""
         mock_health_instance = MagicMock()
         mock_health_server.return_value = mock_health_instance
 
@@ -3510,6 +3512,7 @@ class TestMainNeo4jFailure:
         with (
             patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
             patch("graphinator.graphinator.logger") as mock_logger,
+            pytest.raises(StartupError),
         ):
             await main()
 
@@ -3854,8 +3857,8 @@ class TestMainAmqpConnectionNone:
             ):
                 await main()
 
-            error_calls = str(mock_logger.error.call_args_list)
-            assert "AMQP" in error_calls or "amqp" in error_calls.lower() or "No AMQP" in error_calls
+            # A signal before the broker connected is a requested stop, not a startup failure.
+            mock_logger.error.assert_not_called()
         finally:
             gm.shutdown_requested = original_shutdown
 
@@ -4379,7 +4382,7 @@ class TestMainAmqpRetryExhausted:
     @patch("graphinator.graphinator.GraphinatorConfig.from_env")
     @patch("graphinator.graphinator.AsyncResilientNeo4jDriver")
     @patch("graphinator.graphinator.AsyncResilientRabbitMQ")
-    async def test_main_returns_when_connect_retries_exhausted(
+    async def test_main_raises_when_connect_retries_exhausted(
         self,
         mock_rabbitmq_class: MagicMock,
         mock_neo4j_class: MagicMock,
@@ -4428,6 +4431,7 @@ class TestMainAmqpRetryExhausted:
                 patch("graphinator.graphinator.BATCH_MODE", False),
                 patch("graphinator.graphinator.asyncio.sleep", AsyncMock(return_value=None)),
                 patch("graphinator.graphinator.logger"),
+                pytest.raises(StartupError),
             ):
                 await main()
 
@@ -5224,9 +5228,11 @@ class TestTelemetryLifecycle:
             patch("graphinator.graphinator.run", side_effect=fake_run),
             patch("graphinator.graphinator.shutdown_telemetry") as mock_shutdown_telemetry,
             patch("graphinator.graphinator.logger"),
+            pytest.raises(SystemExit) as exc_info,
         ):
             cli()
 
+        assert exc_info.value.code == 1
         mock_shutdown_telemetry.assert_called_once_with()
 
     @pytest.mark.asyncio
@@ -5244,7 +5250,8 @@ class TestTelemetryLifecycle:
             patch("graphinator.graphinator.GraphinatorConfig") as mock_config,
         ):
             mock_config.from_env.side_effect = ValueError("Missing required environment variables: NEO4J_HOST")
-            await main()
+            with pytest.raises(StartupError):
+                await main()
 
         assert calls[:2] == ["setup_logging", "setup_telemetry"]
         mock_setup_telemetry.assert_called_once_with(TELEMETRY_SERVICE_NAME)
@@ -5344,7 +5351,7 @@ class TestMainHealthPort:
         _mock_monitor: MagicMock,
     ) -> None:
         env = {"STARTUP_DELAY": "0", "HEALTH_PORT": "nope", "NEO4J_HOST": "h", "NEO4J_USERNAME": "u", "NEO4J_PASSWORD": "p"}
-        with patch.dict("os.environ", env), patch("graphinator.graphinator.logger") as mock_logger:
+        with patch.dict("os.environ", env), patch("graphinator.graphinator.logger") as mock_logger, pytest.raises(StartupError):
             await main()
         mock_health_server.assert_not_called()
         assert "Invalid HEALTH_PORT" in str(mock_logger.error.call_args_list)
