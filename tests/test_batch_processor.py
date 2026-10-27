@@ -507,7 +507,7 @@ class TestProcessMastersBatch:
 
     @pytest.mark.asyncio
     async def test_masters_multi_genre_skips_part_of(self) -> None:
-        """discogsography-sy5k: a master with >1 genre must not cartesian-link every
+        """A master with >1 genre must not cartesian-link every
         style to every genre — the assertion is only unambiguous for a single genre."""
         mock_driver, mock_session = create_async_session_mock()
         mock_result = create_async_result_mock([{"id": "1", "hash": None}])
@@ -596,7 +596,7 @@ class TestProcessMastersBatch:
 
 
 class TestStaleEdgePruning:
-    """discogsography-bd0u: relationship writes are MERGE-only and therefore additive,
+    """Relationship writes are MERGE-only and therefore additive,
     but Discogs records are mutable. A release corrected from genres=["Rock"] to
     genres=["Jazz"] gets a new sha256, passes the hash gate, MERGEs the Jazz edge — and
     used to keep the Rock one forever. compute_genre_style_stats counts those stale
@@ -899,7 +899,7 @@ class TestProcessReleasesBatch:
 
     @pytest.mark.asyncio
     async def test_releases_multi_genre_skips_part_of(self) -> None:
-        """discogsography-sy5k: a release with >1 genre must not cartesian-link every
+        """A release with >1 genre must not cartesian-link every
         style to every genre — the assertion is only unambiguous for a single genre."""
         mock_driver, mock_session = create_async_session_mock()
         mock_result = create_async_result_mock([{"id": "1", "hash": None}])
@@ -1358,7 +1358,7 @@ class TestBatchTransactionLogic:
 
     @pytest.mark.asyncio
     async def test_credited_on_merge_key_excludes_derived_category(self) -> None:
-        """discogsography-9k6i: CREDITED_ON must MERGE on {role} only and SET category,
+        """CREDITED_ON must MERGE on {role} only and SET category,
         so a later categorize_role() taxonomy change updates the existing edge in place
         instead of forking a parallel duplicate edge."""
         mock_driver, mock_session = create_async_session_mock()

@@ -123,7 +123,7 @@ async def test_release_batch_writes_representative_catalog_edges(neo4j_driver: A
 
 @pytest.mark.asyncio
 async def test_multi_genre_release_does_not_create_cartesian_part_of_edges(neo4j_driver: AsyncDriver) -> None:
-    """Historical sy5k: co-occurrence must not be persisted as taxonomy."""
+    """Genre/style co-occurrence on a multi-genre release must not be persisted as taxonomy."""
     processor = Neo4jBatchProcessor(neo4j_driver)
     messages = [
         pending(

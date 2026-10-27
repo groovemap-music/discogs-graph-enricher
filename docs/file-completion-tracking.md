@@ -35,8 +35,9 @@ flowchart TD
     J --> K[drain all four batch queues]
     K --> L{all queues quiescent?}
     L -->|no| M[retry whole maintenance pass]
-    L -->|yes| N[remove unresolved stubs]
-    N --> O[refresh genre, style, and label aggregates]
+    L -->|yes| N[remove unresolved stubs with no edges]
+    N --> S[remove legacy no-master sentinel]
+    S --> O[refresh genre, style, and label aggregates]
 ```
 
 The latch is stored as an `ExtractionCompletion` node keyed by the message's
@@ -54,9 +55,13 @@ cannot race cleanup.
 Maintenance performs these steps in order:
 
 1. Drain artists, labels, masters, and releases queues, including in-flight batches.
-2. Delete unresolved Artist, Label, Master, and Release stubs without `sha256`.
-3. Recompute the Genre, Style, and Label aggregate properties documented in the
-   [service reference](../graphinator/README.md#pre-computed-node-properties).
+2. Delete unresolved Artist, Label, Master, and Release stubs without `sha256` that
+   carry no relationships. A stub that still has edges is a dangling reference from a
+   fully imported record and is kept so a later dump can fill it in place.
+3. Delete the `(:Master {id: "0"})` node that graphs loaded before the Discogs
+   "no master" sentinel fix may still carry, detaching its edges in chunks first.
+4. Recompute the Genre, Style, and Label aggregate properties documented in the
+   [service reference](../graphinator/README.md#-pre-computed-node-properties).
 
 If all retry attempts fail, logs report that stubs and aggregates may be stale.
 Shutdown cancels an active maintenance task; because each step is idempotent, a later

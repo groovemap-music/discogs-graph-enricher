@@ -339,7 +339,7 @@ def reset_post_import_maintenance_task() -> Iterator[None]:
     """Clear the detached post-import maintenance task between tests.
 
     Post-import maintenance runs in its own task so the extraction_complete
-    delivery can be acked immediately (discogsography-zjja). The task handle is
+    delivery can be acked immediately. The task handle is
     module-level and single-flight, so a leaked handle from one test would make
     the next test's trigger a no-op — or have it await the wrong task.
     """

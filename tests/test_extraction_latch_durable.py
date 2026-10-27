@@ -1,4 +1,4 @@
-"""Regression tests for discogsography-tk7v.
+"""Regression tests for the durable, version-keyed extraction_complete latch.
 
 The extraction_complete latch used to be a process-local set. Each signal was
 acked — destroying the only durable copy, the queued message — while the set was

@@ -319,7 +319,7 @@ class Neo4jBatchProjector:
         Rock one forever. compute_genre_style_stats then counts those stale edges
         (``MATCH (g)<-[:IS]-(r:Release) RETURN count(DISTINCT r)``), so Genre/Style/Label
         release_count/artist_count are permanently over-stated and explore endpoints
-        list the release under a genre it no longer has (discogsography-bd0u).
+        list the release under a genre it no longer has.
 
         Only edges of ``rel_type`` to ``target_label``, and only for the records in this
         batch, are considered — an entity that is not being reprocessed is untouched.
@@ -397,7 +397,7 @@ class Neo4jBatchProjector:
                 # Prune managed edges the NEW version of each record no longer asserts.
                 # MERGE-only writes are additive, so without this a master retagged from
                 # Rock to Jazz keeps both edges forever and inflates every aggregate
-                # count computed off them (discogsography-bd0u).
+                # count computed off them.
                 await self._prune_stale_edges(
                     tx,
                     "Master",
@@ -498,7 +498,7 @@ class Neo4jBatchProjector:
                 # Connect styles to genres. PART_OF asserts a style belongs to a genre,
                 # which is only unambiguous when the record carries a single genre — a
                 # multi-genre record cartesian-linking every style to every genre would
-                # create false Style-[:PART_OF]->Genre edges (discogsography-sy5k).
+                # create false Style-[:PART_OF]->Genre edges.
                 genre_style_data = []
                 for master in masters_to_process:
                     genres = master.get("genres", [])
@@ -627,9 +627,8 @@ class Neo4jBatchProjector:
                     releases=releases_to_process,
                 )
 
-                # Prune managed edges the NEW version of each record no longer asserts
-                # (discogsography-bd0u). MERGE-only writes never remove a dropped
-                # association, so a release corrected from genres=["Rock"] to
+                # Prune managed edges the NEW version of each record no longer asserts.
+                # MERGE-only writes never remove a dropped association, so a release corrected from genres=["Rock"] to
                 # genres=["Jazz"] kept (r)-[:IS]->(Rock) forever — permanently inflating
                 # Rock.release_count and listing the release under a genre it no longer
                 # has.
@@ -796,7 +795,7 @@ class Neo4jBatchProjector:
                 # Connect styles to genres. PART_OF asserts a style belongs to a genre,
                 # which is only unambiguous when the record carries a single genre — a
                 # multi-genre record cartesian-linking every style to every genre would
-                # create false Style-[:PART_OF]->Genre edges (discogsography-sy5k).
+                # create false Style-[:PART_OF]->Genre edges.
                 genre_style_data = []
                 for release in releases_to_process:
                     genres = release.get("genres", [])
