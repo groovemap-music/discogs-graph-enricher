@@ -58,6 +58,7 @@ async def test_trigger_is_acked_before_maintenance_runs() -> None:
         patch.object(g, "cleanup_all_stub_nodes", slow_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", slow_stats),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
     ):
         handled = await g.check_file_completion(EXTRACTION_COMPLETE, "releases", message)
         await g.post_import_maintenance_task
@@ -89,6 +90,7 @@ async def test_handler_returns_without_waiting_for_maintenance() -> None:
         patch.object(g, "cleanup_all_stub_nodes", blocking_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
     ):
         handled = await asyncio.wait_for(g.check_file_completion(EXTRACTION_COMPLETE, "releases", message), timeout=1.0)
         # Handler is done while maintenance is still mid-flight.
@@ -121,6 +123,7 @@ async def test_redelivered_trigger_does_not_start_a_second_run() -> None:
         patch.object(g, "cleanup_all_stub_nodes", blocking_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
     ):
         first = AsyncMock(spec=AbstractIncomingMessage)
         await g.check_file_completion(EXTRACTION_COMPLETE, "releases", first)
@@ -173,6 +176,7 @@ async def test_maintenance_drains_every_queue_before_cleanup() -> None:
         patch.object(g, "cleanup_all_stub_nodes", cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", stats),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()
@@ -200,6 +204,7 @@ async def test_maintenance_skips_sweeps_when_queues_do_not_drain() -> None:
         patch.object(g, "cleanup_all_stub_nodes", cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()
@@ -223,6 +228,7 @@ async def test_maintenance_retries_then_gives_up_loudly() -> None:
         patch.object(g, "cleanup_all_stub_nodes", failing_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()
@@ -245,6 +251,7 @@ async def test_maintenance_succeeds_on_a_later_attempt() -> None:
         patch.object(g, "cleanup_all_stub_nodes", flaky_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()
@@ -269,6 +276,7 @@ async def test_maintenance_survives_an_exception_and_retries() -> None:
         patch.object(g, "cleanup_all_stub_nodes", exploding_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()
@@ -292,6 +300,7 @@ async def test_maintenance_stops_retrying_on_shutdown() -> None:
         patch.object(g, "cleanup_all_stub_nodes", failing_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()
@@ -316,6 +325,7 @@ async def test_task_reference_is_held_until_completion() -> None:
         patch.object(g, "cleanup_all_stub_nodes", blocking_cleanup),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
     ):
         await g.check_file_completion(EXTRACTION_COMPLETE, "releases", message)
         await asyncio.sleep(0)
@@ -366,6 +376,7 @@ async def test_maintenance_sweeps_the_sentinel_master_between_stub_cleanup_and_s
         patch.object(g, "cleanup_all_stub_nodes", cleanup),
         patch.object(g, "cleanup_sentinel_master", sentinel),
         patch.object(g, "compute_genre_style_stats", stats),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()
@@ -391,6 +402,7 @@ async def test_failed_sentinel_master_sweep_fails_maintenance_and_skips_stats() 
         patch.object(g, "cleanup_all_stub_nodes", AsyncMock(return_value=True)),
         patch.object(g, "cleanup_sentinel_master", failing_sentinel),
         patch.object(g, "compute_genre_style_stats", stats),
+        patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
         ok = await g.run_post_import_maintenance()

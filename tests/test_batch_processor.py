@@ -1296,7 +1296,7 @@ class TestBatchTransactionLogic:
         await processor._process_releases_batch(messages)
 
         # Should contain CREDITED_ON query for Person nodes
-        credited_queries = [q for q in executed_queries if "CREDITED_ON" in q]
+        credited_queries = [q for q in executed_queries if "CREDITED_ON" in q and "MERGE" in q]
         assert len(credited_queries) == 1
         assert "Person" in credited_queries[0]
 
@@ -1348,7 +1348,7 @@ class TestBatchTransactionLogic:
         await processor._process_releases_batch(messages)
 
         # Should contain CREDITED_ON query for Person nodes
-        credited_queries = [q for q in executed_queries if "CREDITED_ON" in q]
+        credited_queries = [q for q in executed_queries if "CREDITED_ON" in q and "MERGE" in q]
         assert len(credited_queries) == 1
         assert "Person" in credited_queries[0]
 
@@ -1398,7 +1398,7 @@ class TestBatchTransactionLogic:
 
         await processor._process_releases_batch(messages)
 
-        credited_queries = [q for q in executed_queries if "CREDITED_ON" in q]
+        credited_queries = [q for q in executed_queries if "CREDITED_ON" in q and "MERGE" in q]
         assert len(credited_queries) == 1
         query = credited_queries[0]
         # The MERGE match key must be {role} only — category must not appear inside it.

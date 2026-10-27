@@ -34,6 +34,7 @@ from graphinator.entity_projection import (
     process_release,
 )
 from graphinator.master_reference import NO_MASTER_ID
+from graphinator.person_credits import CREDIT_COUNT_PROPERTIES, build_credit_count_cypher
 from graphinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
     DATA_TYPES,
@@ -785,7 +786,7 @@ def start_post_import_maintenance() -> None:
 
 
 async def run_post_import_maintenance() -> bool:
-    """Run stub cleanup and aggregate stats, retrying on failure.
+    """Run stub cleanup, aggregate stats, and Person credit counts, retrying on failure.
 
     Detached from the extraction_complete delivery (which is acked immediately),
     so this owns the retry the nack/requeue used to provide. Every step is
@@ -839,6 +840,12 @@ async def run_post_import_maintenance() -> bool:
             # counts would be computed over a graph that is still being written.
             if maintenance_ok and graph is not None and not await compute_genre_style_stats():
                 maintenance_ok = False
+
+            # Recount every Person's credits from the CREDITED_ON edges as they stand
+            # after the import (re-imported releases have already pruned the credits
+            # Discogs removed), so the counts reflect removals as well as additions.
+            if maintenance_ok and graph is not None and not await compute_person_credit_counts():
+                maintenance_ok = False
         except Exception as e:
             logger.error("❌ Post-import maintenance raised", attempt=attempt, error=str(e))
             maintenance_ok = False
@@ -849,7 +856,7 @@ async def run_post_import_maintenance() -> bool:
 
         if attempt == POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS:
             logger.error(
-                "❌ Post-import maintenance failed after every attempt — stub nodes and aggregate stats are stale until it is re-run",
+                "❌ Post-import maintenance failed after every attempt — stub nodes, aggregate stats, and Person credit counts are stale until it is re-run",
                 attempts=attempt,
             )
             return False
@@ -1033,6 +1040,54 @@ async def compute_genre_style_stats() -> bool:
     return True
 
 
+async def compute_person_credit_counts() -> bool:
+    """Recompute ``credit_count`` and ``credit_count_<category>`` on every Person.
+
+    The property contract (shared with the database-schema indexes and the catalog-api
+    role leaderboard) is documented in :mod:`graphinator.person_credits`: per category in
+    ``common.credit_roles.ALL_CATEGORIES``, the number of DISTINCT releases the person is
+    CREDITED_ON with that category, plus the distinct-release total. Every property is
+    rewritten on every Person, and a category the person no longer has reads ``0``.
+
+    A full recount rather than an incremental one, so the result does not depend on the
+    previous value: a re-run is idempotent, and a credit removed since the last pass is
+    simply no longer counted. Persons are batched ``PERSON_CREDIT_COUNT_BATCH_SIZE`` per
+    inner transaction and the batch halves under transaction-memory pressure, the same
+    treatment as stub cleanup.
+
+    Returns:
+        True if the counts were written (or there is no driver), False if the recompute
+        failed — so the detached maintenance task retries the pass.
+    """
+    if graph is None:
+        return True
+
+    try:
+        # Runs straight after the Genre/Style/Label sweep: let the shared transaction
+        # pool drain first rather than claiming it back to back.
+        await asyncio.sleep(MAINTENANCE_SETTLE_SECONDS)
+        logger.info("📊 Computing credit counts on Person nodes...")
+        summary = await _run_maintenance_query(
+            build_credit_count_cypher,
+            "Person credit count computation",
+            batch_size=PERSON_CREDIT_COUNT_BATCH_SIZE,
+            node_label="Person",
+        )
+        if summary is None:
+            # Retries exhausted — already logged.
+            return False
+        logger.info(
+            "✅ Person credit counts computed",
+            properties=list(CREDIT_COUNT_PROPERTIES),
+            counters=str(summary.counters),
+        )
+    except Exception as e:
+        logger.error("❌ Failed to compute Person credit counts", error=str(e))
+        return False
+
+    return True
+
+
 # ── Post-import maintenance under transaction-memory pressure ──────────────
 #
 # Post-import maintenance shares Neo4j's single transaction-memory pool
@@ -1056,6 +1111,11 @@ async def compute_genre_style_stats() -> bool:
 # Reduced from 10000: a chunk of 10000 DETACH DELETEs over high-degree stubs was
 # still large enough to contend for the shared pool.
 STUB_CLEANUP_BATCH_SIZE = 1000
+
+# Persons per inner transaction for the credit-count recompute. Each person's working
+# set is one row per release it is credited on, so a chunk stays cheap even when it
+# holds a prolific mastering engineer; the halving retry covers the rest.
+PERSON_CREDIT_COUNT_BATCH_SIZE = 1000
 
 # Floor for the halving backoff — below this the round-trip overhead dominates.
 MAINTENANCE_MIN_BATCH_SIZE = 50

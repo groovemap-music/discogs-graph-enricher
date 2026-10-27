@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from common.batch import BatchItemResult
-from common.credit_roles import categorize_role
 from common.delivery import Settlement
 
 from graphinator.company_projection import (
@@ -33,6 +32,7 @@ from graphinator.media_projection import (
     prune_record,
     resolve_media_block,
 )
+from graphinator.person_credits import PRUNE_CREDITED_ON_CYPHER, credited_on_prune_record, person_credit_rows
 
 
 if TYPE_CHECKING:
@@ -854,31 +854,19 @@ class Neo4jBatchProjector:
                     if company_rows:
                         await tx.run(MERGE_COMPANY_CYPHER, companies=company_rows, source=COMPANY_SOURCE)
 
-                # Process credits (extraartists) — Person nodes and CREDITED_ON relationships
-                credit_data = []
-                artist_credit_data = []
-                for release in releases_to_process:
-                    if release.get("extraartists"):
-                        for credit in release["extraartists"]:
-                            name = credit.get("name")
-                            role = credit.get("role", "")
-                            if name and role:
-                                category = categorize_role(role)
-                                entry: dict[str, Any] = {
-                                    "name": name,
-                                    "role": role,
-                                    "category": category,
-                                    "release_id": release["id"],
-                                }
-                                credit_data.append(entry)
-                                artist_id = credit.get("id")
-                                if artist_id:
-                                    artist_credit_data.append(
-                                        {
-                                            "name": name,
-                                            "artist_id": artist_id,
-                                        }
-                                    )
+                # Process credits (extraartists) — Person nodes and CREDITED_ON relationships.
+                # Prune first, for every reprocessed release — including one that now asserts
+                # no credits (the empty keep-list is the "every credit removed" case) — so a
+                # credit Discogs dropped stops counting towards the person's credit_count.
+                release_credit_rows = [
+                    (release["id"], person_credit_rows(release["id"], release.get("extraartists"))) for release in releases_to_process
+                ]
+                await tx.run(
+                    PRUNE_CREDITED_ON_CYPHER,
+                    records=[credited_on_prune_record(release_id, rows) for release_id, rows in release_credit_rows],
+                )
+                credit_data = [row for _, rows in release_credit_rows for row in rows]
+                artist_credit_data = [{"name": row["name"], "artist_id": row["artist_id"]} for row in credit_data if row.get("artist_id")]
                 if credit_data:
                     await tx.run(
                         """
