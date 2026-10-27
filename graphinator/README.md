@@ -193,8 +193,9 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 1. **Person** - Credited personnel (producers, engineers, mastering engineers, session musicians, designers, managers)
 
-   - Properties: name, credit_count
+   - Properties: name, credit_count\*, credit_count\_\<category\>\* (one per credit category)
    - Relationships: CREDITED_ON (to Release, with `role` and `category` properties), SAME_AS (to Artist, when Discogs artist ID matches)
+   - \*Pre-computed by `compute_person_credit_counts()` (see [Pre-Computed Node Properties](#-pre-computed-node-properties))
 
 1. **User** - Authenticated Discogs users (created by API syncer, not graphinator)
 
@@ -215,7 +216,7 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 - `PART_OF` - Style belongs to a genre
 - `ISSUED_ON` - Release was issued on a medium (properties: `qty`, `source`). `source` records which provider asserted the edge and is part of the merge pattern, so each catalog writes and prunes only its own edges and the MusicBrainz enricher's edges over the same Medium nodes are left intact
 - `IN_FAMILY` - Medium belongs to a media family
-- `CREDITED_ON` - Person credited on a release (properties: `role`, `category`)
+- `CREDITED_ON` - Person credited on a release (properties: `role`, `category`). `role` is part of the merge pattern, so a person credited under two roles is two edges to one release; `category` is the shared `common.credit_roles.categorize_role()` bucket. A re-imported release prunes the `[person, role]` credits its new version no longer lists, so a credit Discogs removed stops counting
 - `CREDITED_TO` - Release credited to a company that made the physical article (properties: `role`, `role_category`, `source`). `role` and `source` are both part of the merge pattern, so a company credited under two roles is two edges to one node and each catalog writes and prunes only its own edges
 - `SAME_AS` - Person is the same entity as an Artist (linked via Discogs artist ID)
 
@@ -322,10 +323,11 @@ After all queues have been consumed, the graphinator performs cleanup and enrich
 1. **Stub Node Cleanup** — Removes Artist, Label, Master, and Release nodes that have no `sha256` property and no relationships, which are created as side effects of `MERGE` operations when referenced entities (e.g., artists, labels) haven't been ingested yet. A stub that still has edges is kept so a later dump can fill it in place
 1. **Sentinel Master Cleanup** — Deletes the `(:Master {id: "0"})` node a graph loaded before the Discogs "no master" sentinel fix may still carry; a no-op on graphs built since
 1. **Aggregate Stats Computation** — Runs `compute_genre_style_stats()` to pre-compute node properties (see below)
+1. **Person Credit Counts** — Runs `compute_person_credit_counts()` to recount every Person's credits (see below)
 
 ### 📊 Pre-Computed Node Properties
 
-After graph import of releases, the graphinator runs `compute_genre_style_stats()` to set aggregate properties directly on nodes. These pre-computed stats avoid expensive traversal queries at API request time.
+After graph import of releases, the graphinator runs `compute_genre_style_stats()` and `compute_person_credit_counts()` to set aggregate properties directly on nodes. These pre-computed stats avoid expensive traversal queries at API request time.
 
 **Genre nodes:**
 
@@ -354,6 +356,17 @@ After graph import of releases, the graphinator runs `compute_genre_style_stats(
 | `release_count` | Number of releases on this label                       |
 | `artist_count`  | Number of distinct artists on this label               |
 | `genre_count`   | Number of distinct genres across this label's releases |
+
+**Person nodes** — `compute_person_credit_counts()`, read by the catalog-api role leaderboard and backed by the `person_credit_count*` range indexes in `database-schema`:
+
+| Property                  | Description                                                                         |
+| ------------------------- | ----------------------------------------------------------------------------------- |
+| `credit_count`            | Number of distinct releases the person is `CREDITED_ON`, across every category      |
+| `credit_count_<category>` | Number of distinct releases the person is `CREDITED_ON` with that `category`        |
+
+There is one `credit_count_<category>` per category in the shared `common.credit_roles.ALL_CATEGORIES` vocabulary (`production`, `engineering`, `mastering`, `session`, `design`, `management`, `other`); the list is imported, not copied. Counts are per release, not per edge: a person credited as both Producer and Executive Producer on one release counts it once in `credit_count_production`, and a person who produced and mixed one release counts it once in `credit_count` and once in each of the two categories, so `credit_count` is not the sum of the categories.
+
+Every property is written on every Person on every pass, and a category the person no longer has reads `0` — the property is never left absent or at its old value. A person whose credits were all removed keeps its node and reads `0` everywhere. The recount is a full one rather than incremental, so it reflects credits removed since the last import as well as those added, and is batched `PERSON_CREDIT_COUNT_BATCH_SIZE` (1000) people per inner transaction with the same halve-and-retry treatment under transaction-memory pressure as stub cleanup.
 
 ## Development
 

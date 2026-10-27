@@ -1050,7 +1050,10 @@ class TestCheckFileCompletion:
 
         from graphinator.graphinator import check_file_completion
 
-        with patch("graphinator.graphinator.compute_genre_style_stats", AsyncMock(return_value=True)):
+        with (
+            patch("graphinator.graphinator.compute_genre_style_stats", AsyncMock(return_value=True)),
+            patch("graphinator.graphinator.compute_person_credit_counts", AsyncMock(return_value=True)),
+        ):
             result = await check_file_completion(completion_data, "releases", mock_message)
             # Maintenance is detached from the delivery.
             await _await_post_import_maintenance()
@@ -1310,6 +1313,7 @@ class TestCheckFileCompletionComputeGenreStyleStats:
 
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.cleanup_sentinel_master", new=AsyncMock(return_value=True))
+    @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_calls_compute_genre_style_stats_for_releases(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
@@ -1343,6 +1347,7 @@ class TestCheckFileCompletionComputeGenreStyleStats:
         graphinator.graphinator.graph = None
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_defers_maintenance_until_all_types_complete(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
@@ -1389,6 +1394,7 @@ class TestCheckFileCompletionMaintenanceFailure:
     """
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_acks_when_maintenance_succeeds(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
@@ -1415,6 +1421,7 @@ class TestCheckFileCompletionMaintenanceFailure:
 
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.cleanup_sentinel_master", new=AsyncMock(return_value=True))
+    @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_acks_and_retries_in_task_when_compute_stats_fails(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
@@ -1445,6 +1452,7 @@ class TestCheckFileCompletionMaintenanceFailure:
         graphinator.graphinator.graph = None
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_acks_and_retries_in_task_when_cleanup_fails(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
@@ -1983,8 +1991,9 @@ class TestReleaseTransactionLogic:
         # ...plus 5 prune queries (BY/ON/DERIVED_FROM/Genre-IS/Style-IS) that drop
         # associations the record's new version no longer asserts,
         # plus the ISSUED_ON prune, which runs for every release (gm-…-sq6.2). This
-        # record carries no media, so no Medium MERGE follows it.
-        assert mock_tx.run.call_count == 14
+        # record carries no media, so no Medium MERGE follows it. The CREDITED_ON prune
+        # also runs for every release, so a credit Discogs removed stops counting.
+        assert mock_tx.run.call_count == 15
         mock_message.ack.assert_called_once()
 
     @pytest.mark.asyncio
@@ -2061,7 +2070,7 @@ class TestReleaseTransactionLogic:
         ):
             await on_release_message(mock_message)
 
-        credits_calls = [call for call in mock_tx.run.call_args_list if "CREDITED_ON" in str(call.args[0])]
+        credits_calls = [call for call in mock_tx.run.call_args_list if "MERGE (p)-[c:CREDITED_ON" in str(call.args[0])]
         assert len(credits_calls) == 1
         query = credits_calls[0].args[0]
         assert "MERGE (p)-[c:CREDITED_ON {role: credit.role}]->(r)" in query
@@ -2113,11 +2122,12 @@ class TestReleaseTransactionLogic:
         # the record asserts no artists/labels/master/genres/styles — that is exactly the
         # "every association was removed" case, and the ISSUED_ON prune, which runs on the
         # same terms (gm-…-sq6.2). No media on this record means no Medium MERGE.
-        assert mock_tx.run.call_count == 10
+        # ...plus the CREDITED_ON prune, ahead of the credit MERGE.
+        assert mock_tx.run.call_count == 11
         mock_message.ack.assert_called_once()
 
         # Verify credits cypher was called with correct data
-        credits_calls = [call for call in mock_tx.run.call_args_list if "CREDITED_ON" in str(call)]
+        credits_calls = [call for call in mock_tx.run.call_args_list if "MERGE (p)-[c:CREDITED_ON" in str(call)]
         assert len(credits_calls) == 1
 
         same_as_calls = [call for call in mock_tx.run.call_args_list if "SAME_AS" in str(call)]
@@ -4708,6 +4718,7 @@ class TestStubCleanupBatchAndOrdering:
             patch.object(g, "graph", graph_mock),
             patch.object(g, "cleanup_all_stub_nodes", fake_cleanup_all),
             patch.object(g, "compute_genre_style_stats", fake_stats),
+            patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
             patch.object(g, "logger"),
         ):
             # First three signals must NOT trigger cleanup — release batches may
@@ -4759,6 +4770,7 @@ class TestStubCleanupBatchAndOrdering:
             patch.object(g, "graph", graph_mock),
             patch.object(g, "cleanup_all_stub_nodes", failing_cleanup_all),
             patch.object(g, "compute_genre_style_stats", fake_stats),
+            patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
             patch.object(g, "logger"),
         ):
             message = AsyncMock(spec=AbstractIncomingMessage)

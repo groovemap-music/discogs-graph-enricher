@@ -5,14 +5,18 @@ from __future__ import annotations
 import asyncio
 import os
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 import pytest_asyncio
+from common.credit_roles import ALL_CATEGORIES
 from neo4j import AsyncDriver, AsyncGraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 
+import graphinator.graphinator as graphinator
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor, PendingMessage
+from graphinator.entity_projection import process_release
+from graphinator.person_credits import CREDIT_COUNT_PROPERTIES
 
 
 pytestmark = pytest.mark.integration
@@ -368,3 +372,110 @@ async def test_shutdown_drains_real_engine_and_settles_each_member_once(neo4j_dr
     assert all(message.ack_callback.await_count == 1 for message in messages)
     assert all(message.nack_callback.await_count == 0 for message in messages)
     assert (await one(neo4j_driver, "MATCH (a:Artist) WHERE a.id STARTS WITH 'shutdown-' RETURN count(a) AS count"))["count"] == 2
+
+
+def credited_release(release_id: str, sha256: str, *credits: tuple[str, str]) -> PendingMessage:
+    """Build one release message carrying (name, role) extraartists credits."""
+    return pending(
+        "releases",
+        {
+            "id": release_id,
+            "title": release_id,
+            "sha256": sha256,
+            "formats": [],
+            "extraartists": [{"name": name, "role": role} for name, role in credits],
+        },
+    )
+
+
+async def import_releases(processor: Neo4jBatchProcessor, *messages: PendingMessage) -> None:
+    for message in messages:
+        await enqueue(processor, message)
+    assert await processor.flush_queue("releases") is True
+
+
+async def recount_credits(driver: AsyncDriver, batch_size: int | None = None) -> None:
+    """Run the post-import maintenance step against the disposable engine."""
+    with (
+        patch.object(graphinator, "graph", driver),
+        patch.object(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0),
+        patch.object(graphinator, "PERSON_CREDIT_COUNT_BATCH_SIZE", batch_size or graphinator.PERSON_CREDIT_COUNT_BATCH_SIZE),
+    ):
+        assert await graphinator.compute_person_credit_counts() is True
+
+
+async def credit_counts(driver: AsyncDriver, name: str) -> dict[str, Any]:
+    """Every credit-count property of one person, by property name."""
+    person = await one(driver, "MATCH (p:Person {name: $name}) RETURN properties(p) AS props", name=name)
+    return {prop: person["props"].get(prop) for prop in CREDIT_COUNT_PROPERTIES}
+
+
+def expected(total: int, **categories: int) -> dict[str, int]:
+    """The full property map: every category not named reads 0."""
+    return {"credit_count": total, **{f"credit_count_{category}": categories.get(category, 0) for category in ALL_CATEGORIES}}
+
+
+@pytest.mark.asyncio
+async def test_person_credit_counts_are_distinct_releases_per_category(neo4j_driver: AsyncDriver) -> None:
+    """Multi-category people, and releases credited under several roles of one category.
+
+    Flood produces and mixes R1 (two categories, one release), produces and executive-
+    produces R2 (two edges, one category, one release), and plays bass on R3. Run with a
+    batch of one person per inner transaction, so the IN TRANSACTIONS batching itself is
+    exercised by the real engine.
+    """
+    await import_releases(
+        Neo4jBatchProcessor(neo4j_driver),
+        credited_release("R1", "r1-a", ("Flood", "Producer"), ("Flood", "Mixed By"), ("Bob Ludwig", "Mastered By")),
+        credited_release("R2", "r2-a", ("Flood", "Producer"), ("Flood", "Executive Producer")),
+        credited_release("R3", "r3-a", ("Flood", "Bass"), ("Bob Ludwig", "Mastered By"), ("Bob Ludwig", "Lacquer Cut By")),
+    )
+
+    await recount_credits(neo4j_driver, batch_size=1)
+
+    assert await credit_counts(neo4j_driver, "Flood") == expected(3, production=2, engineering=1, session=1)
+    assert await credit_counts(neo4j_driver, "Bob Ludwig") == expected(2, mastering=2)
+
+
+@pytest.mark.asyncio
+async def test_person_credit_counts_reflect_removed_credits(neo4j_driver: AsyncDriver) -> None:
+    """A re-imported release prunes the credits Discogs dropped, and the recount reads 0
+    for a category — and for a person — that no longer has any."""
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    await import_releases(
+        processor,
+        credited_release("R1", "r1-a", ("Flood", "Producer"), ("Flood", "Mixed By"), ("Alan Moulder", "Mixed By")),
+        credited_release("R2", "r2-a", ("Flood", "Producer")),
+    )
+    await recount_credits(neo4j_driver)
+    assert await credit_counts(neo4j_driver, "Flood") == expected(2, production=2, engineering=1)
+    assert await credit_counts(neo4j_driver, "Alan Moulder") == expected(1, engineering=1)
+
+    # The corrected R1 drops Flood's mixing credit and Alan Moulder entirely; the
+    # corrected R2 drops every credit.
+    await import_releases(
+        processor,
+        credited_release("R1", "r1-b", ("Flood", "Producer")),
+        credited_release("R2", "r2-b"),
+    )
+    await recount_credits(neo4j_driver)
+
+    assert await credit_counts(neo4j_driver, "Flood") == expected(1, production=1)
+    assert await credit_counts(neo4j_driver, "Alan Moulder") == expected(0)
+    edges = await one(neo4j_driver, "MATCH (p:Person)-[c:CREDITED_ON]->(r:Release) RETURN collect([p.name, c.role, r.id]) AS edges")
+    assert edges == {"edges": [["Flood", "Producer", "R1"]]}
+
+
+@pytest.mark.asyncio
+async def test_single_record_path_prunes_removed_credits(neo4j_driver: AsyncDriver) -> None:
+    async def project(record: dict[str, Any]) -> None:
+        async with neo4j_driver.session(database="neo4j") as session:
+            await session.execute_write(process_release, record)
+
+    await project(
+        {"id": "S1", "title": "S1", "sha256": "s1-a", "extraartists": [{"name": "Flood", "role": "Producer"}, {"name": "Flood", "role": "Mixed By"}]}
+    )
+    await project({"id": "S1", "title": "S1", "sha256": "s1-b", "extraartists": [{"name": "Flood", "role": "Producer"}]})
+    await recount_credits(neo4j_driver)
+
+    assert await credit_counts(neo4j_driver, "Flood") == expected(1, production=1)

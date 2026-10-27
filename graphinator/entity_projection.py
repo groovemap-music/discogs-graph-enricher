@@ -2,8 +2,6 @@
 
 from typing import Any
 
-from common.credit_roles import categorize_role
-
 from graphinator.company_projection import (
     COMPANY_SOURCE,
     MERGE_COMPANY_CYPHER,
@@ -23,6 +21,7 @@ from graphinator.media_projection import (
     prune_record,
     resolve_media_block,
 )
+from graphinator.person_credits import PRUNE_CREDITED_ON_CYPHER, credited_on_prune_record, person_credit_rows
 
 
 async def process_artist(tx: Any, record: dict[str, Any]) -> bool:
@@ -366,39 +365,25 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
             genre_style_pairs=[{"genre": genres[0], "style": style} for style in styles],
         )
 
-    extraartists: list[dict[str, Any]] | None = record.get("extraartists")
-    if extraartists:
-        credit_rows: list[dict[str, Any]] = []
-        for credit in extraartists:
-            name = credit.get("name")
-            role = credit.get("role", "")
-            if name and role:
-                entry: dict[str, Any] = {
-                    "name": name,
-                    "role": role,
-                    "category": categorize_role(role),
-                    "release_id": record["id"],
-                }
-                if artist_id := credit.get("id"):
-                    entry["artist_id"] = artist_id
-                credit_rows.append(entry)
-        if credit_rows:
+    # Prune before merging, for every reprocessed release — including one that now
+    # asserts no credits (the empty keep-list is the "every credit removed" case), so a
+    # credit Discogs dropped stops counting towards the person's credit_count.
+    credit_rows = person_credit_rows(record["id"], record.get("extraartists"))
+    await tx.run(PRUNE_CREDITED_ON_CYPHER, records=[credited_on_prune_record(record["id"], credit_rows)])
+    if credit_rows:
+        await tx.run(
+            "UNWIND $credits AS credit "
+            "MATCH (r:Release {id: credit.release_id}) "
+            "MERGE (p:Person {name: credit.name}) "
+            "MERGE (p)-[c:CREDITED_ON {role: credit.role}]->(r) "
+            "SET c.category = credit.category",
+            credits=credit_rows,
+        )
+        artist_credits = [credit for credit in credit_rows if credit.get("artist_id")]
+        if artist_credits:
             await tx.run(
-                "UNWIND $credits AS credit "
-                "MATCH (r:Release {id: credit.release_id}) "
-                "MERGE (p:Person {name: credit.name}) "
-                "MERGE (p)-[c:CREDITED_ON {role: credit.role}]->(r) "
-                "SET c.category = credit.category",
-                credits=credit_rows,
+                "UNWIND $credits AS credit MATCH (p:Person {name: credit.name}) MATCH (a:Artist {id: credit.artist_id}) MERGE (p)-[:SAME_AS]->(a)",
+                credits=artist_credits,
             )
-            artist_credits = [credit for credit in credit_rows if credit.get("artist_id")]
-            if artist_credits:
-                await tx.run(
-                    "UNWIND $credits AS credit "
-                    "MATCH (p:Person {name: credit.name}) "
-                    "MATCH (a:Artist {id: credit.artist_id}) "
-                    "MERGE (p)-[:SAME_AS]->(a)",
-                    credits=artist_credits,
-                )
 
     return True
