@@ -45,16 +45,24 @@ flowchart TD
 Environment variables:
 
 ```bash
-# Neo4j connection
-NEO4J_HOST=neo4j
+# Neo4j connection (NEO4J_HOST, NEO4J_USERNAME, and NEO4J_PASSWORD are required;
+# credentials also support _FILE variants for Docker secrets)
+NEO4J_HOST=neo4j                    # Bare host (wrapped as bolt://host:NEO4J_PORT) or a full URI
+NEO4J_PORT=7687                     # Used only when NEO4J_HOST is a bare host (default: 7687)
 NEO4J_USERNAME=neo4j
 NEO4J_PASSWORD=groovemap
+NEO4J_TLS_ENABLED=false             # Encrypt Bolt traffic (default: false)
+NEO4J_TLS_VERIFY=true               # Verify the server certificate when TLS is on (default: true)
 
-# RabbitMQ (also supports _FILE variants for Docker secrets)
-RABBITMQ_USERNAME=groovemap
-RABBITMQ_PASSWORD=groovemap
+# RabbitMQ (credentials also support _FILE variants for Docker secrets)
+RABBITMQ_USERNAME=groovemap         # Default: groovemap
+RABBITMQ_PASSWORD=groovemap         # Default: groovemap
 RABBITMQ_HOST=rabbitmq              # Default: rabbitmq
 RABBITMQ_PORT=5672                  # Default: 5672
+DISCOGS_EXCHANGE_PREFIX=groovemap-discogs  # Exchange and queue name prefix (default: groovemap-discogs; changing it renames wire queues)
+
+# Startup
+STARTUP_DELAY=5                     # Seconds to wait for dependent services before connecting (default: 5)
 
 # Consumer Management (Smart Connection Lifecycle)
 CONSUMER_CANCEL_DELAY=300           # Seconds before canceling idle consumers (default: 5 min)
@@ -289,8 +297,8 @@ paths and in both the `ON CREATE` and `ON MATCH` branches of the single-record w
 ### Queue Consumption
 
 ```python
-# Consumes from four queues
-queues = ["labels", "artists", "releases", "masters"]
+# Consumes from four queues, named groovemap-discogs-graphinator-{entity}
+DATA_TYPES = ["artists", "labels", "masters", "releases"]
 ```
 
 ### Transaction Management
@@ -311,7 +319,8 @@ queues = ["labels", "artists", "releases", "masters"]
 After all queues have been consumed, the graphinator performs cleanup and enrichment steps:
 
 1. **Batch Queue Flushing** — Any remaining messages in batch queues are flushed to ensure no data is left unprocessed
-1. **Stub Node Cleanup** — Removes nodes that have no `sha256` property, which are created as side effects of `MERGE` operations when referenced entities (e.g., artists, labels) haven't been ingested yet
+1. **Stub Node Cleanup** — Removes Artist, Label, Master, and Release nodes that have no `sha256` property and no relationships, which are created as side effects of `MERGE` operations when referenced entities (e.g., artists, labels) haven't been ingested yet. A stub that still has edges is kept so a later dump can fill it in place
+1. **Sentinel Master Cleanup** — Deletes the `(:Master {id: "0"})` node a graph loaded before the Discogs "no master" sentinel fix may still carry; a no-op on graphs built since
 1. **Aggregate Stats Computation** — Runs `compute_genre_style_stats()` to pre-compute node properties (see below)
 
 ### 📊 Pre-Computed Node Properties
@@ -421,7 +430,7 @@ processor (`NEO4J_BATCH_MODE=true`, the default):
 
 `entity` is one of `artist`, `label`, `master`, `release`.
 
-Two more instruments are recorded locally because this service acks/nacks RabbitMQ
+One more instrument is recorded locally because this service acks/nacks RabbitMQ
 deliveries itself instead of going through `common.rabbitmq_resilient.process_message_with_retry`:
 
 | Metric | Attributes |

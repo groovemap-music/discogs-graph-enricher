@@ -1,4 +1,4 @@
-"""Regression coverage for shutdown delivery churn (historical issue discogsography-lnn4)."""
+"""Regression coverage for shutdown delivery churn: deliveries stay unsettled and consumers cancel first."""
 
 from unittest.mock import AsyncMock, patch
 

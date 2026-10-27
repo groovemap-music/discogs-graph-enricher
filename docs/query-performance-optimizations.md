@@ -17,9 +17,11 @@ and its
 - `entity_projection` owns the equivalent single-record path used when
   `NEO4J_BATCH_MODE=false`.
 - The `database-schema` repository owns constraints and indexes. This repository's
-  [schema guide](database-schema.md) documents only the media projection it writes.
+  [media graph model](database-schema.md) and
+  [company credits](company-credits.md) guides document only the projections it writes.
 
-Every batch query accepts records as parameters and begins with `UNWIND $records`.
+Every batch query accepts records as a parameter list and begins with `UNWIND`
+(`$artists`, `$releases`, `$records`, and so on).
 Fix queue or delivery-settlement lifecycle defects once in `common.batch` or
 `common.delivery`; keep Cypher, Neo4j exception mapping, and graph telemetry here.
 No record value is interpolated into Cypher text. Entity nodes are matched or merged
@@ -34,10 +36,11 @@ entity update.
    after that transaction succeeds.
 3. Failed-record indexes returned by the projector let the coordinator acknowledge
    healthy records while preserving poison-record isolation.
-4. Release media reprocessing prunes only this service's stale `ISSUED_ON` edges:
-   `rel.source = "discogs"`. Assertions from another catalog remain untouched.
-5. Related Artist, Label, Master, Genre, Style, Person, Medium, and MediaFamily nodes
-   use stable lookup keys so `MERGE` does not create duplicates.
+4. Release media and company-credit reprocessing prunes only this service's stale
+   `ISSUED_ON` and `CREDITED_TO` edges: `source = "discogs"`. Assertions from another
+   catalog remain untouched.
+5. Related Artist, Label, Master, Genre, Style, Person, Medium, MediaFamily, and
+   Company nodes use stable lookup keys so `MERGE` does not create duplicates.
 6. Post-import cleanup starts only after the durable four-signal latch and a full
    drain of all per-entity queues.
 

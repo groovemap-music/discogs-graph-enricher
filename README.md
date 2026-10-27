@@ -39,9 +39,6 @@ Some identifiers intentionally remain stable across the repository extraction:
   image, health identity, log identity, or ephemeral RabbitMQ consumer tag.
 - `groovemap-discogs` is the versioned AMQP exchange prefix shared with
   `discogs-ingestion`.
-- `discogsography-*` strings that remain in code or regression-test comments are
-  historical issue identifiers. They are provenance for specific failure fixes, not
-  active product branding or wire values.
 
 ## Telemetry
 
@@ -109,9 +106,10 @@ just image
 verification. `just check` adds types, coverage, secret scanning, package and install
 checks, licenses, and a version-bump preview. It uses mocked Neo4j and RabbitMQ
 boundaries and never opens a network connection. `just test-integration` requires Docker;
-it starts a disposable, loopback-only Neo4j container, runs representative graph writes
-and the historical multi-genre taxonomy regression, and removes the container and its
-data on exit. CI invokes this explicit integration tier on pull requests. Live load and
+it starts a disposable, loopback-only Neo4j container, runs representative graph writes,
+the multi-genre taxonomy and company-credit correction regressions, and the shared batch
+engine's retry, poison-isolation, and shutdown-drain paths, and removes the container
+and its data on exit. CI invokes this explicit integration tier on pull requests. Live load and
 deployment checks remain separate. See the
 [service reference](graphinator/README.md) for configuration and the graph data model.
 
@@ -122,9 +120,13 @@ token; personal access tokens are not accepted.
 
 - Catalog-event contract: v1, promoted byte-for-byte from `discogs-ingestion`.
 - Persistence compatibility: v1, promoted from `database-schema`.
+- Runtime attestation: `contracts/runtime/v1/source.json` records the immutable
+  `groovemap-runtime` commit and tree that `pyproject.toml` pins.
 
 `just source-check` verifies both promoted files and the generated Python binding by
-SHA-256. There are no cross-repository relative imports or generated writes.
+SHA-256, and checks that the runtime attestation matches the `groovemap-runtime` source
+pin and the persistence contract's tested baseline. There are no cross-repository
+relative imports or generated writes.
 
 ## Release and license
 

@@ -38,8 +38,8 @@ MEDIA_SOURCE = "discogs"
 # the additive MERGE below re-creates the current set. Discogs records are mutable: a
 # release corrected from Vinyl to CD gets a new sha256, passes the hash gate, MERGEs the
 # CD edge — and would keep the vinyl one forever, so a medium-centric query would list the
-# release under a medium it was never issued on. Mirrors the Genre/Style prune
-# (discogsography-bd0u). `rel.source` scopes the delete to this provider's edges: a
+# release under a medium it was never issued on. Mirrors the Genre/Style stale-edge
+# prune in batch_projection. `rel.source` scopes the delete to this provider's edges: a
 # MusicBrainz-sourced edge on the same release is another producer's assertion.
 # A release whose new version asserts NO media is included too, with an empty keep-list —
 # that is precisely the "every medium was removed" case.

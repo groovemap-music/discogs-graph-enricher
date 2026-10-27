@@ -85,7 +85,7 @@ completed_files: set[str] = set()  # Track which files have completed processing
 # Non-batch mode only: throttles requeues while Neo4j is unavailable, so an
 # outage cannot burn the quorum queue's x-delivery-limit budget and dead-letter
 # valid records. Batch mode gets the same protection from _flush_queue's
-# re-enqueue+backoff, which never nacks (discogsography-rb05).
+# re-enqueue+backoff, which never nacks.
 outage_backoff = OutageBackoff(SERVICE_NAME)
 # Track which data types have delivered an extraction_complete signal. Stub
 # cleanup and aggregate stats are deferred until EVERY type has signalled, so
@@ -98,8 +98,7 @@ outage_backoff = OutageBackoff(SERVICE_NAME)
 # them all: the final signal then found 1-of-4, deferred forever, and post-import
 # maintenance silently never ran. The latch is also keyed by extraction VERSION,
 # so a long-lived process cannot carry a completed run's signals into the next
-# dump and fire maintenance while other queues are still importing
-# (discogsography-tk7v).
+# dump and fire maintenance while other queues are still importing.
 extraction_complete_signals: set[str] = set()
 extraction_complete_version: str | None = None
 EXTRACTION_LATCH_UNKNOWN_VERSION = "unknown"
@@ -573,7 +572,7 @@ async def _load_extraction_signals(version: str) -> set[str]:
 
     Returns the set of data types that have already signalled. Raises if Neo4j
     cannot answer — the caller must requeue rather than assume "none signalled",
-    which would re-run maintenance state from scratch (discogsography-tk7v).
+    which would re-run maintenance state from scratch.
     """
     if graph is None:
         return set()
@@ -653,7 +652,6 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
             # and let post-import maintenance run over an incomplete graph while
             # the service reports success. Requeue the marker instead — the
             # pending records stay queued and periodic_flush retries them.
-            # See discogsography-hh7r.
             logger.error(
                 "❌ Flush incomplete — requeueing file_complete instead of marking the file done",
                 data_type=data_type,
@@ -682,7 +680,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         if batch_processor is not None and not await batch_processor.flush_queue(data_type):
             # Records are still pending, so this type is NOT complete. Recording
             # the signal would let stub cleanup and stats run over a graph that is
-            # still missing rows. Requeue and retry (discogsography-hh7r).
+            # still missing rows. Requeue and retry.
             logger.error(
                 "❌ Flush incomplete — requeueing extraction_complete instead of recording the signal",
                 data_type=data_type,
@@ -693,7 +691,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         # Record this type's completion signal (idempotent — safe under
         # nack/requeue redelivery) in Neo4j BEFORE acking. The ack destroys the
         # queued message, which was otherwise the only durable copy of this
-        # coordination state (discogsography-tk7v).
+        # coordination state.
         version = str(data.get("version") or EXTRACTION_LATCH_UNKNOWN_VERSION)
         try:
             await _sync_extraction_signals(version)
@@ -718,7 +716,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         # every 30s forever and check_all_consumers_idle() could never return True, so
         # the connection and four idle consumers were held open until restart. A plain
         # restart between the file_complete ack and this delivery reaches the same
-        # terminal state (discogsography-ewvh).
+        # terminal state.
         completed_files.add(data_type)
         if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
             await schedule_consumer_cancellation(data_type, queues[data_type])
@@ -755,8 +753,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         # timeout, which closes the SHARED channel with PRECONDITION_FAILED: all
         # four consumers die, the signal is redelivered, maintenance restarts from
         # scratch, and after x-delivery-limit=20 redeliveries the trigger is
-        # dead-lettered and maintenance never completes at all. See
-        # discogsography-zjja.
+        # dead-lettered and maintenance never completes at all.
         await message.ack()
 
         # Maintenance now runs detached with its own retry, because the AMQP
@@ -817,9 +814,8 @@ async def run_post_import_maintenance() -> bool:
             # batches MERGE fresh stubs — the stubs survive forever with no sha256, or
             # the sweep deletes a stub together with a just-written edge. The gate is
             # "all four signals received"; this makes it "all four queues quiescent"
-            # too, which is the invariant the deferral comment actually claims
-            # (discogsography-fyxy). flush_all is a no-op on empty queues and waits out
-            # in-flight batches per type.
+            # too, which is the invariant the deferral comment actually claims.
+            # flush_all is a no-op on empty queues and waits out in-flight batches per type.
             if batch_processor is not None and not await batch_processor.flush_all():
                 logger.error(
                     "❌ Batch queues did not drain — deferring stub cleanup rather than sweeping while writers are still creating stubs",
@@ -1068,7 +1064,7 @@ MAINTENANCE_MAX_ATTEMPTS = 4
 MAINTENANCE_RETRY_BASE_DELAY_SECONDS = 30.0
 
 # Whole-sweep retries for the detached post-import maintenance task. The AMQP
-# delivery is acked before maintenance starts (discogsography-zjja), so this — not
+# delivery is acked before maintenance starts, so this — not
 # nack/requeue — is what retries a failed sweep. Kept small: each pass is hours of
 # Neo4j work, and every step is idempotent so a later manual re-run is always safe.
 POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS = 3
@@ -1167,7 +1163,7 @@ async def cleanup_stub_nodes(data_type: str) -> bool:
 
     A stub that still has relationships is NOT collected: its edges belong to
     fully-imported records and deleting them is unrecoverable under the
-    content-hash write-skip (discogsography-64aw).
+    content-hash write-skip.
 
     Returns:
         True if cleanup succeeded (or there is nothing to do), False if the
@@ -1211,8 +1207,8 @@ async def cleanup_stub_nodes(data_type: str) -> bool:
     # in process_release/process_artist (and both batch processors) returns before the
     # relationship blocks, and the edge is never rebuilt. Keeping the stub preserves
     # both the edge and the id, and a later dump upgrades it in place — the fill-in
-    # path MERGEs on id, so the stub simply gains its properties and sha256
-    # (discogsography-64aw). Truly orphaned stubs still get collected here.
+    # path MERGEs on id, so the stub simply gains its properties and sha256.
+    # Truly orphaned stubs still get collected here.
     def _build_cleanup_cypher(batch_size: int | None) -> str:
         return f"""
     MATCH (n:{label})
@@ -1332,7 +1328,7 @@ def make_message_handler(
             # x-delivery-count per cycle; at x-delivery-limit=20 valid records
             # are dead-lettered within a second of a routine restart. Returning
             # without settling lets the connection close requeue them exactly
-            # once. See discogsography-lnn4.
+            # once.
             logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
             return
 
@@ -1462,7 +1458,7 @@ def make_message_handler(
                 )
                 # Pause before requeueing — x-delivery-limit=20 is a budget with no
                 # time dimension, so unthrottled requeues dead-letter valid records
-                # within minutes of a Neo4j outage (discogsography-rb05).
+                # within minutes of a Neo4j outage.
                 await outage_backoff.wait()
                 try:
                     await message.nack(requeue=True)
@@ -1710,7 +1706,7 @@ async def main() -> None:
         # QoS is deliberately per-consumer (aio-pika's global_=False default) so each
         # data type can fill its own batch; the resulting channel-wide ceiling is
         # prefetch_count x len(DATA_TYPES) and is logged so the multiplier is explicit
-        # rather than silent (discogsography-4fio). Unlike the Discogs SQL loader's non-batch mode,
+        # rather than silent. Unlike the Discogs SQL loader's non-batch mode,
         # graphinator writes through the Neo4j driver's own pool, so there is no small
         # fixed connection budget to couple the prefetch to.
         prefetch_count = max(200, BATCH_SIZE * 2) if BATCH_MODE else 200
@@ -1800,7 +1796,7 @@ async def main() -> None:
         finally:
             # Stop new deliveries FIRST, before the multi-second flush/teardown
             # below: a still-subscribed consumer keeps being handed messages it
-            # can only leave unacked (discogsography-lnn4).
+            # can only leave unacked.
             await cancel_all_consumers()
 
             # Cancel progress reporting

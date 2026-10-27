@@ -26,8 +26,8 @@ from graphinator.graphinator import (
 async def _await_post_import_maintenance() -> bool | None:
     """Await the detached post-import maintenance task, if one was started.
 
-    extraction_complete is acked immediately and maintenance runs in its own task
-    (discogsography-zjja), so tests that assert on maintenance effects must join
+    extraction_complete is acked immediately and maintenance runs in its own task,
+    so tests that assert on maintenance effects must join
     that task instead of assuming it ran inline.
     """
     import graphinator.graphinator as g
@@ -75,7 +75,7 @@ class TestOnArtistMessage:
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.shutdown_requested", False)
     async def test_non_batch_mode_awaits_async_transaction(self, sample_artist_data: dict[str, Any], mock_neo4j_driver: MagicMock) -> None:
-        """Regression (cu2.18): non-batch mode must await tx.run()/result.single().
+        """Regression: non-batch mode must await tx.run()/result.single().
 
         The service runs on AsyncResilientNeo4jDriver, whose execute_write hands
         the tx function a real AsyncManagedTransaction where ``tx.run()`` is a
@@ -160,7 +160,7 @@ class TestOnArtistMessage:
     async def test_reject_on_shutdown(self) -> None:
         """During shutdown a message is left UNSETTLED, not nacked.
 
-        discogsography-lnn4: nack(requeue=True) against a still-subscribed
+        A nack(requeue=True) against a still-subscribed
         consumer is redelivered in milliseconds and burns a quorum
         x-delivery-count per cycle, dead-lettering valid records at
         x-delivery-limit=20. Leaving it unacked defers redelivery to the
@@ -189,7 +189,7 @@ class TestOnArtistMessage:
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.shutdown_requested", False)
     async def test_batch_mode_nack_callback_uses_requeue_false(self) -> None:
-        """Regression (cu2.52): the batch-mode add_message nack callback must use
+        """Regression: the batch-mode add_message nack callback must use
         requeue=False so permanently-invalid input goes straight to the DLQ
         instead of cycling x-delivery-limit (20) futile redeliveries.
         """
@@ -347,7 +347,7 @@ class TestOnLabelMessage:
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.shutdown_requested", True)
     async def test_reject_on_shutdown(self) -> None:
-        """discogsography-lnn4: shutdown leaves the message unsettled, not nacked."""
+        """Shutdown leaves the message unsettled, not nacked."""
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
 
         await on_label_message(mock_message)
@@ -956,7 +956,7 @@ class TestCheckFileCompletion:
     @patch("graphinator.graphinator.batch_processor", None)
     @patch("graphinator.graphinator.graph", None)
     async def test_extraction_complete_marks_the_type_complete(self) -> None:
-        """discogsography-ewvh: extraction_complete is the type's terminal signal.
+        """extraction_complete is the type's terminal signal.
 
         completed_files was written only by file_complete and erased by the recovery
         path for any type whose queue still holds messages — and when the only pending
@@ -1015,7 +1015,7 @@ class TestCheckFileCompletion:
         """Test extraction_complete triggers stub cleanup once ALL types complete.
 
         Cleanup is deferred until every data type has signalled
-        extraction_complete (cu2.49 / cu2.67), then runs across every entity
+        extraction_complete, then runs across every entity
         label. Seed the other three signals and send the final one.
         """
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
@@ -1052,7 +1052,7 @@ class TestCheckFileCompletion:
 
         with patch("graphinator.graphinator.compute_genre_style_stats", AsyncMock(return_value=True)):
             result = await check_file_completion(completion_data, "releases", mock_message)
-            # Maintenance is detached from the delivery (discogsography-zjja).
+            # Maintenance is detached from the delivery.
             await _await_post_import_maintenance()
 
         assert result is True
@@ -1191,7 +1191,7 @@ class TestComputeGenreStyleStats:
 
     @pytest.mark.asyncio
     async def test_driving_match_is_outside_transactional_subquery(self) -> None:
-        """Regression (cu2.17): the driving MATCH must sit OUTSIDE ``CALL {} IN
+        """Regression: the driving MATCH must sit OUTSIDE ``CALL {} IN
         TRANSACTIONS`` so the update batches one node per inner transaction.
 
         If the MATCH is the first statement *inside* the transactional subquery
@@ -1331,7 +1331,7 @@ class TestCheckFileCompletionComputeGenreStyleStats:
         from graphinator.graphinator import check_file_completion
 
         result = await check_file_completion(completion_data, "releases", mock_message)
-        # Maintenance is detached from the delivery (discogsography-zjja).
+        # Maintenance is detached from the delivery.
         await _await_post_import_maintenance()
 
         assert result is True
@@ -1346,7 +1346,7 @@ class TestCheckFileCompletionComputeGenreStyleStats:
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
     async def test_defers_maintenance_until_all_types_complete(self, mock_cleanup: AsyncMock, mock_compute: AsyncMock) -> None:
-        """cu2.49 / cu2.67: a single type's signal must NOT trigger any maintenance."""
+        """A single type's signal must NOT trigger any maintenance."""
         mock_message = AsyncMock(spec=AbstractIncomingMessage)
         completion_data = {
             "type": "extraction_complete",
@@ -1380,9 +1380,9 @@ class TestCheckFileCompletionComputeGenreStyleStats:
 class TestCheckFileCompletionMaintenanceFailure:
     """Post-import maintenance failure handling.
 
-    Originally (cu2.50) a failed maintenance pass nacked(requeue=True) so the
+    Originally a failed maintenance pass nacked(requeue=True) so the
     idempotent work would be retried, since extraction_complete is emitted once
-    per run. discogsography-zjja replaced that: the delivery is acked BEFORE
+    per run. Detached maintenance replaced that: the delivery is acked BEFORE
     maintenance starts — holding it across hours of Neo4j sweeps trips RabbitMQ's
     30-minute consumer ack timeout and kills the shared channel — and the retry
     now lives in the detached maintenance task itself.
@@ -1856,9 +1856,9 @@ class TestMasterTransactionLogic:
         # 4. Genre relationships
         # 5. Style relationships
         # No genre-style (PART_OF) connection: multiple genres make the style-belongs-to
-        # -genre assertion ambiguous, so it is skipped (discogsography-sy5k).
+        # -genre assertion ambiguous, so it is skipped.
         # Plus 3 prune queries (BY/Genre-IS/Style-IS) that drop associations the record's
-        # new version no longer asserts before the additive MERGEs (discogsography-bd0u).
+        # new version no longer asserts before the additive MERGEs.
         assert mock_tx.run.call_count == 8
         mock_message.ack.assert_called_once()
 
@@ -1981,7 +1981,7 @@ class TestReleaseTransactionLogic:
         # 7. Style relationships
         # 8. Genre-style connections
         # ...plus 5 prune queries (BY/ON/DERIVED_FROM/Genre-IS/Style-IS) that drop
-        # associations the record's new version no longer asserts (discogsography-bd0u),
+        # associations the record's new version no longer asserts,
         # plus the ISSUED_ON prune, which runs for every release (gm-…-sq6.2). This
         # record carries no media, so no Medium MERGE follows it.
         assert mock_tx.run.call_count == 14
@@ -1989,7 +1989,7 @@ class TestReleaseTransactionLogic:
 
     @pytest.mark.asyncio
     async def test_multi_genre_release_skips_part_of(self, mock_neo4j_driver: MagicMock) -> None:
-        """discogsography-sy5k: a release with >1 genre must not cartesian-link every
+        """A release with >1 genre must not cartesian-link every
         style to every genre — the assertion is only unambiguous for a single genre."""
         from graphinator.graphinator import on_release_message
 
@@ -2028,7 +2028,7 @@ class TestReleaseTransactionLogic:
 
     @pytest.mark.asyncio
     async def test_credited_on_merge_key_excludes_derived_category(self, mock_neo4j_driver: MagicMock) -> None:
-        """discogsography-9k6i: CREDITED_ON must MERGE on {role} only and SET category,
+        """CREDITED_ON must MERGE on {role} only and SET category,
         so a later categorize_role() taxonomy change updates the existing edge in place
         instead of forking a parallel duplicate edge."""
         from graphinator.graphinator import on_release_message
@@ -2109,7 +2109,7 @@ class TestReleaseTransactionLogic:
         # 2. Create release node
         # 3. Person CREDITED_ON relationships
         # 4. Person SAME_AS relationships (for Bob Ludwig who has artist_id)
-        # ...plus the 5 release prune queries (discogsography-bd0u), which run even when
+        # ...plus the 5 release prune queries, which run even when
         # the record asserts no artists/labels/master/genres/styles — that is exactly the
         # "every association was removed" case, and the ISSUED_ON prune, which runs on the
         # same terms (gm-…-sq6.2). No media on this record means no Medium MERGE.
@@ -3343,7 +3343,7 @@ class TestProcessReleaseLabelNoId:
 
 
 class TestNonBatchStaleEdgePruning:
-    """discogsography-bd0u (non-batch mirror): the single-record path uses the same
+    """Non-batch mirror of stale-edge pruning: the single-record path uses the same
     MERGE-only, additive relationship writes as the batch processor, so it needs the
     same prune of associations the record's new version no longer asserts."""
 
@@ -4491,7 +4491,7 @@ class TestCoverageGaps:
 
 
 class TestRecoverConsumersAllTypes:
-    """Regression (cu2.53): _recover_consumers must start consumers for ALL data
+    """Regression: _recover_consumers must start consumers for ALL data
     types, not just those with a backlog at the passive-declare instant."""
 
     @pytest.mark.asyncio
@@ -4536,7 +4536,7 @@ class TestRecoverConsumersAllTypes:
 
 
 class TestRecoverConsumersClearsTags:
-    """Regression (cu2.54): recovery errors after ≥1 consumer registered must
+    """Regression: recovery errors after ≥1 consumer registered must
     clear consumer_tags so the stuck-state detector can re-fire."""
 
     @pytest.mark.asyncio
@@ -4587,8 +4587,8 @@ class TestStubCleanupBatchAndOrdering:
     """Regression tests for the stub-cleanup batch.
 
     Covers three linked defects in graphinator stub cleanup:
-      - cu2.68: the DETACH DELETE ran in one unbounded transaction (no batching)
-      - cu2.49 / cu2.67: per-type cleanup raced still-draining release batches
+      - the DETACH DELETE ran in one unbounded transaction (no batching)
+      - per-type cleanup raced still-draining release batches
         that re-create Artist/Label/Master stubs, leaving permanent phantoms.
     """
 
@@ -4622,7 +4622,7 @@ class TestStubCleanupBatchAndOrdering:
 
     @pytest.mark.asyncio
     async def test_cleanup_all_covers_every_entity_label(self) -> None:
-        """cu2.49: cleanup runs across all labels, not just the completed type."""
+        """Cleanup runs across all labels, not just the completed type."""
         import graphinator.graphinator as g
 
         graph_mock, run_calls = self._make_graph_mock()
@@ -4637,7 +4637,7 @@ class TestStubCleanupBatchAndOrdering:
 
     @pytest.mark.asyncio
     async def test_cleanup_uses_batched_transactions(self) -> None:
-        """cu2.68: the delete is batched via CALL {} IN TRANSACTIONS, not one big tx."""
+        """The delete is batched via CALL {} IN TRANSACTIONS, not one big tx."""
         import graphinator.graphinator as g
 
         graph_mock, run_calls = self._make_graph_mock()
@@ -4654,7 +4654,7 @@ class TestStubCleanupBatchAndOrdering:
 
     @pytest.mark.asyncio
     async def test_cleanup_only_deletes_stubs_with_no_relationships(self) -> None:
-        """discogsography-64aw: a stub that still has relationships must survive.
+        """A stub that still has relationships must survive.
 
         Its edges (BY/ON/DERIVED_FROM/MEMBER_OF) were written by fully-imported records
         that referenced an entity missing from this dump. DETACH DELETE destroyed those
@@ -4678,7 +4678,7 @@ class TestStubCleanupBatchAndOrdering:
 
     @pytest.mark.asyncio
     async def test_cleanup_failure_returns_false_for_retry(self) -> None:
-        """cu2.68: a failed delete must return False so the caller nacks/retries."""
+        """A failed delete must return False so the caller nacks/retries."""
         import graphinator.graphinator as g
 
         graph_mock, _ = self._make_graph_mock(fail=True)
@@ -4689,7 +4689,7 @@ class TestStubCleanupBatchAndOrdering:
 
     @pytest.mark.asyncio
     async def test_cleanup_deferred_until_all_types_complete(self) -> None:
-        """cu2.49 / cu2.67: no cleanup until every type signals extraction_complete."""
+        """No cleanup until every type signals extraction_complete."""
         import graphinator.graphinator as g
 
         g.extraction_complete_signals = set()
@@ -4735,9 +4735,9 @@ class TestStubCleanupBatchAndOrdering:
 
     @pytest.mark.asyncio
     async def test_final_signal_acks_and_retries_in_task_when_maintenance_fails(self) -> None:
-        """discogsography-zjja: failed maintenance retries in its own task, not via nack.
+        """Failed maintenance retries in its own task, not via nack.
 
-        cu2.67 originally nacked so the idempotent sweep would be retried, but
+        The trigger was originally nacked so the idempotent sweep would be retried, but
         that held the delivery across hours of Neo4j work and tripped the broker's
         consumer ack timeout. The ack now happens first and the retry moved into
         the detached task.
@@ -4779,7 +4779,7 @@ class TestStubCleanupBatchAndOrdering:
 
 
 class TestMaintenanceUnderMemoryPressure:
-    """discogsography-79p9: Neo4j transaction-memory exhaustion (16 GiB pool).
+    """Neo4j transaction-memory exhaustion (16 GiB pool).
 
     Jul 5-9 production hit Neo.TransientError.General.MemoryPoolOutOfMemoryError
     repeatedly. Stub-Master cleanup failed twice and was silently skipped with no
@@ -4958,7 +4958,7 @@ class TestMaintenanceUnderMemoryPressure:
 
 
 class TestOutageRequeueBackoff:
-    """Regression tests for discogsography-rb05 (mirror of the brainz consumers)."""
+    """Regression tests for throttled requeues during a Neo4j outage (mirror of the brainz consumers)."""
 
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.shutdown_requested", False)

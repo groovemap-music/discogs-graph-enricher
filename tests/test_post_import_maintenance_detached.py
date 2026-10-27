@@ -1,4 +1,4 @@
-"""Regression tests for discogsography-zjja.
+"""Regression tests for detaching post-import maintenance from its AMQP delivery.
 
 check_file_completion ran post-import maintenance — stub cleanup across every
 entity label plus genre/style/label aggregate stats — INLINE in the consumer
@@ -141,7 +141,7 @@ async def test_redelivered_trigger_does_not_start_a_second_run() -> None:
 
 @pytest.mark.asyncio
 async def test_maintenance_drains_every_queue_before_cleanup() -> None:
-    """discogsography-fyxy: cleanup DETACH DELETEs sha256-less stubs of EVERY label, so
+    """Cleanup DETACH DELETEs sha256-less stubs of EVERY label, so
     every batch queue — not just the signalling type's — must be quiescent first.
 
     The extraction_complete branch flushes only its own data type, and a type whose
