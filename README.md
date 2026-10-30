@@ -108,7 +108,9 @@ batch-drain, and transient-classification regression suites. See
 
 The container image is `ghcr.io/groovemap-music/discogs-graph-enricher`. The process
 runs as a non-root user, writes structured logs under
-`/logs/discogs-graph-enricher.log`, and exposes health on port `8001` (the graph-enricher health role port; set `HEALTH_PORT` to override, and an invalid value fails startup). Deployment owns
+`/logs/discogs-graph-enricher.log` in the container (set `LOG_FILE` to relocate the file or
+leave it empty to disable it; when the file cannot be opened, as when running locally without
+`/logs`, the service logs to the console with one warning), and exposes health on port `8001` (the graph-enricher health role port; set `HEALTH_PORT` to override, and an invalid value fails startup). Deployment owns
 runtime composition and credentials; this repository owns the image and its application
 contract.
 
