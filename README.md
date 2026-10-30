@@ -13,6 +13,37 @@ flowchart LR
     DGE -->|health :8001 and structured logs| OPS[operators]
 ```
 
+## Quick start
+
+Audience: engineers working on this service. Operators should start from the image
+described under [Operations](#operations).
+
+```bash
+mise install          # pinned Python, uv, just, gitleaks
+just setup            # install locked dependencies
+just check            # full local gate; needs no RabbitMQ or Neo4j
+
+# Run the consumer against a reachable RabbitMQ and Neo4j
+RABBITMQ_HOST=localhost NEO4J_HOST=localhost \
+  NEO4J_USERNAME=neo4j NEO4J_PASSWORD=groovemap \
+  uv run discogs-graph-enricher
+curl http://localhost:8001/health
+```
+
+`NEO4J_HOST`, `NEO4J_USERNAME`, and `NEO4J_PASSWORD` are required. RabbitMQ defaults to
+host `rabbitmq`, port `5672`, user `groovemap`, and password `groovemap`; override the
+`RABBITMQ_*` variables for a local broker. RabbitMQ's built-in `guest` user only accepts
+loopback connections, so a stock broker needs a matching user, or set `RABBITMQ_USERNAME`
+and `RABBITMQ_PASSWORD` to existing credentials:
+
+```bash
+rabbitmqctl add_user groovemap groovemap
+rabbitmqctl set_permissions -p / groovemap ".*" ".*" ".*"
+```
+
+See the
+[configuration reference](graphinator/README.md#configuration) for all settings.
+
 ## Inputs and outputs
 
 The service consumes the `artists`, `labels`, `masters`, and `releases` queues from

@@ -93,8 +93,10 @@ OTEL_RESOURCE_ATTRIBUTES=service.namespace=groovemap,deployment.environment.name
 # Batch Processing (Enabled by Default)
 NEO4J_BATCH_MODE=true               # Enable batch processing (default: true)
 NEO4J_BATCH_SIZE=100                # Records per batch (default: 100)
-HEALTH_PORT=8001                    # Health server port (default: 8001; invalid values fail startup)
 NEO4J_BATCH_FLUSH_INTERVAL=5.0      # Seconds between automatic flushes (default: 5.0)
+
+# Health
+HEALTH_PORT=8001                    # Health server port (default: 8001; invalid values fail startup)
 ```
 
 The health server listens on **8001**, the health role port for every graph enricher. Set `HEALTH_PORT` (1-65535) to override it; the image `HEALTHCHECK` follows the same variable. A non-integer or out-of-range value is rejected at startup with a configuration error rather than falling back to 8001.
