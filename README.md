@@ -32,7 +32,16 @@ curl http://localhost:8001/health
 
 `NEO4J_HOST`, `NEO4J_USERNAME`, and `NEO4J_PASSWORD` are required. RabbitMQ defaults to
 host `rabbitmq`, port `5672`, user `groovemap`, and password `groovemap`; override the
-`RABBITMQ_*` variables for a local broker. See the
+`RABBITMQ_*` variables for a local broker. RabbitMQ's built-in `guest` user only accepts
+loopback connections, so a stock broker needs a matching user, or set `RABBITMQ_USERNAME`
+and `RABBITMQ_PASSWORD` to existing credentials:
+
+```bash
+rabbitmqctl add_user groovemap groovemap
+rabbitmqctl set_permissions -p / groovemap ".*" ".*" ".*"
+```
+
+See the
 [configuration reference](graphinator/README.md#configuration) for all settings.
 
 ## Inputs and outputs
