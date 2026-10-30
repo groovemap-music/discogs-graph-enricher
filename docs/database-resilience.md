@@ -62,7 +62,8 @@ current task. Telemetry is pushed using OTLP/HTTP-protobuf. This service exposes
 Prometheus `/metrics` route.
 
 During an outage, watch RabbitMQ queue and dead-letter depth, the health response,
-structured logs at `/logs/discogs-graph-enricher.log`, and:
+structured logs (`/logs/discogs-graph-enricher.log` in the container, or the path in
+`LOG_FILE`; console only if the file cannot be opened), and:
 
 - `groovemap.pipeline.batch.flush.duration`
 - `groovemap.pipeline.consumers.active`

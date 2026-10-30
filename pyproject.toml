@@ -61,7 +61,7 @@ exclude-newer = "7 days"
 exclude-newer-package = { certifi = "2026-10-20T02:24:17Z" }
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "9bac0220df80fdb550fde78d4db8228ca4273625" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "6d0425f908e01a446b040e2993045e2afe30460e" }
 
 [tool.ruff]
 extend-exclude = ["graphinator/catalog_contract.py"]

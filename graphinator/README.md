@@ -75,7 +75,8 @@ IDLE_LOG_INTERVAL=300               # Seconds between idle status logs (default:
 
 # Logging
 LOG_LEVEL=INFO                      # Logging level (default: INFO)
-LOG_FILE_MAX_BYTES=104857600        # Bytes before the /logs file sink rotates (default: 100 MiB)
+LOG_FILE=                           # Log file path override (default: /logs/discogs-graph-enricher.log; empty disables the file; console fallback with one warning if unwritable)
+LOG_FILE_MAX_BYTES=104857600        # Bytes before the log file sink rotates (default: 100 MiB)
 LOG_FILE_BACKUP_COUNT=5             # Rotated log files retained alongside the active one (default: 5)
 
 # OpenTelemetry metrics and traces (standard OTEL vars only — no GrooveMap-specific ones)
@@ -417,7 +418,7 @@ and index creation belongs to
 ## Monitoring
 
 - Health endpoint at `http://localhost:8001/health`
-- Structured JSON logging in `/logs/discogs-graph-enricher.log`
+- Structured JSON logging to the console and, where writable, `/logs/discogs-graph-enricher.log` (override with `LOG_FILE`)
 - OpenTelemetry metrics and traces pushed to a collector (see below); no `/metrics` scrape route
 - Error tracking with detailed messages
 
