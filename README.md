@@ -13,6 +13,25 @@ flowchart LR
     DGE -->|health :8001 and structured logs| OPS[operators]
 ```
 
+## Quick start
+
+Audience: engineers working on this service. Operators should start from the image
+described under [Operations](#operations).
+
+```bash
+mise install          # pinned Python, uv, just, gitleaks
+just setup            # install locked dependencies
+just check            # offline checks; needs no RabbitMQ or Neo4j
+
+# Run the consumer against a reachable RabbitMQ and Neo4j
+NEO4J_HOST=localhost NEO4J_USERNAME=neo4j NEO4J_PASSWORD=<password> \
+  uv run discogs-graph-enricher
+curl http://localhost:8001/health
+```
+
+`NEO4J_HOST`, `NEO4J_USERNAME`, and `NEO4J_PASSWORD` are required. Every other setting
+has a default; see the [configuration reference](graphinator/README.md#configuration).
+
 ## Inputs and outputs
 
 The service consumes the `artists`, `labels`, `masters`, and `releases` queues from
