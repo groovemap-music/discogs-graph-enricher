@@ -102,6 +102,9 @@ outage_backoff = OutageBackoff(SERVICE_NAME)
 # dump and fire maintenance while other queues are still importing.
 extraction_complete_signals: set[str] = set()
 extraction_complete_version: str | None = None
+# Four consumers share this singleton cache. Serialize the entire read/commit/
+# publish operation, including version switches, not just the database write.
+extraction_latch_lock = asyncio.Lock()
 EXTRACTION_LATCH_UNKNOWN_VERSION = "unknown"
 # Post-import maintenance runs DETACHED from the AMQP delivery that triggers it
 # (see check_file_completion). Strong references are held here so the loop cannot
@@ -580,11 +583,18 @@ async def _load_extraction_signals(version: str) -> set[str]:
 
     async with graph.session(database="neo4j") as session:
         result = await session.run(
-            "MATCH (m:ExtractionCompletion {version: $version}) RETURN m.signals AS signals",
+            """
+            MATCH (m:ExtractionCompletion {version: $version})
+            UNWIND coalesce(m.signals, []) AS signal
+            RETURN collect(DISTINCT signal) AS signals
+            """,
             version=version,
         )
         record = await result.single()
 
+    # Older concurrent first writes could create duplicate version nodes before
+    # the process lock existed. Recover every committed signal without deleting
+    # historical nodes or requiring a runtime uniqueness migration.
     if record is None or record["signals"] is None:
         return set()
     return {str(signal) for signal in record["signals"]}
@@ -593,51 +603,58 @@ async def _load_extraction_signals(version: str) -> set[str]:
 async def _persist_extraction_signals(version: str, signals: set[str]) -> None:
     """Write the extraction_complete latch for this version to Neo4j.
 
-    Called BEFORE the trigger message is acked, so the coordination state
-    outlives the delivery that carried it.
+    Union with the stored property rather than replace it with a cache snapshot.
+    Reading the property in its own SET expression lets Neo4j acquire its write
+    lock before that read, preserving overlapping updates to an existing node.
+    First creation is serialized by extraction_latch_lock in the supported
+    single-service process; this does not require runtime schema changes.
     """
     if graph is None:
-        return
+        raise RuntimeError("Neo4j driver is not initialized")
 
     async with graph.session(database="neo4j") as session:
-        await session.run(
+        result = await session.run(
             """
             MERGE (m:ExtractionCompletion {version: $version})
             ON CREATE SET m.created_at = datetime()
-            SET m.signals = $signals, m.updated_at = datetime()
+            SET m.signals = reduce(recorded = coalesce(m.signals, []), signal IN $signals |
+                CASE WHEN signal IN recorded THEN recorded ELSE recorded + [signal] END),
+                m.updated_at = datetime()
             """,
             version=version,
             signals=sorted(signals),
         )
+        # Auto-commit queries are lazy: consume the result and surface commit
+        # failures before publishing cache state or destroying the AMQP delivery.
+        await result.consume()
 
 
-async def _sync_extraction_signals(version: str) -> None:
-    """Refresh the in-memory latch cache from Neo4j for this extraction version.
+async def _record_extraction_signal(version: str, data_type: str) -> set[str]:
+    """Commit one signal, then publish and return this version's cache snapshot.
 
-    On a version change the cache is rebuilt from that version's durable latch
-    (usually empty), so signals from a previous dump can never satisfy the
-    all-four check for the new one.
+    Keep the candidate private until persistence succeeds. A failed duplicate
+    must not discard a previously committed signal, and a failed first delivery
+    must not let another consumer see completion that was never committed.
     """
     global extraction_complete_signals, extraction_complete_version
 
-    if extraction_complete_version == version:
-        return
-
-    persisted = await _load_extraction_signals(version)
-    if extraction_complete_version is not None:
-        logger.info(
-            "🔄 New extraction version — resetting the completion latch",
-            previous_version=extraction_complete_version,
-            version=version,
-        )
-    extraction_complete_signals = persisted
-    extraction_complete_version = version
-    if persisted:
-        logger.info(
-            "📥 Restored extraction_complete signals",
-            version=version,
-            received=sorted(persisted),
-        )
+    async with extraction_latch_lock:
+        changed_version = extraction_complete_version != version
+        persisted = await _load_extraction_signals(version) if changed_version else extraction_complete_signals
+        candidate = persisted | {data_type}
+        await _persist_extraction_signals(version, candidate)
+        if changed_version:
+            if extraction_complete_version is not None:
+                logger.info(
+                    "🔄 New extraction version — resetting the completion latch",
+                    previous_version=extraction_complete_version,
+                    version=version,
+                )
+            if persisted:
+                logger.info("📥 Restored extraction_complete signals", version=version, received=sorted(persisted))
+        extraction_complete_signals = candidate
+        extraction_complete_version = version
+        return set(candidate)
 
 
 async def check_file_completion(data: dict[str, Any], data_type: str, message: AbstractIncomingMessage) -> bool:
@@ -695,9 +712,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         # coordination state.
         version = str(data.get("version") or EXTRACTION_LATCH_UNKNOWN_VERSION)
         try:
-            await _sync_extraction_signals(version)
-            extraction_complete_signals.add(data_type)
-            await _persist_extraction_signals(version, extraction_complete_signals)
+            signals = await _record_extraction_signal(version, data_type)
         except Exception as e:
             logger.error(
                 "❌ Failed to persist extraction_complete latch — requeueing the signal",
@@ -705,7 +720,6 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
                 version=version,
                 error=str(e),
             )
-            extraction_complete_signals.discard(data_type)
             await message.nack(requeue=True)
             return True
 
@@ -731,19 +745,19 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         # early cleanup persist forever, and DETACH DELETE can interleave with
         # freshly written release edges. Running once — after all four signals
         # — guarantees no consumer is still creating stubs.
-        if not extraction_complete_signals.issuperset(DATA_TYPES):
+        if not signals.issuperset(DATA_TYPES):
             logger.info(
                 "⏳ Deferring stub cleanup until all data types complete",
                 data_type=data_type,
-                received=sorted(extraction_complete_signals),
-                pending=sorted(set(DATA_TYPES) - extraction_complete_signals),
+                received=sorted(signals),
+                pending=sorted(set(DATA_TYPES) - signals),
             )
             await message.ack()
             return True
 
         logger.info(
             "🏁 All data types complete — running post-import maintenance",
-            received=sorted(extraction_complete_signals),
+            received=sorted(signals),
         )
 
         # Ack the trigger BEFORE maintenance starts, never after. Post-import

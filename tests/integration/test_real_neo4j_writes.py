@@ -21,6 +21,10 @@ from graphinator.person_credits import CREDIT_COUNT_PROPERTIES
 
 pytestmark = pytest.mark.integration
 
+# Preserve real helpers before the default suite fixture substitutes an in-memory latch.
+_LOAD_EXTRACTION_SIGNALS = graphinator._load_extraction_signals
+_PERSIST_EXTRACTION_SIGNALS = graphinator._persist_extraction_signals
+
 
 def pending(data_type: str, data: dict[str, Any]) -> PendingMessage:
     """Build one batch message; settlement belongs to the queue-level tests."""
@@ -53,6 +57,98 @@ async def one(driver: AsyncDriver, query: str, **parameters: Any) -> dict[str, A
         result = await session.run(query, **parameters)
         record = await result.single(strict=True)
         return dict(record)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_first_signals_are_durable_at_ack(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use real load/commit awaits through the four consumer completion handlers."""
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    monkeypatch.setattr(graphinator, "batch_processor", None)
+    monkeypatch.setattr(graphinator, "_load_extraction_signals", _LOAD_EXTRACTION_SIGNALS)
+    monkeypatch.setattr(graphinator, "_persist_extraction_signals", _PERSIST_EXTRACTION_SIGNALS)
+    acknowledged: set[str] = set()
+    ack_lock = asyncio.Lock()
+    messages = []
+    for data_type in graphinator.DATA_TYPES:
+        message = AsyncMock()
+
+        async def ack(data_type: str = data_type) -> None:
+            async with ack_lock:
+                acknowledged.add(data_type)
+                stored = await _LOAD_EXTRACTION_SIGNALS("concurrent-first")
+                assert stored.issuperset(acknowledged)
+
+        message.ack.side_effect = ack
+        messages.append((data_type, message))
+
+    with patch.object(graphinator, "start_post_import_maintenance") as start:
+        await asyncio.gather(
+            *(
+                graphinator.check_file_completion({"type": "extraction_complete", "version": "concurrent-first"}, data_type, message)
+                for data_type, message in messages
+            )
+        )
+    assert await _LOAD_EXTRACTION_SIGNALS("concurrent-first") == set(graphinator.DATA_TYPES)
+    assert all(message.ack.await_count == 1 and message.nack.await_count == 0 for _, message in messages)
+    start.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_latch_writes_union_existing_signals(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Bypass the process lock: overlapping stale snapshots must remain monotonic in Neo4j."""
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    await _PERSIST_EXTRACTION_SIGNALS("overlapping-writes", {"already-committed"})
+    # Each write intentionally knows only its own type, never the committed seed
+    # or other writers' signals. Repetition also checks duplicate idempotency.
+    await asyncio.gather(*(_PERSIST_EXTRACTION_SIGNALS("overlapping-writes", {data_type}) for _ in range(8) for data_type in graphinator.DATA_TYPES))
+    stored = await one(
+        neo4j_driver,
+        "MATCH (m:ExtractionCompletion {version: $version}) RETURN count(m) AS nodes, head(collect(m.signals)) AS signals",
+        version="overlapping-writes",
+    )
+    expected = {"already-committed", *graphinator.DATA_TYPES}
+    assert stored["nodes"] == 1
+    assert set(stored["signals"]) == expected
+    assert len(stored["signals"]) == len(expected)
+
+
+@pytest.mark.asyncio
+async def test_historical_duplicate_version_nodes_restore_every_committed_signal(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recover old first-MERGE races without DDL, deletion, or cross-version leakage."""
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    monkeypatch.setattr(graphinator, "batch_processor", None)
+    monkeypatch.setattr(graphinator, "_load_extraction_signals", _LOAD_EXTRACTION_SIGNALS)
+    monkeypatch.setattr(graphinator, "_persist_extraction_signals", _PERSIST_EXTRACTION_SIGNALS)
+    await one(
+        neo4j_driver,
+        """
+        CREATE (:ExtractionCompletion {version: 'historical', signals: ['artists', 'labels']}),
+               (:ExtractionCompletion {version: 'historical', signals: ['masters']}),
+               (:ExtractionCompletion {version: 'other-version', signals: ['releases']})
+        RETURN 1 AS seeded
+        """,
+    )
+    assert await _LOAD_EXTRACTION_SIGNALS("historical") == {"artists", "labels", "masters"}
+    assert await _LOAD_EXTRACTION_SIGNALS("other-version") == {"releases"}
+    assert await _LOAD_EXTRACTION_SIGNALS("missing-version") == set()
+    message = AsyncMock()
+
+    async def ack() -> None:
+        assert await _LOAD_EXTRACTION_SIGNALS("historical") == set(graphinator.DATA_TYPES)
+
+    message.ack.side_effect = ack
+    with patch.object(graphinator, "start_post_import_maintenance") as start:
+        await graphinator.check_file_completion({"type": "extraction_complete", "version": "historical"}, "releases", message)
+    message.ack.assert_awaited_once()
+    message.nack.assert_not_awaited()
+    start.assert_called_once()
+    stored = await one(
+        neo4j_driver,
+        "MATCH (m:ExtractionCompletion {version: 'historical'}) RETURN collect(m.signals) AS rows",
+    )
+    assert len(stored["rows"]) == 2
+    assert all(set(row) == set(graphinator.DATA_TYPES) for row in stored["rows"])
+    assert await _LOAD_EXTRACTION_SIGNALS("other-version") == {"releases"}
 
 
 @pytest.mark.asyncio
