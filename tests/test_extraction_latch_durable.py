@@ -16,6 +16,7 @@ into the next dump and firing maintenance while other queues still import.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -42,11 +43,15 @@ class FakeLatchStore:
         self.writes: list[tuple[str, set[str]]] = []
 
     async def load(self, version: str) -> set[str]:
-        return set(self.rows.get(version, set()))
+        snapshot = set(self.rows.get(version, set()))
+        await asyncio.sleep(0)  # A real database read lets other consumers run.
+        return snapshot
 
     async def persist(self, version: str, signals: set[str]) -> None:
-        self.rows[version] = set(signals)
-        self.writes.append((version, set(signals)))
+        snapshot = set(signals)
+        await asyncio.sleep(0)  # Model an in-flight write with frozen parameters.
+        self.rows[version] = snapshot
+        self.writes.append((version, snapshot))
 
 
 @pytest.fixture
@@ -71,6 +76,151 @@ async def test_signal_persisted_before_ack(latch: FakeLatchStore) -> None:
     assert latch.rows["20260101"] == {"artists"}
     message.ack.assert_awaited_once()
     message.nack.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_four_concurrent_first_signals_survive_every_ack(latch: FakeLatchStore) -> None:
+    """All consumers enter before the first load returns; no stale write may erase an ACK."""
+    acknowledged: set[str] = set()
+    messages = []
+    for data_type in g.DATA_TYPES:
+        message = AsyncMock(spec=AbstractIncomingMessage)
+
+        async def ack(data_type: str = data_type) -> None:
+            acknowledged.add(data_type)
+            assert latch.rows["20260101"].issuperset(acknowledged)
+
+        message.ack.side_effect = ack
+        messages.append((data_type, message))
+
+    with patch.object(g, "start_post_import_maintenance") as start:
+        await asyncio.gather(*(g.check_file_completion(_signal(), data_type, message) for data_type, message in messages))
+
+    assert latch.rows["20260101"] == set(g.DATA_TYPES)
+    assert g.extraction_complete_signals == set(g.DATA_TYPES)
+    assert all(message.ack.await_count == 1 for _, message in messages)
+    assert all(message.nack.await_count == 0 for _, message in messages)
+    start.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_duplicate_keeps_previously_committed_signal(latch: FakeLatchStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed duplicate must not remove a signal whose first delivery was ACKed."""
+    await g.check_file_completion(_signal(), "artists", AsyncMock(spec=AbstractIncomingMessage))
+
+    async def fail(_version: str, _signals: set[str]) -> None:
+        await asyncio.sleep(0)
+        raise RuntimeError("write failed")
+
+    monkeypatch.setattr(g, "_persist_extraction_signals", fail)
+    message = AsyncMock(spec=AbstractIncomingMessage)
+    await g.check_file_completion(_signal(), "artists", message)
+
+    message.ack.assert_not_awaited()
+    message.nack.assert_awaited_once_with(requeue=True)
+    assert g.extraction_complete_signals == latch.rows["20260101"] == {"artists"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_failure_does_not_publish_or_erase_signals(latch: FakeLatchStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A failed in-flight write leaves committed cache/state intact; redelivery fills the gap."""
+    persist = latch.persist
+
+    async def fail_labels(version: str, signals: set[str]) -> None:
+        if "labels" in signals:
+            await asyncio.sleep(0)
+            raise RuntimeError("labels write failed")
+        await persist(version, signals)
+
+    monkeypatch.setattr(g, "_persist_extraction_signals", fail_labels)
+    messages = {data_type: AsyncMock(spec=AbstractIncomingMessage) for data_type in g.DATA_TYPES}
+    with patch.object(g, "start_post_import_maintenance") as start:
+        await asyncio.gather(*(g.check_file_completion(_signal(), data_type, message) for data_type, message in messages.items()))
+        start.assert_not_called()
+        assert latch.rows["20260101"] == g.extraction_complete_signals == {"artists", "masters", "releases"}
+        messages["labels"].nack.assert_awaited_once_with(requeue=True)
+        messages["labels"].ack.assert_not_awaited()
+        monkeypatch.setattr(g, "_persist_extraction_signals", persist)
+        await g.check_file_completion(_signal(), "labels", messages["labels"])
+        start.assert_called_once()
+    assert latch.rows["20260101"] == set(g.DATA_TYPES)
+
+
+@pytest.mark.asyncio
+async def test_inflight_write_is_private_until_commit(latch: FakeLatchStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pause_write(version: str, signals: set[str]) -> None:
+        entered.set()
+        await release.wait()
+        await latch.persist(version, signals)
+
+    monkeypatch.setattr(g, "_persist_extraction_signals", pause_write)
+    message = AsyncMock(spec=AbstractIncomingMessage)
+    task = asyncio.create_task(g.check_file_completion(_signal(), "artists", message))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        assert g.extraction_complete_signals == set()
+        assert g.extraction_complete_version is None
+        message.ack.assert_not_awaited()
+    finally:
+        release.set()
+        await task
+    message.ack.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_failed_version_change_preserves_committed_cache(latch: FakeLatchStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    await g.check_file_completion(_signal(), "artists", AsyncMock(spec=AbstractIncomingMessage))
+    latch.rows["20260201"] = {"labels"}
+    monkeypatch.setattr(g, "_persist_extraction_signals", AsyncMock(side_effect=RuntimeError("write failed")))
+    message = AsyncMock(spec=AbstractIncomingMessage)
+
+    await g.check_file_completion(_signal("20260201"), "masters", message)
+
+    assert g.extraction_complete_version == "20260101"
+    assert g.extraction_complete_signals == {"artists"}
+    assert latch.rows["20260201"] == {"labels"}
+    message.ack.assert_not_awaited()
+    message.nack.assert_awaited_once_with(requeue=True)
+
+
+@pytest.mark.asyncio
+async def test_duplicate_concurrent_deliveries_are_idempotent(latch: FakeLatchStore) -> None:
+    messages = [AsyncMock(spec=AbstractIncomingMessage) for _ in range(4)]
+    with patch.object(g, "start_post_import_maintenance") as start:
+        await asyncio.gather(*(g.check_file_completion(_signal(), "artists", message) for message in messages))
+    assert latch.rows["20260101"] == g.extraction_complete_signals == {"artists"}
+    assert all(message.ack.await_count == 1 for message in messages)
+    start.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_overlapping_versions_use_their_own_maintenance_snapshot(latch: FakeLatchStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A version switch during consumer cancellation cannot change the first delivery's gate."""
+    latch.rows["20260101"] = {"artists", "labels", "masters"}
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pause_cancellation(_data_type: str, _queue: Any) -> None:
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(g, "queues", {"releases": object()})
+    monkeypatch.setattr(g, "CONSUMER_CANCEL_DELAY", 1)
+    monkeypatch.setattr(g, "schedule_consumer_cancellation", pause_cancellation)
+    with patch.object(g, "start_post_import_maintenance") as start:
+        first = asyncio.create_task(g.check_file_completion(_signal(), "releases", AsyncMock(spec=AbstractIncomingMessage)))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            await g.check_file_completion(_signal("20260201"), "artists", AsyncMock(spec=AbstractIncomingMessage))
+        finally:
+            release.set()
+            await first
+        start.assert_called_once()
+    assert latch.rows["20260101"] == set(g.DATA_TYPES)
+    assert latch.rows["20260201"] == {"artists"}
 
 
 @pytest.mark.asyncio
@@ -193,3 +343,34 @@ async def test_persist_writes_the_version_row(monkeypatch: pytest.MonkeyPatch) -
     cypher = session.run.await_args.args[0]
     assert "MERGE (m:ExtractionCompletion {version: $version})" in cypher
     assert session.run.await_args.kwargs["signals"] == ["artists", "labels"]
+    session.run.return_value.consume.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_commit_failure_requeues_without_publishing_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """session.run succeeding is not proof that the auto-commit write committed."""
+    session = AsyncMock()
+    session.run.return_value.consume.side_effect = RuntimeError("commit failed")
+    session_cm = AsyncMock()
+    session_cm.__aenter__.return_value = session
+    driver = AsyncMock()
+    driver.session = lambda **_kwargs: session_cm
+    monkeypatch.setattr(g, "graph", driver)
+    monkeypatch.setattr(g, "_persist_extraction_signals", _REAL_PERSIST)
+    message = AsyncMock(spec=AbstractIncomingMessage)
+
+    await g.check_file_completion(_signal(), "artists", message)
+
+    session.run.assert_awaited_once()
+    session.run.return_value.consume.assert_awaited_once()
+    assert g.extraction_complete_signals == set()
+    assert g.extraction_complete_version is None
+    message.ack.assert_not_awaited()
+    message.nack.assert_awaited_once_with(requeue=True)
+
+
+@pytest.mark.asyncio
+async def test_persist_requires_initialized_driver(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(g, "graph", None)
+    with pytest.raises(RuntimeError, match="driver is not initialized"):
+        await _REAL_PERSIST("20260101", {"artists"})
