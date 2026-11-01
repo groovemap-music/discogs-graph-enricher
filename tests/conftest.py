@@ -13,6 +13,7 @@ installs an in-memory TracerProvider so the `process` and `flush` spans can be r
 without a collector.
 """
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -380,3 +381,4 @@ def in_memory_extraction_latch(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(g, "_load_extraction_signals", load)
     monkeypatch.setattr(g, "_persist_extraction_signals", persist)
     monkeypatch.setattr(g, "extraction_complete_version", None)
+    monkeypatch.setattr(g, "extraction_latch_lock", asyncio.Lock(), raising=False)

@@ -975,7 +975,6 @@ class TestCheckFileCompletion:
             patch("graphinator.graphinator.queues", {"artists": mock_queue}),
             patch("graphinator.graphinator.CONSUMER_CANCEL_DELAY", 300),
             patch("graphinator.graphinator.schedule_consumer_cancellation", new=AsyncMock()) as mock_schedule,
-            patch("graphinator.graphinator._sync_extraction_signals", new=AsyncMock()),
             patch("graphinator.graphinator._persist_extraction_signals", new=AsyncMock()),
             patch("graphinator.graphinator.extraction_complete_signals", set()),
         ):
