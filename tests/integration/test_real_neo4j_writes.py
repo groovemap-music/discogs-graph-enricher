@@ -575,3 +575,59 @@ async def test_single_record_path_prunes_removed_credits(neo4j_driver: AsyncDriv
     await recount_credits(neo4j_driver)
 
     assert await credit_counts(neo4j_driver, "Flood") == expected(1, production=1)
+
+
+_REAL_MAINTENANCE_HELPERS = {
+    name: getattr(graphinator, name)
+    for name in (
+        "_is_extraction_maintained",
+        "_latest_extraction_version",
+        "_stamp_maintenance_success",
+        "_record_maintenance_failure",
+    )
+}
+
+
+@pytest.mark.asyncio
+async def test_maintained_at_stamp_on_real_neo4j(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stamp, failure record, idempotence and per-version independence in real Cypher."""
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    for name, fn in _REAL_MAINTENANCE_HELPERS.items():
+        monkeypatch.setattr(graphinator, name, fn)
+    monkeypatch.setattr(graphinator, "_load_extraction_signals", _LOAD_EXTRACTION_SIGNALS)
+    monkeypatch.setattr(graphinator, "_persist_extraction_signals", _PERSIST_EXTRACTION_SIGNALS)
+    signals = set(graphinator.DATA_TYPES)
+    await _PERSIST_EXTRACTION_SIGNALS("dump-1", signals)
+    await asyncio.sleep(0.01)
+    await _PERSIST_EXTRACTION_SIGNALS("dump-2", signals)
+
+    # Newest complete, unstamped version is the restart-resume candidate.
+    assert await graphinator._latest_extraction_version() == "dump-2"
+    assert await graphinator._is_extraction_maintained("dump-2") is False
+
+    # A failed pass records an error and no stamp; dump-1 is untouched.
+    await graphinator._record_maintenance_failure("dump-2", "boom")
+    row = await one(neo4j_driver, "MATCH (m:ExtractionCompletion {version: 'dump-2'}) RETURN m.maintained_at AS at, m.maintenance_error AS err")
+    assert row == {"at": None, "err": "boom"}
+    assert await graphinator._is_extraction_maintained("dump-1") is False
+
+    # Success stamps, clears the error, and is idempotent (first stamp wins).
+    await graphinator._stamp_maintenance_success("dump-2")
+    first = await one(neo4j_driver, "MATCH (m:ExtractionCompletion {version: 'dump-2'}) RETURN toString(m.maintained_at) AS at, m.maintenance_error AS err, m.signals AS signals")
+    assert first["at"] is not None and first["err"] is None and set(first["signals"]) == signals
+    await asyncio.sleep(0.01)
+    await graphinator._stamp_maintenance_success("dump-2")
+    second = await one(neo4j_driver, "MATCH (m:ExtractionCompletion {version: 'dump-2'}) RETURN toString(m.maintained_at) AS at")
+    assert second["at"] == first["at"]
+    assert await graphinator._is_extraction_maintained("dump-2") is True
+
+    # A later failure never unstamps; the other dump stays independent.
+    await graphinator._record_maintenance_failure("dump-2", "late")
+    assert await graphinator._is_extraction_maintained("dump-2") is True
+    assert await graphinator._is_extraction_maintained("dump-1") is False
+    stamped = await one(neo4j_driver, "MATCH (m:ExtractionCompletion) WHERE m.maintained_at IS NOT NULL RETURN count(m) AS n")
+    assert stamped["n"] == 1
+
+    # Stamping a version with no node fails loudly instead of pretending.
+    with pytest.raises(RuntimeError):
+        await graphinator._stamp_maintenance_success("never-seen")

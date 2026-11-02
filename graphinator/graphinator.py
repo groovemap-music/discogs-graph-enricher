@@ -657,6 +657,124 @@ async def _record_extraction_signal(version: str, data_type: str) -> set[str]:
         return set(candidate)
 
 
+MAINTENANCE_ERROR_MAX_CHARS = 500
+
+
+async def _is_extraction_maintained(version: str) -> bool:
+    """Return True when this version's ExtractionCompletion node carries maintained_at."""
+    if graph is None:
+        return False
+
+    async with graph.session(database="neo4j") as session:
+        result = await session.run(
+            """
+            MATCH (m:ExtractionCompletion {version: $version})
+            RETURN any(stamped IN collect(m.maintained_at IS NOT NULL) WHERE stamped) AS maintained
+            """,
+            version=version,
+        )
+        record = await result.single()
+    return bool(record and record["maintained"])
+
+
+async def _latest_extraction_version() -> str | None:
+    """Return the version of the most recently created ExtractionCompletion node."""
+    if graph is None:
+        return None
+
+    async with graph.session(database="neo4j") as session:
+        result = await session.run(
+            """
+            MATCH (m:ExtractionCompletion)
+            RETURN m.version AS version
+            ORDER BY coalesce(m.created_at, datetime({epochMillis: 0})) DESC
+            LIMIT 1
+            """
+        )
+        record = await result.single()
+    return None if record is None or record["version"] is None else str(record["version"])
+
+
+async def _stamp_maintenance_success(version: str) -> None:
+    """Stamp maintained_at on this version's node: the durable "graph is final" signal.
+
+    Idempotent: the first stamp wins (coalesce), so a re-run never moves it, and any
+    earlier maintenance_error is cleared. Only this version's node is touched, and only
+    maintenance_* properties — never `signals`, which stays owned by the latch writer.
+    Runs under extraction_latch_lock like every other write to this node.
+    """
+    if graph is None:
+        raise RuntimeError("Neo4j driver is not initialized")
+
+    async with extraction_latch_lock, graph.session(database="neo4j") as session:
+        result = await session.run(
+            """
+            MATCH (m:ExtractionCompletion {version: $version})
+            SET m.maintained_at = coalesce(m.maintained_at, datetime()),
+                m.maintenance_status = 'succeeded'
+            REMOVE m.maintenance_error, m.maintenance_failed_at
+            RETURN count(m) AS stamped
+            """,
+            version=version,
+        )
+        record = await result.single()
+        await result.consume()
+    if record is None or not record["stamped"]:
+        raise RuntimeError(f"No ExtractionCompletion node for version {version!r} to stamp")
+
+
+async def _record_maintenance_failure(version: str, error: str) -> None:
+    """Record a failed pass as maintenance_error. Never creates or moves maintained_at.
+
+    A node that is already stamped is left untouched: a later failure must not
+    contradict a completed run.
+    """
+    if graph is None:
+        raise RuntimeError("Neo4j driver is not initialized")
+
+    async with extraction_latch_lock, graph.session(database="neo4j") as session:
+        result = await session.run(
+            """
+            MATCH (m:ExtractionCompletion {version: $version})
+            WHERE m.maintained_at IS NULL
+            SET m.maintenance_status = 'failed',
+                m.maintenance_error = $error,
+                m.maintenance_failed_at = datetime()
+            """,
+            version=version,
+            error=error[:MAINTENANCE_ERROR_MAX_CHARS],
+        )
+        await result.consume()
+
+
+async def resume_pending_maintenance() -> bool:
+    """Re-run maintenance after a restart interrupted it. Returns True if one was started.
+
+    The fourth extraction_complete is acked before maintenance runs, so a restart
+    mid-maintenance leaves no queued message to retrigger it. The durable node is the
+    only record: if the NEWEST version has all four signals but no maintained_at,
+    maintenance never finished. Older versions are superseded by a newer dump and are
+    deliberately not resumed (maintenance sweeps the whole graph, so running it for a
+    stale version could race the newer import).
+    """
+    if graph is None:
+        return False
+    try:
+        version = await _latest_extraction_version()
+        if version is None:
+            return False
+        signals = await _load_extraction_signals(version)
+        if not signals.issuperset(DATA_TYPES) or await _is_extraction_maintained(version):
+            return False
+    except Exception as e:
+        logger.error("❌ Could not check for interrupted post-import maintenance", error=str(e))
+        return False
+
+    logger.info("♻️ Resuming interrupted post-import maintenance", version=version)
+    start_post_import_maintenance(version)
+    return True
+
+
 async def check_file_completion(data: dict[str, Any], data_type: str, message: AbstractIncomingMessage) -> bool:
     """Check if message is a file completion or extraction completion message."""
     if data.get("type") == "file_complete":
@@ -760,6 +878,24 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
             received=sorted(signals),
         )
 
+        # A redelivered final signal for a dump whose maintenance already finished
+        # must not re-sweep the graph. Check while the delivery is still unacked so a
+        # database error requeues it (the latch write is idempotent).
+        try:
+            already_maintained = await _is_extraction_maintained(version)
+        except Exception as e:
+            logger.error(
+                "❌ Could not read maintenance state — requeueing the signal",
+                version=version,
+                error=str(e),
+            )
+            await message.nack(requeue=True)
+            return True
+        if already_maintained:
+            logger.info("✅ Post-import maintenance already stamped for this version — skipping", version=version)
+            await message.ack()
+            return True
+
         # Ack the trigger BEFORE maintenance starts, never after. Post-import
         # maintenance is unbounded work — genre/style stats alone run ~10-30s per
         # node over 16 genres + ~757 styles, label stats cover ~2.3M labels, and
@@ -773,13 +909,13 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
 
         # Maintenance now runs detached with its own retry, because the AMQP
         # delivery is no longer available as a retry token.
-        start_post_import_maintenance()
+        start_post_import_maintenance(version)
         return True
 
     return False
 
 
-def start_post_import_maintenance() -> None:
+def start_post_import_maintenance(version: str | None = None) -> None:
     """Launch post-import maintenance as a detached, single-flight task.
 
     Single-flight matters: extraction_complete can be redelivered (consumer
@@ -793,22 +929,29 @@ def start_post_import_maintenance() -> None:
         logger.info("⏳ Post-import maintenance already running — ignoring duplicate trigger")
         return
 
-    task = asyncio.create_task(run_post_import_maintenance())
+    task = asyncio.create_task(run_post_import_maintenance(version))
     post_import_maintenance_task = task
     maintenance_tasks.add(task)
     task.add_done_callback(maintenance_tasks.discard)
 
 
-async def run_post_import_maintenance() -> bool:
+async def run_post_import_maintenance(version: str | None = None) -> bool:
     """Run stub cleanup, aggregate stats, and Person credit counts, retrying on failure.
 
     Detached from the extraction_complete delivery (which is acked immediately),
     so this owns the retry the nack/requeue used to provide. Every step is
     idempotent, so a retry re-runs the whole sweep safely.
 
+    When ``version`` is given, a successful pass stamps ``maintained_at`` on that
+    version's ExtractionCompletion node as its final step (a stamp that cannot be
+    written fails the attempt, so it is retried), and a run that fails every attempt
+    records ``maintenance_error`` instead. Shutdown records neither: the work is
+    simply unfinished and resume_pending_maintenance picks it up on restart.
+
     Returns:
         True if a full pass succeeded, False if every attempt failed.
     """
+    failure = "post-import maintenance failed"
     for attempt in range(1, POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS + 1):
         if shutdown_requested:
             logger.warning(
@@ -860,8 +1003,17 @@ async def run_post_import_maintenance() -> bool:
             # Discogs removed), so the counts reflect removals as well as additions.
             if maintenance_ok and graph is not None and not await compute_person_credit_counts():
                 maintenance_ok = False
+
+            if not maintenance_ok:
+                failure = "a maintenance step did not complete (see service logs)"
+
+            # Final step: the durable "graph is final for this dump" stamp. Written
+            # only after every sweep above succeeded.
+            if maintenance_ok and version is not None and graph is not None:
+                await _stamp_maintenance_success(version)
         except Exception as e:
             logger.error("❌ Post-import maintenance raised", attempt=attempt, error=str(e))
+            failure = f"{type(e).__name__}: {e}"
             maintenance_ok = False
 
         if maintenance_ok:
@@ -873,6 +1025,11 @@ async def run_post_import_maintenance() -> bool:
                 "❌ Post-import maintenance failed after every attempt — stub nodes, aggregate stats, and Person credit counts are stale until it is re-run",
                 attempts=attempt,
             )
+            if version is not None and graph is not None:
+                try:
+                    await _record_maintenance_failure(version, failure)
+                except Exception as e:
+                    logger.error("❌ Could not record maintenance_error", version=version, error=str(e))
             return False
 
         delay = POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
@@ -1848,6 +2005,10 @@ async def main() -> None:
         if BATCH_MODE and batch_processor is not None:
             batch_flush_task = asyncio.create_task(batch_processor.periodic_flush())
             logger.info("🔄 Started batch periodic flush task")
+
+        # A restart mid-maintenance loses the (already acked) trigger; the durable
+        # node says whether the newest dump still needs its maintenance pass.
+        await resume_pending_maintenance()
 
         # Start periodic queue checker task
         connection_check_task = asyncio.create_task(periodic_queue_checker())

@@ -16,7 +16,7 @@ The graph projector matches or merges these stable keys:
 | Medium | `id` |
 | MediaFamily | `name` |
 | Company | `id` |
-| ExtractionCompletion | `version` |
+| ExtractionCompletion | `version` (also carries `signals` and the `maintained_at` stamp; see [completion tracking](file-completion-tracking.md#maintenance-completion-stamp-maintained_at)) |
 
 The owning schema should provide the constraints and indexes appropriate to those
 lookups. The full deployed inventory is authoritative in `database-schema`; copying
