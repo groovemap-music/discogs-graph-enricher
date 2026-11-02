@@ -613,7 +613,10 @@ async def test_maintained_at_stamp_on_real_neo4j(neo4j_driver: AsyncDriver, monk
 
     # Success stamps, clears the error, and is idempotent (first stamp wins).
     await graphinator._stamp_maintenance_success("dump-2")
-    first = await one(neo4j_driver, "MATCH (m:ExtractionCompletion {version: 'dump-2'}) RETURN toString(m.maintained_at) AS at, m.maintenance_error AS err, m.signals AS signals")
+    first = await one(
+        neo4j_driver,
+        "MATCH (m:ExtractionCompletion {version: 'dump-2'}) RETURN toString(m.maintained_at) AS at, m.maintenance_error AS err, m.signals AS signals",
+    )
     assert first["at"] is not None and first["err"] is None and set(first["signals"]) == signals
     await asyncio.sleep(0.01)
     await graphinator._stamp_maintenance_success("dump-2")
