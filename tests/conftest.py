@@ -380,5 +380,8 @@ def in_memory_extraction_latch(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(g, "_load_extraction_signals", load)
     monkeypatch.setattr(g, "_persist_extraction_signals", persist)
+    monkeypatch.setattr(g, "_is_extraction_maintained", AsyncMock(return_value=False))
+    monkeypatch.setattr(g, "_stamp_maintenance_success", AsyncMock(return_value=None))
+    monkeypatch.setattr(g, "_record_maintenance_failure", AsyncMock(return_value=None))
     monkeypatch.setattr(g, "extraction_complete_version", None)
     monkeypatch.setattr(g, "extraction_latch_lock", asyncio.Lock(), raising=False)
