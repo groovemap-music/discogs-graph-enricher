@@ -39,3 +39,9 @@ def test_read_checkpoint(tmp_path: object) -> None:
     assert read_checkpoint(base / "c") == 12
     (base / "c").write_text("junk")
     assert read_checkpoint(base / "c") == 0
+
+
+def test_parse_line_keeps_quotes_backslashes_and_non_ascii_from_the_psql_export() -> None:
+    # Verbatim output of `psql -At -f scripts/stub-name-export.sql` for such a name.
+    line = '{"id": "11358", "kind": "Label", "name": "RCA \\"Victor\\" \\\\ Ünï 日本"}'
+    assert parse_line(line) == ("Label", {"id": "11358", "name": 'RCA "Victor" \\ Ünï 日本'})

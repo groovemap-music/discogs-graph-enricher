@@ -16,21 +16,20 @@ The projection (batch and single-record paths) now sets the name when it creates
 Stubs created earlier have `name = null`, and a re-import does not repair them (the release
 hash gate skips unchanged releases). The names are in the release data, so the backfill reads
 them from an NDJSON file, one `{"kind": "Label"|"Artist", "id": "...", "name": "..."}` per
-distinct entity, e.g. from the `releases` table in Postgres (`data` is the release JSON):
+distinct entity, exported from the `releases` table in Postgres (`data` is the release JSON,
+e.g. `labels = [{"id": "11358", "name": "RCA Victor", "catno": "104037"}]`):
 
-```sql
-\copy (
-  SELECT json_build_object('kind', 'Label', 'id', l->>'id', 'name', l->>'name')
-  FROM (SELECT DISTINCT ON (l->>'id') l
-        FROM releases, jsonb_array_elements(data->'labels') l
-        WHERE l->>'name' IS NOT NULL ORDER BY l->>'id') s(l)
-  UNION ALL
-  SELECT json_build_object('kind', 'Artist', 'id', a->>'id', 'name', a->>'name')
-  FROM (SELECT DISTINCT ON (a->>'id') a
-        FROM releases, jsonb_array_elements(data->'artists') a
-        WHERE a->>'name' IS NOT NULL ORDER BY a->>'id') s(a)
-) TO 'stub-names.ndjson'
+```sh
+psql -X -At -f scripts/stub-name-export.sql -o stub-names.ndjson
 ```
+
+Use `psql -At` (unaligned, tuples only), not `\copy`: COPY's text format doubles backslashes
+and so breaks the JSON for any name containing a quote or backslash. The script
+(`scripts/stub-name-export.sql`) skips rows whose `labels`/`artists` is not an array, so one
+odd row cannot abort the export. It only reads `data->'labels'` and `data->'artists'`.
+
+The export reads only what is already in Postgres, so run it after the SQL load has finished.
+Releases not loaded yet contribute no names, and their stubs would stay nameless.
 
 Run it in the service image (same `NEO4J_*` environment as the service):
 
