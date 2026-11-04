@@ -843,6 +843,74 @@ async def test_genre_style_label_stats_are_computed_by_paged_statements(neo4j_dr
     assert l3 == {"rc": 0, "ac": 0, "gc": 0}
 
 
+_ORACLE_METRICS = {
+    "release_count": "MATCH (n)<-[:IS]-(r:Release) RETURN count(DISTINCT r) AS v",
+    "artist_count": "MATCH (n)<-[:IS]-(r:Release)-[:BY]->(a:Artist) RETURN count(DISTINCT a) AS v",
+    "label_count": "MATCH (n)<-[:IS]-(r:Release)-[:ON]->(l:Label) RETURN count(DISTINCT l) AS v",
+    "style_count": "MATCH (n)<-[:IS]-(r:Release)-[:IS]->(o:Style) RETURN count(DISTINCT o) AS v",
+    "genre_count": "MATCH (n)<-[:IS]-(r:Release)-[:IS]->(o:Genre) RETURN count(DISTINCT o) AS v",
+    "first_year": "MATCH (n)<-[:IS]-(r:Release) WHERE r.year > 0 RETURN min(r.year) AS v",
+}
+
+
+@pytest.mark.asyncio
+async def test_shared_traversal_genre_style_metrics_equal_the_separate_distinct_queries(neo4j_driver: AsyncDriver) -> None:
+    """The grouped statements give exactly what the one-aggregate-per-statement originals gave.
+
+    A varied graph: releases with no artist, no label, several of each, years of 0, a Master
+    that also has IS edges (it is not a Release, so it must not count), and nodes nothing is
+    tagged with.
+    """
+    async with neo4j_driver.session(database="neo4j") as session:
+        for statement in (
+            "UNWIND range(1, 12) AS g CREATE (:Genre {name: 'G' + g})",
+            "UNWIND range(1, 25) AS s CREATE (:Style {name: 'S' + s})",
+            "UNWIND range(1, 9) AS a CREATE (:Artist {id: 'A' + a})",
+            "UNWIND range(1, 7) AS l CREATE (:Label {id: 'L' + l})",
+        ):
+            await session.run(statement)
+        await session.run(
+            """
+            UNWIND range(1, 120) AS i
+            CREATE (r:Release {id: 'R' + i, year: CASE WHEN i % 7 = 0 THEN 0 ELSE 1950 + i % 60 END})
+            WITH r, i
+            CALL (r, i) { UNWIND range(0, i % 3) AS k MATCH (g:Genre {name: 'G' + (1 + (i + k * 5) % 12)}) MERGE (r)-[:IS]->(g) }
+            CALL (r, i) { UNWIND range(0, i % 4) AS k MATCH (s:Style {name: 'S' + (1 + (i * 3 + k * 7) % 25)}) MERGE (r)-[:IS]->(s) }
+            CALL (r, i) { UNWIND (CASE WHEN i % 5 = 0 THEN [] ELSE range(0, i % 3) END) AS k MATCH (a:Artist {id: 'A' + (1 + (i + k) % 9)}) MERGE (r)-[:BY]->(a) }
+            CALL (r, i) { UNWIND (CASE WHEN i % 6 = 0 THEN [] ELSE range(0, i % 2) END) AS k MATCH (l:Label {id: 'L' + (1 + (i + k) % 7)}) MERGE (r)-[:ON]->(l) }
+            """
+        )
+        await session.run(
+            "CREATE (m:Master {id: 'M1'}) WITH m MATCH (g:Genre {name: 'G1'}), (s:Style {name: 'S1'}) CREATE (m)-[:IS]->(g), (m)-[:IS]->(s)"
+        )
+
+    async def run_all(node: str) -> dict[str, dict[str, Any]]:
+        got: dict[str, dict[str, Any]] = {}
+        async with neo4j_driver.session(database="neo4j") as session:
+            rows = await (await session.run(f"MATCH (n:{node}) RETURN n.name AS name ORDER BY name")).data()
+            for name in (row["name"] for row in rows):
+                for cypher, _ in graphinator.build_node_stat_statements(node):
+                    await (await session.run(cypher, key=name)).consume()
+                expected_props: dict[str, Any] = {}
+                for prop, query in _ORACLE_METRICS.items():
+                    if prop == ("genre_count" if node == "Genre" else "style_count"):
+                        continue
+                    record = await (await session.run(f"MATCH (n:{node} {{name: $key}}) CALL {{ WITH n {query} }} RETURN v", key=name)).single()
+                    expected_props[prop] = record["v"]
+                actual = await (await session.run(f"MATCH (n:{node} {{name: $key}}) RETURN properties(n) AS p", key=name)).single()
+                got[name] = {prop: actual["p"].get(prop) for prop in expected_props} | {"__expected__": expected_props}
+        return got
+
+    for node in ("Genre", "Style"):
+        results = await run_all(node)
+        assert results, node
+        for name, row in results.items():
+            expected_props = row.pop("__expected__")
+            assert row == expected_props, f"{node} {name}"
+        # The graph exercises real values, not only zeros.
+        assert any(row["artist_count"] and row["label_count"] for row in results.values())
+
+
 # --- names carried by release references (stub nodes) ------------------------------------
 
 

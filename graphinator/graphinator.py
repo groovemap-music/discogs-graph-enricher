@@ -1089,24 +1089,38 @@ LABEL_STATS_PAGE_SIZE = 100
 _maintenance_run_key: contextvars.ContextVar[str | None] = contextvars.ContextVar("maintenance_run_key", default=None)
 
 
-def _node_stat_metrics(node: str) -> list[tuple[str, str]]:
-    """Return ``(property, Cypher body)`` per aggregate of a Genre/Style node ``n``.
+def _node_stat_metrics(node: str) -> list[tuple[tuple[str, ...], str]]:
+    """Return ``(properties, Cypher body)`` per statement of a Genre/Style node ``n``.
 
-    Each body is a subquery returning ``v``; each becomes its own statement and
-    transaction. The node is Genre or Style, and the "other" taxonomy is counted.
+    Each body is a subquery returning ``v0, v1, ...``, one column per property, and
+    each becomes its own statement and transaction. The node is Genre or Style, and the
+    "other" taxonomy is counted.
+
+    ``release_count`` is ``count(r)``, not ``count(DISTINCT r)``: the ``IS`` edge is
+    ``MERGE``d, so a release has at most one edge to a node (checked live on Rock, Pop,
+    Electronic, Folk/World/Country and Jazz: edges equal distinct releases), and the
+    distinct set only cost memory (286 MB for Rock). ``artist_count``, ``label_count``
+    and the other taxonomy's count share ONE expansion of each release: the cost of a
+    release is walking its relationship chain, which three separate statements did three
+    times over.
     """
     other_label, other_prop = ("Style", "style_count") if node == "Genre" else ("Genre", "genre_count")
     return [
-        ("release_count", "MATCH (n)<-[:IS]-(r:Release) RETURN count(DISTINCT r) AS v"),
-        ("artist_count", "MATCH (n)<-[:IS]-(r:Release)-[:BY]->(a:Artist) RETURN count(DISTINCT a) AS v"),
-        ("label_count", "MATCH (n)<-[:IS]-(r:Release)-[:ON]->(l:Label) RETURN count(DISTINCT l) AS v"),
-        (other_prop, f"MATCH (n)<-[:IS]-(r:Release)-[:IS]->(o:{other_label}) RETURN count(DISTINCT o) AS v"),
-        ("first_year", "MATCH (n)<-[:IS]-(r:Release) WHERE r.year > 0 RETURN min(r.year) AS v"),
+        (("release_count",), "MATCH (n)<-[:IS]-(r:Release) RETURN count(r) AS v0"),
+        (
+            ("artist_count", "label_count", other_prop),
+            f"""MATCH (n)<-[:IS]-(r:Release)
+                OPTIONAL MATCH (r)-[x:BY|ON|IS]->(t)
+                RETURN count(DISTINCT CASE WHEN type(x) = 'BY' AND t:Artist THEN t END) AS v0,
+                    count(DISTINCT CASE WHEN type(x) = 'ON' AND t:Label THEN t END) AS v1,
+                    count(DISTINCT CASE WHEN type(x) = 'IS' AND t:{other_label} THEN t END) AS v2""",
+        ),
+        (("first_year",), "MATCH (n)<-[:IS]-(r:Release) WHERE r.year > 0 RETURN min(r.year) AS v0"),
     ]
 
 
 def build_node_stat_statements(node: str) -> list[tuple[str, dict[str, Any]]]:
-    """Return one ``(cypher, params)`` statement per aggregate of a Genre/Style node."""
+    """Return one ``(cypher, params)`` statement per group of aggregates of a Genre/Style node."""
     return [
         (
             f"""
@@ -1115,11 +1129,11 @@ def build_node_stat_statements(node: str) -> list[tuple[str, dict[str, Any]]]:
                 WITH n
                 {body}
             }}
-            SET n.{prop} = v
+            SET {", ".join(f"n.{prop} = v{i}" for i, prop in enumerate(props))}
             """,
             {},
         )
-        for prop, body in _node_stat_metrics(node)
+        for props, body in _node_stat_metrics(node)
     ]
 
 

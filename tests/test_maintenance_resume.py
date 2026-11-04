@@ -66,13 +66,20 @@ def test_label_page_is_bounded_and_keyed() -> None:
     assert "IN TRANSACTIONS" not in cypher
 
 
-def test_genre_style_metrics_are_one_statement_each() -> None:
-    """No statement carries more than one aggregate of one node."""
+def test_genre_style_metrics_are_grouped_by_what_they_share() -> None:
+    """The three counts that walk the same release chain share one statement; the others stay apart."""
     for node in ("Genre", "Style"):
+        other = "style_count" if node == "Genre" else "genre_count"
         statements = g.build_node_stat_statements(node)
-        props = [cypher.split("SET n.")[1].split(" =")[0] for cypher, _ in statements]
-        assert props == ["release_count", "artist_count", "label_count", "style_count" if node == "Genre" else "genre_count", "first_year"]
-        assert all(cypher.count("SET n.") == 1 for cypher, _ in statements)
+        sets = [cypher.split("SET ")[1].strip() for cypher, _ in statements]
+        assert sets == [
+            "n.release_count = v0",
+            f"n.artist_count = v0, n.label_count = v1, n.{other} = v2",
+            "n.first_year = v0",
+        ]
+        # release_count needs no DISTINCT set: the IS edge is MERGEd, one per release/node pair.
+        assert "count(r) AS v0" in statements[0][0]
+        assert "DISTINCT" not in statements[0][0]
 
 
 @pytest.mark.asyncio
@@ -240,7 +247,9 @@ async def test_genre_and_style_stats_run_every_metric_for_every_node() -> None:
         assert await g.compute_genre_style_stats() is True
 
     assert sorted({k for k, _ in graph.metric_sets}) == ["Jazz", "Punk", "Rock"]
-    assert len([1 for k, _ in graph.metric_sets if k == "Rock"]) == 5
+    assert sorted(p for k, p in graph.metric_sets if k == "Rock") == sorted(
+        ["release_count", "artist_count", "label_count", "style_count", "first_year"]
+    )
     assert set(graph.checkpoints) == {"genre_stats", "style_stats", "label_stats"}
 
 
