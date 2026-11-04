@@ -73,6 +73,9 @@ STUCK_CHECK_INTERVAL=30             # Seconds between stuck-state checks (defaul
 STARTUP_IDLE_TIMEOUT=30             # Seconds after startup with no messages before idle mode (default: 30)
 IDLE_LOG_INTERVAL=300               # Seconds between idle status logs (default: 300)
 
+# Post-import maintenance
+MAINTENANCE_TRANSACTION_TIMEOUT_SECONDS=  # Optional client transaction timeout per maintenance statement (default: unset, the server's db.transaction.timeout applies). Backstop only: the aggregate sweeps are keyed pages and checkpointed, so they do not depend on it.
+
 # Logging
 LOG_LEVEL=INFO                      # Logging level (default: INFO)
 LOG_FILE=                           # Log file path override (default: /logs/discogs-graph-enricher.log; empty disables the file; console fallback with one warning if unwritable)

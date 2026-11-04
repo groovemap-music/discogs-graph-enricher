@@ -386,9 +386,9 @@ async def test_maintenance_sweeps_the_sentinel_master_between_stub_cleanup_and_s
 
 
 @pytest.mark.asyncio
-async def test_failed_sentinel_master_sweep_fails_maintenance_and_skips_stats() -> None:
-    """A failed sweep is retried like a failed stub cleanup, and the stats are not
-    computed over a graph that still carries the sentinel node."""
+async def test_failed_sentinel_master_sweep_fails_maintenance_without_skipping_stats() -> None:
+    """A failed sweep is retried like a failed stub cleanup. The stats count Release
+    IS/BY/ON edges, which the sentinel Master does not touch, so they still run."""
     sentinel_attempts = {"n": 0}
 
     async def failing_sentinel() -> bool:
@@ -409,4 +409,4 @@ async def test_failed_sentinel_master_sweep_fails_maintenance_and_skips_stats() 
 
     assert ok is False
     assert sentinel_attempts["n"] == g.POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS
-    stats.assert_not_awaited()
+    assert stats.await_count == g.POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS

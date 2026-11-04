@@ -636,6 +636,86 @@ async def test_maintained_at_stamp_on_real_neo4j(neo4j_driver: AsyncDriver, monk
         await graphinator._stamp_maintenance_success("never-seen")
 
 
+@pytest.mark.asyncio
+async def test_paged_person_recount_resumes_from_its_committed_cursor(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real Cypher: pages of one person, a crash after two pages, a resume that finishes."""
+    await import_releases(
+        Neo4jBatchProcessor(neo4j_driver),
+        credited_release("R1", "r1-a", ("Alpha", "Producer"), ("Bravo", "Mixed By"), ("Charlie", "Bass"), ("Delta", "Mastered By")),
+    )
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "PERSON_CREDIT_COUNT_BATCH_SIZE", 1)
+    token = graphinator._maintenance_run_key.set("integration-run")
+    try:
+        real_run = graphinator.maintenance_paging.run_statement
+        pages = {"n": 0}
+
+        async def crash_on_third_page(graph: Any, cypher: str, **params: Any) -> Any:
+            if "MATCH (p:Person)" in cypher:
+                pages["n"] += 1
+                if pages["n"] == 3:
+                    raise RuntimeError("connection lost")
+            return await real_run(graph, cypher, **params)
+
+        monkeypatch.setattr(graphinator.maintenance_paging, "run_statement", crash_on_third_page)
+        assert await graphinator.compute_person_credit_counts() is False
+        checkpoint = await one(
+            neo4j_driver, "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.cursor AS cursor, c.done AS done"
+        )
+        assert checkpoint == {"cursor": "Bravo", "done": False}
+        assert (await credit_counts(neo4j_driver, "Charlie"))["credit_count"] is None, "not yet reached"
+
+        monkeypatch.setattr(graphinator.maintenance_paging, "run_statement", real_run)
+        assert await graphinator.compute_person_credit_counts() is True
+    finally:
+        graphinator._maintenance_run_key.reset(token)
+
+    for name, extra in (("Alpha", {"production": 1}), ("Bravo", {"engineering": 1}), ("Charlie", {"session": 1}), ("Delta", {"mastering": 1})):
+        assert await credit_counts(neo4j_driver, name) == expected(1, **extra)
+    done = await one(neo4j_driver, "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.done AS done")
+    assert done == {"done": True}
+
+
+@pytest.mark.asyncio
+async def test_genre_style_label_stats_are_computed_by_paged_statements(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Real Cypher for the Genre/Style per-metric statements and the Label page."""
+    async with neo4j_driver.session(database="neo4j") as session:
+        await session.run(
+            """
+            CREATE (rock:Genre {name: 'Rock'}), (jazz:Genre {name: 'Jazz'}), (punk:Style {name: 'Punk'}),
+                   (l1:Label {id: 'L1'}), (l2:Label {id: 'L2'}), (l3:Label {id: 'L3'}),
+                   (a1:Artist {id: 'A1'}), (a2:Artist {id: 'A2'}),
+                   (r1:Release {id: 'R1', year: 1977}), (r2:Release {id: 'R2', year: 1980}), (r3:Release {id: 'R3', year: 0}),
+                   (r1)-[:IS]->(rock), (r1)-[:IS]->(punk), (r1)-[:BY]->(a1), (r1)-[:ON]->(l1),
+                   (r2)-[:IS]->(rock), (r2)-[:BY]->(a2), (r2)-[:ON]->(l1), (r2)-[:ON]->(l2),
+                   (r3)-[:IS]->(rock), (r3)-[:IS]->(jazz), (r3)-[:BY]->(a1), (r3)-[:ON]->(l2)
+            """
+        )
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "LABEL_STATS_PAGE_SIZE", 2)
+    token = graphinator._maintenance_run_key.set("integration-run")
+    try:
+        assert await graphinator.compute_genre_style_stats() is True
+        # A second pass of the same run recomputes nothing and still succeeds.
+        assert await graphinator.compute_genre_style_stats() is True
+    finally:
+        graphinator._maintenance_run_key.reset(token)
+
+    rock = await one(
+        neo4j_driver,
+        "MATCH (g:Genre {name: 'Rock'}) RETURN g.release_count AS rc, g.artist_count AS ac, g.label_count AS lc, g.style_count AS sc, g.first_year AS fy",
+    )
+    assert rock == {"rc": 3, "ac": 2, "lc": 2, "sc": 1, "fy": 1977}
+    punk = await one(neo4j_driver, "MATCH (s:Style {name: 'Punk'}) RETURN s.release_count AS rc, s.genre_count AS gc, s.first_year AS fy")
+    assert punk == {"rc": 1, "gc": 1, "fy": 1977}
+    l2 = await one(neo4j_driver, "MATCH (l:Label {id: 'L2'}) RETURN l.release_count AS rc, l.artist_count AS ac, l.genre_count AS gc")
+    assert l2 == {"rc": 2, "ac": 2, "gc": 2}
+    l3 = await one(neo4j_driver, "MATCH (l:Label {id: 'L3'}) RETURN l.release_count AS rc, l.artist_count AS ac, l.genre_count AS gc")
+    assert l3 == {"rc": 0, "ac": 0, "gc": 0}
+
+
 # --- names carried by release references (stub nodes) ------------------------------------
 
 

@@ -19,7 +19,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from common.credit_roles import ALL_CATEGORIES
-from neo4j.exceptions import Neo4jError
 
 import graphinator.graphinator as g
 from graphinator import person_credits
@@ -27,11 +26,12 @@ from graphinator.batch_processor import Neo4jBatchProcessor, PendingMessage
 from graphinator.person_credits import (
     CREDIT_COUNT_PROPERTIES,
     PRUNE_CREDITED_ON_CYPHER,
-    build_credit_count_cypher,
+    build_credit_count_page_cypher,
     credit_count_property,
     credited_on_prune_record,
     person_credit_rows,
 )
+from tests.fake_paged_graph import FakePagedGraph
 from tests.test_batch_processor import create_async_result_mock, create_async_session_mock
 
 
@@ -43,40 +43,6 @@ def test_properties_follow_the_shared_category_vocabulary() -> None:
     assert person_credits.ALL_CATEGORIES is ALL_CATEGORIES, "the vocabulary must be imported, not copied"
     assert ("credit_count", *(f"credit_count_{category}" for category in ALL_CATEGORIES)) == CREDIT_COUNT_PROPERTIES
     assert credit_count_property("mastering") == "credit_count_mastering"
-
-
-def test_recompute_writes_every_property_on_every_person() -> None:
-    """A lost category is rewritten to 0, never left at its old value or skipped."""
-    cypher = build_credit_count_cypher(1000)
-    for prop in CREDIT_COUNT_PROPERTIES:
-        assert re.search(rf"\bp\.{prop} = ", cypher), f"{prop} must be SET on every person"
-    # OPTIONAL MATCH: a person whose credits were all pruned still gets its zeros.
-    assert "OPTIONAL MATCH (p)-[c:CREDITED_ON]->(r:Release)" in cypher
-    for category in ALL_CATEGORIES:
-        assert f"sum(CASE WHEN '{category}' IN categories THEN 1 ELSE 0 END) AS count_{category}" in cypher
-    assert "REMOVE" not in cypher
-
-
-def test_recompute_counts_distinct_releases_not_edges() -> None:
-    """Two roles on one release (Producer + Executive Producer, or Producer + Mixed By)
-    are two CREDITED_ON edges. The edges are grouped per release before counting, so the
-    release counts once in the total and once in each category it carries."""
-    cypher = build_credit_count_cypher(1000)
-    group = cypher.index("WITH p, r, collect(DISTINCT c.category) AS categories")
-    total = cypher.index("count(r) AS total")
-    assert group < total, "edges must be grouped per release before they are counted"
-    assert "count(c)" not in cypher
-
-
-def test_recompute_driving_match_is_outside_the_transactional_subquery() -> None:
-    """Same regression as the Genre/Style/Label stats: a driving MATCH inside the CALL
-    gives the subquery a single input row, so the whole recompute runs in ONE
-    transaction — exactly the unbounded working set the batching exists to prevent."""
-    cypher = build_credit_count_cypher(250)
-    assert cypher.index("MATCH (p:Person)") < cypher.index("CALL {")
-    after_call = cypher[cypher.index("CALL {") + len("CALL {") :]
-    assert after_call.strip().startswith("WITH p")
-    assert re.search(r"\} IN TRANSACTIONS OF 250 ROWS", cypher)
 
 
 def test_recompute_batch_size_is_bounded() -> None:
@@ -178,100 +144,6 @@ async def test_single_record_path_prunes_a_release_that_lost_every_credit() -> N
 # ── The maintenance step ─────────────────────────────────────────────────────
 
 
-def _pressure_graph(fail_times: int) -> tuple[MagicMock, list[str]]:
-    """Graph mock whose first ``fail_times`` runs raise MemoryPoolOutOfMemoryError."""
-    run_calls: list[str] = []
-
-    class _Result:
-        async def consume(self) -> MagicMock:
-            summary = MagicMock()
-            summary.counters = "properties_set=8"
-            return summary
-
-    class _Session:
-        async def __aenter__(self) -> _Session:
-            return self
-
-        async def __aexit__(self, *args: Any) -> None:
-            return None
-
-        async def run(self, cypher: str, *_args: Any, **_kwargs: Any) -> _Result:
-            run_calls.append(cypher)
-            if len(run_calls) <= fail_times:
-                raise Neo4jError._hydrate_neo4j(
-                    code="Neo.TransientError.General.MemoryPoolOutOfMemoryError",
-                    message="using 16.0 GiB of 16.0 GiB dbms.memory.transaction.total.max",
-                )
-            return _Result()
-
-    graph_mock = MagicMock()
-    graph_mock.session = MagicMock(return_value=_Session())
-    return graph_mock, run_calls
-
-
-def _batch_sizes(run_calls: list[str]) -> list[int]:
-    return [int(re.search(r"IN TRANSACTIONS OF (\d+) ROWS", c).group(1)) for c in run_calls]  # type: ignore[union-attr]
-
-
-@pytest.fixture
-def no_waits() -> Any:
-    with (
-        patch.object(g, "MAINTENANCE_SETTLE_SECONDS", 0.0),
-        patch.object(g, "MAINTENANCE_RETRY_BASE_DELAY_SECONDS", 0.0),
-    ):
-        yield
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("no_waits")
-async def test_compute_runs_the_batched_recompute() -> None:
-    graph_mock, run_calls = _pressure_graph(fail_times=0)
-    with patch.object(g, "graph", graph_mock):
-        assert await g.compute_person_credit_counts() is True
-
-    assert len(run_calls) == 1
-    assert run_calls[0] == build_credit_count_cypher(g.PERSON_CREDIT_COUNT_BATCH_SIZE)
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("no_waits")
-async def test_compute_retries_with_halved_batches_under_memory_pressure() -> None:
-    graph_mock, run_calls = _pressure_graph(fail_times=2)
-    with patch.object(g, "graph", graph_mock):
-        assert await g.compute_person_credit_counts() is True
-
-    size = g.PERSON_CREDIT_COUNT_BATCH_SIZE
-    assert _batch_sizes(run_calls) == [size, size // 2, size // 4]
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("no_waits")
-async def test_compute_reports_failure_when_retries_exhaust() -> None:
-    graph_mock, run_calls = _pressure_graph(fail_times=99)
-    with patch.object(g, "graph", graph_mock):
-        assert await g.compute_person_credit_counts() is False
-
-    assert len(run_calls) == g.MAINTENANCE_MAX_ATTEMPTS
-    assert all(size >= g.MAINTENANCE_MIN_BATCH_SIZE for size in _batch_sizes(run_calls))
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("no_waits")
-async def test_compute_reports_a_non_transient_error_without_retrying() -> None:
-    session = AsyncMock()
-    session.run = AsyncMock(side_effect=RuntimeError("syntax error"))
-    session_ctx = AsyncMock()
-    session_ctx.__aenter__ = AsyncMock(return_value=session)
-    session_ctx.__aexit__ = AsyncMock(return_value=False)
-    graph_mock = MagicMock()
-    graph_mock.session = MagicMock(return_value=session_ctx)
-
-    with patch.object(g, "graph", graph_mock), patch.object(g, "logger"):
-        assert await g.compute_person_credit_counts() is False
-
-    assert session.run.await_count == 1
-
-
 @pytest.mark.asyncio
 async def test_compute_is_a_no_op_without_a_driver() -> None:
     with patch.object(g, "graph", None):
@@ -280,20 +152,39 @@ async def test_compute_is_a_no_op_without_a_driver() -> None:
 
 @pytest.mark.asyncio
 async def test_compute_lets_the_pool_settle_after_the_stats_sweep() -> None:
-    graph_mock, _ = _pressure_graph(fail_times=0)
     sleeps: list[float] = []
 
     async def record_sleep(seconds: float) -> None:
         sleeps.append(seconds)
 
     with (
-        patch.object(g, "graph", graph_mock),
+        patch.object(g, "graph", FakePagedGraph(persons=["a"])),
         patch.object(g, "MAINTENANCE_SETTLE_SECONDS", 7.5),
         patch.object(g.asyncio, "sleep", record_sleep),
     ):
         assert await g.compute_person_credit_counts() is True
 
     assert sleeps == [7.5]
+
+
+def test_recompute_writes_every_property_on_every_person() -> None:
+    """A lost category is rewritten to 0, never left at its old value or skipped."""
+    cypher = build_credit_count_page_cypher()
+    for prop in CREDIT_COUNT_PROPERTIES:
+        assert re.search(rf"\bp\.{prop} = ", cypher), f"{prop} must be SET on every person"
+    # OPTIONAL MATCH: a person whose credits were all pruned still gets its zeros.
+    assert "OPTIONAL MATCH (p)-[c:CREDITED_ON]->(r:Release)" in cypher
+    for category in ALL_CATEGORIES:
+        assert f"sum(CASE WHEN '{category}' IN categories THEN 1 ELSE 0 END) AS count_{category}" in cypher
+    assert "REMOVE" not in cypher
+
+
+def test_recompute_counts_distinct_releases_not_edges() -> None:
+    """Two roles on one release are two CREDITED_ON edges; they are grouped per release
+    before counting, so the release counts once in the total and once per category."""
+    cypher = build_credit_count_page_cypher()
+    assert cypher.index("WITH p, r, collect(DISTINCT c.category) AS categories") < cypher.index("count(r) AS total")
+    assert "count(c)" not in cypher
 
 
 @pytest.mark.asyncio
@@ -339,16 +230,19 @@ async def test_failed_credit_recount_fails_the_pass_and_is_retried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_credit_recount_is_skipped_when_the_stats_sweep_fails() -> None:
+async def test_credit_recount_still_runs_when_the_stats_sweep_fails() -> None:
+    """Independent steps: a failed stats sweep fails the pass but does not skip the recount."""
     credits = AsyncMock(return_value=True)
     with (
         patch.object(g, "graph", AsyncMock()),
+        patch.object(g, "batch_processor", None),
         patch.object(g, "cleanup_all_stub_nodes", AsyncMock(return_value=True)),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=False)),
         patch.object(g, "compute_person_credit_counts", credits),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
+        patch.object(g, "logger"),
     ):
         assert await g.run_post_import_maintenance() is False
 
-    credits.assert_not_awaited()
+    assert credits.await_count == g.POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS
