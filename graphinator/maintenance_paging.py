@@ -5,13 +5,17 @@ Why this exists
 The Genre/Style/Label stats and the Person credit-count recompute used to be one
 Cypher statement each (``CALL { } IN TRANSACTIONS``). ``IN TRANSACTIONS`` commits the
 inner work in chunks, but the statement as a whole is still ONE query on ONE outer
-transaction, so the server's ``db.transaction.timeout`` (``120s`` in the base compose
-file, ``600s`` in the production overlay, set on the server in
-``deployment/docker-compose*.yml``; nothing in this repo or ``python-libraries`` sets a
-client-side transaction timeout) bounded the entire sweep. At full-graph size that
-sweep is hours of work, so every attempt ended in
-``Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration`` and a retry of
-the identical statement could only fail the same way.
+transaction, so the server's ``db.transaction.timeout`` bounded the entire sweep. It is
+set on the server in ``deployment/docker-compose*.yml`` (``120s`` base file, ``600s``
+production overlay, which lux runs); nothing in this repo or ``python-libraries`` sets a
+client-side transaction timeout.
+
+Measured on the real graph on lux (600s limit), the old single statements took: Genre
+2m16s, Style about 9m35s (close to the limit), Label 2m12s (7.3M properties set), and
+Person credit counts hit the limit at exactly 600s on both attempts
+(``Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration``). So Person is
+the step that failed outright and Style was a near miss that grows with the graph; a
+retry of the identical statement can only fail the same way.
 
 The sweep is now shaped as many short statements instead:
 

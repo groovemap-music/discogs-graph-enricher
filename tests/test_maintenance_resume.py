@@ -348,3 +348,25 @@ async def test_retry_after_a_failed_step_resumes_instead_of_restarting() -> None
     assert [n for page in graph.person_pages for n in page] == NAMES, "no person redone, none missed"
     assert [k for k, p in graph.metric_sets if p == "release_count"] == ["Rock", "Punk"], "stats were not recomputed on the retry"
     stamp.assert_awaited_once_with("2026-11")
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_error_fails_the_step_at_once_without_halving_or_backoff() -> None:
+    """A syntax error or lost connection is not a page-size problem: no halving, no sleep."""
+    graph = FakePagedGraph(persons=NAMES)
+    graph.fail = lambda _kind, _params: RuntimeError("syntax error")
+    sleeps: list[float] = []
+
+    async def record_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    with (
+        patch.object(g, "graph", graph),
+        _run_key("2026-11"),
+        patch.object(g, "logger"),
+        patch.object(mp.asyncio, "sleep", record_sleep),
+    ):
+        assert await g.compute_person_credit_counts() is False
+
+    assert graph.page_sizes == [10], "exactly one attempt at the starting size"
+    assert [d for d in sleeps if d > 0] == [], "no retry backoff"

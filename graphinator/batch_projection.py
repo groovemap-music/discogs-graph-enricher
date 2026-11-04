@@ -33,6 +33,7 @@ from graphinator.media_projection import (
     resolve_media_block,
 )
 from graphinator.person_credits import PRUNE_CREDITED_ON_CYPHER, credited_on_prune_record, person_credit_rows
+from graphinator.reference_name import reference_name
 
 
 if TYPE_CHECKING:
@@ -688,6 +689,7 @@ class Neo4jBatchProjector:
                                     {
                                         "release_id": release["id"],
                                         "artist_id": artist["id"],
+                                        "artist_name": reference_name(artist),
                                     }
                                 )
                 if artist_data:
@@ -696,6 +698,8 @@ class Neo4jBatchProjector:
                         UNWIND $artists AS rel
                         MATCH (r:Release {id: rel.release_id})
                         MERGE (a:Artist {id: rel.artist_id})
+                        ON CREATE SET a.name = rel.artist_name
+                        ON MATCH SET a.name = coalesce(a.name, rel.artist_name)
                         MERGE (r)-[:BY]->(a)
                         """,
                         artists=artist_data,
@@ -711,6 +715,7 @@ class Neo4jBatchProjector:
                                     {
                                         "release_id": release["id"],
                                         "label_id": label["id"],
+                                        "label_name": reference_name(label),
                                     }
                                 )
                 if label_data:
@@ -719,6 +724,8 @@ class Neo4jBatchProjector:
                         UNWIND $labels AS rel
                         MATCH (r:Release {id: rel.release_id})
                         MERGE (l:Label {id: rel.label_id})
+                        ON CREATE SET l.name = rel.label_name
+                        ON MATCH SET l.name = coalesce(l.name, rel.label_name)
                         MERGE (r)-[:ON]->(l)
                         """,
                         labels=label_data,
