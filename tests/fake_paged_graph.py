@@ -7,6 +7,7 @@ committed, in what order, and what a retry did or did not redo.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -98,8 +99,9 @@ class FakePagedGraph:
             return _Result([{"key": k} for k in keys])
         if "SET n." in cypher:
             self._maybe_fail("metric", params)
-            prop = cypher.split("SET n.")[1].split(" =")[0]
-            self.metric_sets.append((params["key"], prop))
+            # A statement may set several properties: record each one.
+            for prop in re.findall(r"n\.(\w+) = v\d", cypher.split("SET ", 1)[1]):
+                self.metric_sets.append((params["key"], prop))
             return _Result([])
         raise AssertionError(f"unexpected statement: {cypher}")
 
