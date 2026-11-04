@@ -42,6 +42,17 @@ flowchart TD
     P --> Q[stamp maintained_at on the version's node]
 ```
 
+The aggregate steps are resumable. Genre, Style, Label and Person-credit sweeps run as
+short keyed pages (for example `Label.id > $cursor ORDER BY id LIMIT $size`), not as one
+statement over the whole graph, so no single transaction is bounded by graph size and the
+server's `db.transaction.timeout` is not what limits them. After each page the cursor is
+committed to a `MaintenanceCheckpoint` node keyed by step and dump version; a retry or a
+restart continues after the last committed page, a finished step is skipped, and a page
+that times out or hits transaction-memory pressure is retried at half the size (the size
+that worked is remembered). A new dump version starts every sweep again. A failing step is
+logged by name, the remaining steps still run, and `maintained_at` is only stamped when
+every step succeeded; otherwise `maintenance_error` names the failed steps.
+
 The latch is stored as an `ExtractionCompletion` node keyed by the message's
 `version`. Changing versions replaces the in-memory cache with the persisted state
 for the new version, so signals from two imports cannot satisfy one another. Duplicate

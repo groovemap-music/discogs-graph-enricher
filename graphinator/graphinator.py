@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import os
 import signal
 import sys
@@ -24,6 +25,7 @@ from common.telemetry import setup_telemetry, shutdown_telemetry, start_event_lo
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from orjson import loads
 
+from graphinator import maintenance_paging
 from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor
 from graphinator.config import GraphinatorConfig
@@ -34,7 +36,7 @@ from graphinator.entity_projection import (
     process_release,
 )
 from graphinator.master_reference import NO_MASTER_ID
-from graphinator.person_credits import CREDIT_COUNT_PROPERTIES, build_credit_count_cypher
+from graphinator.person_credits import CREDIT_COUNT_PROPERTIES, build_credit_count_page_cypher
 from graphinator.queue_names import (
     AMQP_EXCHANGE_TYPE,
     DATA_TYPES,
@@ -952,6 +954,34 @@ async def run_post_import_maintenance(version: str | None = None) -> bool:
         True if a full pass succeeded, False if every attempt failed.
     """
     failure = "post-import maintenance failed"
+    # Identifies this run to the per-step checkpoints. A versioned run is resumable
+    # across retries AND restarts (resume_pending_maintenance passes the same version);
+    # an unversioned manual run is only resumable within this call.
+    run_key = version if version is not None else f"adhoc-{time.time_ns()}"
+    token = _maintenance_run_key.set(run_key)
+    try:
+        return await _run_post_import_maintenance_attempts(version, failure)
+    finally:
+        _maintenance_run_key.reset(token)
+
+
+async def _run_maintenance_step(name: str, step: Any) -> str | None:
+    """Run one maintenance step. Returns ``None`` on success, else a description of the failure.
+
+    A raise or a False is logged under the step's name so a failed step is never anonymous.
+    """
+    try:
+        ok = await step()
+    except Exception as e:
+        logger.error(f"❌ Maintenance step {name} raised", step=name, error=str(e))
+        return f"{name}: {type(e).__name__}: {e}"
+    if not ok:
+        logger.error(f"❌ Maintenance step {name} did not complete", step=name)
+        return name
+    return None
+
+
+async def _run_post_import_maintenance_attempts(version: str | None, failure: str) -> bool:
     for attempt in range(1, POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS + 1):
         if shutdown_requested:
             logger.warning(
@@ -960,9 +990,8 @@ async def run_post_import_maintenance(version: str | None = None) -> bool:
             )
             return False
 
+        failed_steps: list[str] = []
         try:
-            maintenance_ok = True
-
             # Drain EVERY batch queue first, not just the signalling type's. The
             # extraction_complete branch flushes only its own data type, and a type
             # whose signal was acked earlier can still hold pending messages:
@@ -974,41 +1003,46 @@ async def run_post_import_maintenance(version: str | None = None) -> bool:
             # "all four signals received"; this makes it "all four queues quiescent"
             # too, which is the invariant the deferral comment actually claims.
             # flush_all is a no-op on empty queues and waits out in-flight batches per type.
-            if batch_processor is not None and not await batch_processor.flush_all():
+            drained = batch_processor is None or await batch_processor.flush_all()
+            if not drained:
+                # Writers are still creating stubs and edges: NOTHING below may run, and
+                # that is a deferral, not a per-step failure.
                 logger.error(
-                    "❌ Batch queues did not drain — deferring stub cleanup rather than sweeping while writers are still creating stubs",
+                    "❌ Batch queues did not drain — deferring every maintenance step rather than sweeping while writers are still active",
+                    skipped_steps=["stub_cleanup", "sentinel_master_cleanup", "genre_style_label_stats", "person_credit_counts"],
                 )
-                maintenance_ok = False
+                failed_steps.append("batch_queue_drain")
+            elif graph is not None:
+                # The steps are independent of each other, so one failing must not
+                # silently skip the rest. Each failure is logged by step name and the
+                # stamp below is withheld unless EVERY step succeeded. Steps with a
+                # checkpoint skip their completed pages on the retry.
+                steps: list[tuple[str, Any]] = [
+                    # Stub nodes created by cross-type MERGE operations, across EVERY entity
+                    # label — release batches create Artist/Label/Master stubs regardless of
+                    # which signal arrived last.
+                    ("stub_cleanup", cleanup_all_stub_nodes),
+                    # Drops the fake (:Master {id: "0"}) a graph loaded before the sentinel
+                    # fix may still carry. Idempotent, a no-op on a graph built since.
+                    ("sentinel_master_cleanup", cleanup_sentinel_master),
+                    # Aggregate stats on Genre/Style/Label nodes, over a graph that is no
+                    # longer being written.
+                    ("genre_style_label_stats", compute_genre_style_stats),
+                    # Recount every Person's credits from the CREDITED_ON edges as they
+                    # stand after the import (re-imported releases have already pruned the
+                    # credits Discogs removed), so removals are reflected as well as additions.
+                    ("person_credit_counts", compute_person_credit_counts),
+                ]
+                for name, step in steps:
+                    if (step_failure := await _run_maintenance_step(name, step)) is not None:
+                        failed_steps.append(step_failure)
 
-            # Clean up stub nodes created by cross-type MERGE operations, across
-            # EVERY entity label — not just one type's — because release batches
-            # create Artist/Label/Master stubs regardless of which signal arrived
-            # last.
-            if maintenance_ok and graph is not None and not await cleanup_all_stub_nodes():
-                maintenance_ok = False
-
-            # Drop the fake (:Master {id: "0"}) a graph loaded before the sentinel fix
-            # may still carry. Idempotent, and a no-op on a graph built since.
-            if maintenance_ok and graph is not None and not await cleanup_sentinel_master():
-                maintenance_ok = False
-
-            # All releases are now imported — compute aggregate stats on
-            # Genre/Style/Label nodes. Skipped when the queues never drained: the
-            # counts would be computed over a graph that is still being written.
-            if maintenance_ok and graph is not None and not await compute_genre_style_stats():
-                maintenance_ok = False
-
-            # Recount every Person's credits from the CREDITED_ON edges as they stand
-            # after the import (re-imported releases have already pruned the credits
-            # Discogs removed), so the counts reflect removals as well as additions.
-            if maintenance_ok and graph is not None and not await compute_person_credit_counts():
-                maintenance_ok = False
-
-            if not maintenance_ok:
-                failure = "a maintenance step did not complete (see service logs)"
+            maintenance_ok = not failed_steps
+            if failed_steps:
+                failure = f"maintenance step(s) did not complete: {', '.join(failed_steps)} (see service logs)"
 
             # Final step: the durable "graph is final for this dump" stamp. Written
-            # only after every sweep above succeeded.
+            # only after every step above succeeded.
             if maintenance_ok and version is not None and graph is not None:
                 await _stamp_maintenance_success(version)
         except Exception as e:
@@ -1043,115 +1077,62 @@ async def run_post_import_maintenance(version: str | None = None) -> bool:
     return False
 
 
-async def compute_genre_style_stats() -> bool:
-    """Pre-compute aggregate counts and first_year on Genre, Style, and Label nodes.
+# Pages per statement. Genre/Style are low-cardinality but heavy per node, so each
+# metric of a node is its own statement and a page is a handful of nodes; Label and
+# Person are high-cardinality, so a page is a bounded slice of them. Every size halves
+# on a timeout / memory pressure and the working size is remembered in the checkpoint.
+GENRE_STYLE_STATS_PAGE_SIZE = 10
+LABEL_STATS_PAGE_SIZE = 100
 
-    Sets release_count, artist_count, label_count, style_count/genre_count,
-    and first_year properties on each Genre and Style node.  Also sets
-    release_count, artist_count, genre_count on Label nodes.
+# Identifies the run being maintained to the checkpoints (the dump version). ``None``
+# outside run_post_import_maintenance, which disables checkpoint persistence.
+_maintenance_run_key: contextvars.ContextVar[str | None] = contextvars.ContextVar("maintenance_run_key", default=None)
 
-    - Genre/Style counts are read by explore/genre and explore/style endpoints,
-      replacing 4 expensive traversal queries (~200M DB hits for Rock)
-      with a single property read (~3 DB hits).
-    - first_year is read by genre-emergence, replacing a full IS edge scan
-      (~184M DB hits) with an index seek (~100 DB hits).
-    - Label counts are read by explore/label, replacing a 1.2M DB-hit
-      traversal (for Reprise Records with 55K releases) with ~3 DB hits.
 
-    Should be called after all releases have been imported.
+def _node_stat_metrics(node: str) -> list[tuple[str, str]]:
+    """Return ``(property, Cypher body)`` per aggregate of a Genre/Style node ``n``.
 
-    Returns:
-        True if all stats were computed (or there is no driver / no work),
-        False if the computation failed — so the caller can nack and retry.
+    Each body is a subquery returning ``v``; each becomes its own statement and
+    transaction. The node is Genre or Style, and the "other" taxonomy is counted.
     """
-    if graph is None:
-        return True
+    other_label, other_prop = ("Style", "style_count") if node == "Genre" else ("Genre", "genre_count")
+    return [
+        ("release_count", "MATCH (n)<-[:IS]-(r:Release) RETURN count(DISTINCT r) AS v"),
+        ("artist_count", "MATCH (n)<-[:IS]-(r:Release)-[:BY]->(a:Artist) RETURN count(DISTINCT a) AS v"),
+        ("label_count", "MATCH (n)<-[:IS]-(r:Release)-[:ON]->(l:Label) RETURN count(DISTINCT l) AS v"),
+        (other_prop, f"MATCH (n)<-[:IS]-(r:Release)-[:IS]->(o:{other_label}) RETURN count(DISTINCT o) AS v"),
+        ("first_year", "MATCH (n)<-[:IS]-(r:Release) WHERE r.year > 0 RETURN min(r.year) AS v"),
+    ]
 
-    # Drive the batching with an outer MATCH so CALL {} IN TRANSACTIONS actually
-    # commits one inner transaction per node (OF 1 ROWS = one genre/style per
-    # transaction).  The driving MATCH MUST sit OUTSIDE the transactional
-    # subquery, with the node re-imported via WITH; otherwise nothing precedes
-    # the CALL, exactly one implicit input row drives it, and the entire update
-    # runs in a SINGLE transaction — defeating the batching and hitting the
-    # default 120s transaction timeout (each node takes ~10-30s).
-    genre_cypher = """
-    MATCH (g:Genre)
-    CALL {
-        WITH g
-        CALL {
-            WITH g
-            MATCH (g)<-[:IS]-(r:Release)
-            RETURN count(DISTINCT r) AS rc
-        }
-        CALL {
-            WITH g
-            MATCH (g)<-[:IS]-(r:Release)-[:BY]->(a:Artist)
-            RETURN count(DISTINCT a) AS ac
-        }
-        CALL {
-            WITH g
-            MATCH (g)<-[:IS]-(r:Release)-[:ON]->(l:Label)
-            RETURN count(DISTINCT l) AS lc
-        }
-        CALL {
-            WITH g
-            MATCH (g)<-[:IS]-(r:Release)-[:IS]->(s:Style)
-            RETURN count(DISTINCT s) AS sc
-        }
-        CALL {
-            WITH g
-            MATCH (g)<-[:IS]-(r:Release)
-            WHERE r.year > 0
-            RETURN min(r.year) AS fy
-        }
-        SET g.release_count = rc, g.artist_count = ac,
-            g.label_count = lc, g.style_count = sc,
-            g.first_year = fy
-    } IN TRANSACTIONS OF 1 ROWS
+
+def build_node_stat_statements(node: str) -> list[tuple[str, dict[str, Any]]]:
+    """Return one ``(cypher, params)`` statement per aggregate of a Genre/Style node."""
+    return [
+        (
+            f"""
+            MATCH (n:{node} {{name: $key}})
+            CALL {{
+                WITH n
+                {body}
+            }}
+            SET n.{prop} = v
+            """,
+            {},
+        )
+        for prop, body in _node_stat_metrics(node)
+    ]
+
+
+def build_label_stats_page_cypher() -> str:
+    """Keyed page of Label aggregates: the ``$size`` labels with ``id > $cursor``.
+
+    Returns ``last`` (next cursor) and ``processed``. Bounded by ``$size``, not by the
+    ~millions of labels in the graph; most labels have few releases so a page is quick.
     """
-
-    style_cypher = """
-    MATCH (s:Style)
-    CALL {
-        WITH s
-        CALL {
-            WITH s
-            MATCH (s)<-[:IS]-(r:Release)
-            RETURN count(DISTINCT r) AS rc
-        }
-        CALL {
-            WITH s
-            MATCH (s)<-[:IS]-(r:Release)-[:BY]->(a:Artist)
-            RETURN count(DISTINCT a) AS ac
-        }
-        CALL {
-            WITH s
-            MATCH (s)<-[:IS]-(r:Release)-[:ON]->(l:Label)
-            RETURN count(DISTINCT l) AS lc
-        }
-        CALL {
-            WITH s
-            MATCH (s)<-[:IS]-(r:Release)-[:IS]->(g:Genre)
-            RETURN count(DISTINCT g) AS gc
-        }
-        CALL {
-            WITH s
-            MATCH (s)<-[:IS]-(r:Release)
-            WHERE r.year > 0
-            RETURN min(r.year) AS fy
-        }
-        SET s.release_count = rc, s.artist_count = ac,
-            s.label_count = lc, s.genre_count = gc,
-            s.first_year = fy
-    } IN TRANSACTIONS OF 1 ROWS
-    """
-
-    # Label stats: release_count, artist_count, genre_count.
-    # Labels have higher cardinality (~2.3M) than genres (16) or styles (757),
-    # but most labels have <100 releases so each batch computes quickly.
-    # Use IN TRANSACTIONS OF 100 ROWS for throughput.
-    label_cypher = """
+    return """
     MATCH (l:Label)
+    WHERE l.id > $cursor
+    WITH l ORDER BY l.id LIMIT $size
     CALL {
         WITH l
         CALL {
@@ -1169,46 +1150,91 @@ async def compute_genre_style_stats() -> bool:
             MATCH (l)<-[:ON]-(r:Release)-[:IS]->(g:Genre)
             RETURN count(DISTINCT g) AS gc
         }
-        SET l.release_count = rc, l.artist_count = ac,
-            l.genre_count = gc
-    } IN TRANSACTIONS OF 100 ROWS
+        SET l.release_count = rc, l.artist_count = ac, l.genre_count = gc
+    }
+    RETURN max(l.id) AS last, count(l) AS processed
     """
 
-    # These share the transaction-memory pool with stub cleanup and the insights
-    # background scans, so they get the same retry-under-pressure treatment and
-    # are staggered rather than run back to back.
-    stats_queries = [
-        ("Genre", genre_cypher),
-        ("Style", style_cypher),
-        ("Label", label_cypher),
+
+async def compute_genre_style_stats() -> bool:
+    """Pre-compute aggregate counts and first_year on Genre, Style, and Label nodes.
+
+    Sets release_count, artist_count, label_count, style_count/genre_count,
+    and first_year properties on each Genre and Style node.  Also sets
+    release_count, artist_count, genre_count on Label nodes.
+
+    - Genre/Style counts are read by explore/genre and explore/style endpoints,
+      replacing 4 expensive traversal queries (~200M DB hits for Rock)
+      with a single property read (~3 DB hits).
+    - first_year is read by genre-emergence, replacing a full IS edge scan
+      (~184M DB hits) with an index seek (~100 DB hits).
+    - Label counts are read by explore/label, replacing a 1.2M DB-hit
+      traversal (for Reprise Records with 55K releases) with ~3 DB hits.
+
+    Resumable: each of Genre, Style and Label is a keyed-page sweep checkpointed after
+    every page (see :mod:`graphinator.maintenance_paging`), so no single transaction is
+    bounded by the size of the graph, a transaction timeout halves the page rather than
+    repeating the same work, and a retry continues after the last committed page.
+
+    Should be called after all releases have been imported.
+
+    Returns:
+        True if all stats were computed (or there is no driver / no work),
+        False if the computation failed. Every failing sweep is logged with its
+        step name; a failure does not skip the sweeps after it.
+    """
+    if graph is None:
+        return True
+
+    run_key = _maintenance_run_key.get()
+    sweeps: list[tuple[str, Any, int]] = [
+        (
+            "Genre",
+            maintenance_paging.per_key_page_processor(
+                graph,
+                list_keys_cypher="MATCH (n:Genre) WHERE n.name > $cursor RETURN n.name AS key ORDER BY key LIMIT $size",
+                statements_for_key=lambda _key: build_node_stat_statements("Genre"),
+            ),
+            GENRE_STYLE_STATS_PAGE_SIZE,
+        ),
+        (
+            "Style",
+            maintenance_paging.per_key_page_processor(
+                graph,
+                list_keys_cypher="MATCH (n:Style) WHERE n.name > $cursor RETURN n.name AS key ORDER BY key LIMIT $size",
+                statements_for_key=lambda _key: build_node_stat_statements("Style"),
+            ),
+            GENRE_STYLE_STATS_PAGE_SIZE,
+        ),
+        (
+            "Label",
+            maintenance_paging.keyed_page_processor(graph, build_label_stats_page_cypher()),
+            LABEL_STATS_PAGE_SIZE,
+        ),
     ]
 
-    try:
-        for index, (node_label, cypher) in enumerate(stats_queries):
-            if index:
-                await asyncio.sleep(MAINTENANCE_SETTLE_SECONDS)
-            logger.info(f"📊 Computing aggregate stats on {node_label} nodes...")
-            summary = await _run_maintenance_query(
-                lambda _batch_size, _cypher=cypher: _cypher,
-                f"{node_label} stats computation",
-                node_label=node_label,
+    ok = True
+    for index, (node_label, process_page, page_size) in enumerate(sweeps):
+        if index:
+            await asyncio.sleep(MAINTENANCE_SETTLE_SECONDS)
+        step = f"{node_label.lower()}_stats"
+        logger.info(f"📊 Computing aggregate stats on {node_label} nodes...", step=step)
+        try:
+            processed = await maintenance_paging.run_checkpointed_step(
+                graph,
+                step=step,
+                run_key=run_key,
+                process_page=process_page,
+                page_size=page_size,
             )
-            if summary is None:
-                # Retries exhausted — already logged. Fail so the caller nacks
-                # and the whole maintenance step is retried on the next cycle.
-                return False
-            logger.info(
-                f"✅ {node_label} stats computed",
-                counters=str(summary.counters),
-            )
-    except Exception as e:
-        logger.error(
-            "❌ Failed to compute genre/style/label stats",
-            error=str(e),
-        )
-        return False
+            logger.info(f"✅ {node_label} stats computed", step=step, processed=processed)
+        except Exception as e:
+            # Keep going: the other sweeps are independent, and the checkpoint keeps
+            # this one's progress for the retry.
+            logger.error(f"❌ Failed to compute {node_label} stats", step=step, error=str(e))
+            ok = False
 
-    return True
+    return ok
 
 
 async def compute_person_credit_counts() -> bool:
@@ -1222,38 +1248,34 @@ async def compute_person_credit_counts() -> bool:
 
     A full recount rather than an incremental one, so the result does not depend on the
     previous value: a re-run is idempotent, and a credit removed since the last pass is
-    simply no longer counted. Persons are batched ``PERSON_CREDIT_COUNT_BATCH_SIZE`` per
-    inner transaction and the batch halves under transaction-memory pressure, the same
-    treatment as stub cleanup.
+    simply no longer counted. Persons are processed in keyed pages of
+    ``PERSON_CREDIT_COUNT_BATCH_SIZE`` (by name), checkpointed after each page and
+    halved on a timeout or transaction-memory pressure, so the sweep resumes after its
+    last committed page instead of restarting.
 
     Returns:
         True if the counts were written (or there is no driver), False if the recompute
-        failed — so the detached maintenance task retries the pass.
+        failed (logged with the step name) — so the detached maintenance task retries it.
     """
     if graph is None:
         return True
 
+    step = "person_credit_counts"
     try:
         # Runs straight after the Genre/Style/Label sweep: let the shared transaction
         # pool drain first rather than claiming it back to back.
         await asyncio.sleep(MAINTENANCE_SETTLE_SECONDS)
-        logger.info("📊 Computing credit counts on Person nodes...")
-        summary = await _run_maintenance_query(
-            build_credit_count_cypher,
-            "Person credit count computation",
-            batch_size=PERSON_CREDIT_COUNT_BATCH_SIZE,
-            node_label="Person",
+        logger.info("📊 Computing credit counts on Person nodes...", step=step)
+        processed = await maintenance_paging.run_checkpointed_step(
+            graph,
+            step=step,
+            run_key=_maintenance_run_key.get(),
+            process_page=maintenance_paging.keyed_page_processor(graph, build_credit_count_page_cypher()),
+            page_size=PERSON_CREDIT_COUNT_BATCH_SIZE,
         )
-        if summary is None:
-            # Retries exhausted — already logged.
-            return False
-        logger.info(
-            "✅ Person credit counts computed",
-            properties=list(CREDIT_COUNT_PROPERTIES),
-            counters=str(summary.counters),
-        )
+        logger.info("✅ Person credit counts computed", step=step, properties=list(CREDIT_COUNT_PROPERTIES), processed=processed)
     except Exception as e:
-        logger.error("❌ Failed to compute Person credit counts", error=str(e))
+        logger.error("❌ Failed to compute Person credit counts", step=step, error=str(e))
         return False
 
     return True

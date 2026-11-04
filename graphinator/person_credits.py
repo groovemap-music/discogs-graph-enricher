@@ -99,17 +99,20 @@ DELETE rel
 """
 
 
-def build_credit_count_cypher(batch_size: int | None) -> str:
-    """Build the batched recompute of every Person's credit counts.
+def build_credit_count_page_cypher() -> str:
+    """Build the keyed-page recompute of Person credit counts.
 
-    The driving ``MATCH (p:Person)`` sits OUTSIDE the transactional subquery and the
-    person is re-imported with ``WITH``, so ``IN TRANSACTIONS OF n ROWS`` commits one
-    inner transaction per ``n`` people (see ``compute_genre_style_stats``). Inside, the
-    edges are grouped by release first, so each release contributes once to the total
-    and once to each category it carries — the distinct-release semantics — while the
-    working set stays one row per release of a single person rather than a DISTINCT set
-    per category. ``OPTIONAL MATCH`` keeps a person whose credits were all pruned in
-    the batch, so it is rewritten to zero instead of keeping stale counts.
+    One statement handles one page: the ``$size`` Persons whose ``name`` sorts after
+    ``$cursor``, in name order. It returns ``last`` (the greatest name handled, the next
+    cursor) and ``processed`` so :mod:`graphinator.maintenance_paging` can checkpoint and
+    resume after it. The statement is bounded by ``$size``, not by the size of the graph.
+
+    Inside, the edges are grouped by release first, so each release contributes once to
+    the total and once to each category it carries (the distinct-release semantics) while
+    the working set stays one row per release of a single person rather than a DISTINCT
+    set per category. ``OPTIONAL MATCH`` keeps a person whose credits were all pruned, so
+    it is rewritten to zero instead of keeping stale counts. The per-person subquery has
+    no ``RETURN``, so every page row survives it to feed the final aggregate.
     """
     category_sums = ",\n            ".join(
         f"sum(CASE WHEN '{category}' IN categories THEN 1 ELSE 0 END) AS count_{category}" for category in ALL_CATEGORIES
@@ -117,6 +120,8 @@ def build_credit_count_cypher(batch_size: int | None) -> str:
     category_sets = ",\n            ".join(f"p.{credit_count_property(category)} = count_{category}" for category in ALL_CATEGORIES)
     return f"""
     MATCH (p:Person)
+    WHERE p.name > $cursor
+    WITH p ORDER BY p.name LIMIT $size
     CALL {{
         WITH p
         OPTIONAL MATCH (p)-[c:CREDITED_ON]->(r:Release)
@@ -126,5 +131,6 @@ def build_credit_count_cypher(batch_size: int | None) -> str:
             {category_sums}
         SET p.{CREDIT_COUNT_PROPERTY} = total,
             {category_sets}
-    }} IN TRANSACTIONS OF {batch_size} ROWS
+    }}
+    RETURN max(p.name) AS last, count(p) AS processed
     """

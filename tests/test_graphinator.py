@@ -15,6 +15,7 @@ from orjson import dumps
 from graphinator import telemetry as gm_telemetry
 from graphinator.graphinator import (
     StartupError,
+    compute_genre_style_stats,
     main,
     on_artist_message,
     on_label_message,
@@ -1137,174 +1138,58 @@ class TestCleanupStubNodes:
 
 
 class TestComputeGenreStyleStats:
-    """Test compute_genre_style_stats function."""
+    """Test compute_genre_style_stats function (paged and resumable; see test_maintenance_resume)."""
 
     @pytest.mark.asyncio
     async def test_computes_stats_for_genres_styles_and_labels(self) -> None:
-        """Test pre-computes aggregate stats on Genre, Style, and Label nodes."""
-        mock_driver = AsyncMock()
-        mock_session_ctx = AsyncMock()
-        mock_session = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_driver.session = MagicMock(return_value=mock_session_ctx)
+        """Every Genre/Style gets all five aggregates, every Label is paged through."""
+        from tests.fake_paged_graph import FakePagedGraph
 
-        # Results use result.consume() to get summary (no records returned)
-        genre_result = AsyncMock()
-        genre_result.consume = AsyncMock(return_value=MagicMock(counters="properties_set=96"))
-        style_result = AsyncMock()
-        style_result.consume = AsyncMock(return_value=MagicMock(counters="properties_set=4542"))
-        label_result = AsyncMock()
-        label_result.consume = AsyncMock(return_value=MagicMock(counters="properties_set=6900000"))
-        mock_session.run = AsyncMock(side_effect=[genre_result, style_result, label_result])
+        graph = FakePagedGraph(genres=["Rock"], styles=["Punk"], labels=["1", "2"])
+        with patch("graphinator.graphinator.graph", graph), patch("graphinator.graphinator.MAINTENANCE_SETTLE_SECONDS", 0.0):
+            assert await compute_genre_style_stats() is True
 
-        import graphinator.graphinator
-
-        graphinator.graphinator.graph = mock_driver
-
-        from graphinator.graphinator import compute_genre_style_stats
-
-        await compute_genre_style_stats()
-
-        assert mock_session.run.call_count == 3
-        # Verify genre query includes aggregate counts, first_year, and IN TRANSACTIONS
-        genre_query = mock_session.run.call_args_list[0][0][0]
-        assert "Genre" in genre_query
-        assert "release_count" in genre_query
-        assert "artist_count" in genre_query
-        assert "first_year" in genre_query
-        assert "IN TRANSACTIONS" in genre_query
-        # Verify style query
-        style_query = mock_session.run.call_args_list[1][0][0]
-        assert "Style" in style_query
-        assert "release_count" in style_query
-        assert "first_year" in style_query
-        assert "IN TRANSACTIONS" in style_query
-        # Verify label query
-        label_query = mock_session.run.call_args_list[2][0][0]
-        assert "Label" in label_query
-        assert "release_count" in label_query
-        assert "artist_count" in label_query
-        assert "genre_count" in label_query
-        assert "IN TRANSACTIONS" in label_query
-
-        # Reset
-        graphinator.graphinator.graph = None
+        props = {p for k, p in graph.metric_sets if k == "Rock"}
+        assert props == {"release_count", "artist_count", "label_count", "style_count", "first_year"}
+        assert {p for k, p in graph.metric_sets if k == "Punk"} == {"release_count", "artist_count", "label_count", "genre_count", "first_year"}
+        assert [n for page in graph.label_pages for n in page] == ["1", "2"]
+        # No statement is a single whole-graph IN TRANSACTIONS sweep any more.
+        assert not any("IN TRANSACTIONS" in c for c in graph.statements)
 
     @pytest.mark.asyncio
-    async def test_driving_match_is_outside_transactional_subquery(self) -> None:
-        """Regression: the driving MATCH must sit OUTSIDE ``CALL {} IN
-        TRANSACTIONS`` so the update batches one node per inner transaction.
+    async def test_label_page_query_carries_the_label_aggregates(self) -> None:
+        from graphinator.graphinator import build_label_stats_page_cypher
 
-        If the MATCH is the first statement *inside* the transactional subquery
-        (``CALL { MATCH (g:Genre) ... } IN TRANSACTIONS``) then nothing precedes
-        the CALL, exactly one implicit input row drives it, and the entire update
-        runs in a single transaction — defeating the batching and hitting the
-        120s transaction timeout at production scale.
-        """
-        mock_driver = AsyncMock()
-        mock_session_ctx = AsyncMock()
-        mock_session = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_driver.session = MagicMock(return_value=mock_session_ctx)
-
-        result = AsyncMock()
-        result.consume = AsyncMock(return_value=MagicMock(counters="properties_set=0"))
-        mock_session.run = AsyncMock(return_value=result)
-
-        import graphinator.graphinator
-
-        graphinator.graphinator.graph = mock_driver
-
-        from graphinator.graphinator import compute_genre_style_stats
-
-        await compute_genre_style_stats()
-
-        # (query string, driving-match snippet) for each of the three queries
-        cases = [
-            (mock_session.run.call_args_list[0][0][0], "MATCH (g:Genre)"),
-            (mock_session.run.call_args_list[1][0][0], "MATCH (s:Style)"),
-            (mock_session.run.call_args_list[2][0][0], "MATCH (l:Label)"),
-        ]
-        for query, driving_match in cases:
-            match_idx = query.index(driving_match)
-            call_idx = query.index("CALL {")
-            # Driving MATCH must appear before the transactional CALL block.
-            assert match_idx < call_idx, (
-                f"driving MATCH {driving_match!r} must precede 'CALL {{' — otherwise the whole update runs in one transaction"
-            )
-            # The transactional subquery must import the node with WITH, not
-            # re-MATCH the full label set inside the CALL.
-            after_call = query[call_idx + len("CALL {") :]
-            first_stmt = after_call.strip().split("\n", 1)[0].strip()
-            assert first_stmt.startswith("WITH "), f"first statement inside 'CALL {{' should be a WITH import, got {first_stmt!r}"
-            assert "IN TRANSACTIONS" in query
-
-        # Reset
-        graphinator.graphinator.graph = None
+        query = build_label_stats_page_cypher()
+        for needle in ("release_count", "artist_count", "genre_count", "$cursor", "$size", "ORDER BY l.id LIMIT $size"):
+            assert needle in query
 
     @pytest.mark.asyncio
     async def test_skips_when_no_driver(self) -> None:
         """Test does nothing when graph driver is None."""
-        import graphinator.graphinator
-
-        graphinator.graphinator.graph = None
-
-        from graphinator.graphinator import compute_genre_style_stats
-
-        # Should not raise
-        await compute_genre_style_stats()
+        with patch("graphinator.graphinator.graph", None):
+            assert await compute_genre_style_stats() is True
 
     @pytest.mark.asyncio
     async def test_handles_exception_gracefully(self) -> None:
-        """Test logs error and does not raise on failure."""
-        mock_driver = AsyncMock()
-        mock_session_ctx = AsyncMock()
-        mock_session = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_driver.session = MagicMock(return_value=mock_session_ctx)
-        mock_session.run = AsyncMock(side_effect=Exception("connection lost"))
+        """A failing sweep is logged, reported as False, and does not raise."""
+        from tests.fake_paged_graph import FakePagedGraph
 
-        import graphinator.graphinator
-
-        graphinator.graphinator.graph = mock_driver
-
-        from graphinator.graphinator import compute_genre_style_stats
-
-        # Should not raise
-        await compute_genre_style_stats()
-
-        # Reset
-        graphinator.graphinator.graph = None
+        graph = FakePagedGraph(genres=["Rock"], styles=["Punk"], labels=["1"])
+        graph.fail = lambda _kind, _params: RuntimeError("connection lost")
+        with (
+            patch("graphinator.graphinator.graph", graph),
+            patch("graphinator.graphinator.MAINTENANCE_SETTLE_SECONDS", 0.0),
+            patch("graphinator.graphinator.logger"),
+        ):
+            assert await compute_genre_style_stats() is False
 
     @pytest.mark.asyncio
-    async def test_handles_empty_result(self) -> None:
-        """Test handles empty result from query."""
-        mock_driver = AsyncMock()
-        mock_session_ctx = AsyncMock()
-        mock_session = AsyncMock()
-        mock_session_ctx.__aenter__ = AsyncMock(return_value=mock_session)
-        mock_session_ctx.__aexit__ = AsyncMock(return_value=False)
-        mock_driver.session = MagicMock(return_value=mock_session_ctx)
+    async def test_handles_empty_graph(self) -> None:
+        from tests.fake_paged_graph import FakePagedGraph
 
-        # Both queries return empty summary
-        empty_result = AsyncMock()
-        empty_result.consume = AsyncMock(return_value=MagicMock(counters="properties_set=0"))
-        mock_session.run = AsyncMock(return_value=empty_result)
-
-        import graphinator.graphinator
-
-        graphinator.graphinator.graph = mock_driver
-
-        from graphinator.graphinator import compute_genre_style_stats
-
-        # Should not raise
-        await compute_genre_style_stats()
-
-        # Reset
-        graphinator.graphinator.graph = None
+        with patch("graphinator.graphinator.graph", FakePagedGraph()), patch("graphinator.graphinator.MAINTENANCE_SETTLE_SECONDS", 0.0):
+            assert await compute_genre_style_stats() is True
 
 
 class TestCheckFileCompletionComputeGenreStyleStats:
@@ -4920,29 +4805,6 @@ class TestMaintenanceUnderMemoryPressure:
 
         assert ok is False
         assert len(run_calls) == 1
-
-    @pytest.mark.asyncio
-    async def test_stats_computation_retries_under_pressure(self) -> None:
-        """Fix-one-fix-all: the sibling maintenance query shares the same pool."""
-        import graphinator.graphinator as g
-
-        graph_mock, run_calls = self._pressure_graph(fail_times=1)
-        with patch.object(g, "graph", graph_mock):
-            ok = await g.compute_genre_style_stats()
-
-        assert ok is True
-        # 1 failed Genre attempt + Genre retry + Style + Label
-        assert len(run_calls) == 4
-
-    @pytest.mark.asyncio
-    async def test_stats_computation_reports_failure_when_retries_exhaust(self) -> None:
-        import graphinator.graphinator as g
-
-        graph_mock, _ = self._pressure_graph(fail_times=99)
-        with patch.object(g, "graph", graph_mock):
-            ok = await g.compute_genre_style_stats()
-
-        assert ok is False
 
     @pytest.mark.asyncio
     async def test_cleanup_sweeps_are_staggered(self) -> None:
