@@ -16,7 +16,7 @@ from neo4j.exceptions import ServiceUnavailable
 import graphinator.graphinator as graphinator
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor, PendingMessage
 from graphinator.entity_projection import process_artist, process_label, process_release
-from graphinator.person_credits import CREDIT_COUNT_PROPERTIES
+from graphinator.person_credits import CREDIT_COUNT_PROPERTIES, build_credit_count_page_cypher
 
 
 pytestmark = pytest.mark.integration
@@ -586,6 +586,51 @@ _REAL_MAINTENANCE_HELPERS = {
         "_record_maintenance_failure",
     )
 }
+
+
+async def run_page(driver: AsyncDriver, cypher: str) -> int:
+    """Run one whole-graph page of a sweep statement; return the properties it set."""
+    async with driver.session(database="neo4j") as session:
+        result = await session.run(cypher, cursor="", size=1000)
+        summary = await result.consume()
+        return summary.counters.properties_set
+
+
+@pytest.mark.asyncio
+async def test_sweeps_write_only_properties_that_changed(neo4j_driver: AsyncDriver) -> None:
+    """Person and Label pages compare before writing: a rerun sets nothing, a change sets only itself."""
+    await import_releases(
+        Neo4jBatchProcessor(neo4j_driver),
+        credited_release("R1", "r1-a", ("Flood", "Producer"), ("Flood", "Mixed By")),
+        credited_release("R2", "r2-a", ("Flood", "Bass")),
+    )
+    async with neo4j_driver.session(database="neo4j") as session:
+        await session.run(
+            "CREATE (l:Label {id: 'L1'}), (a:Artist {id: 'A1'}), (g:Genre {name: 'Rock'}) "
+            "WITH l, a, g MATCH (r:Release {id: 'R1'}) CREATE (r)-[:ON]->(l), (r)-[:BY]->(a), (r)-[:IS]->(g)"
+        )
+    person_page = build_credit_count_page_cypher()
+    label_page = graphinator.build_label_stats_page_cypher()
+
+    # First pass writes every property: 8 on the one person, 3 on the one label.
+    assert await run_page(neo4j_driver, person_page) == len(CREDIT_COUNT_PROPERTIES)
+    assert await run_page(neo4j_driver, label_page) == 3
+    flood = await credit_counts(neo4j_driver, "Flood")
+    assert flood == expected(2, production=1, engineering=1, session=1)
+
+    # Unchanged data: nothing is written, and the values are identical.
+    assert await run_page(neo4j_driver, person_page) == 0
+    assert await run_page(neo4j_driver, label_page) == 0
+    assert await credit_counts(neo4j_driver, "Flood") == flood
+
+    # One stale value (and one lost category read as stale) is rewritten, alone.
+    async with neo4j_driver.session(database="neo4j") as session:
+        await session.run("MATCH (p:Person {name: 'Flood'}) SET p.credit_count_session = 9")
+        await session.run("MATCH (l:Label {id: 'L1'}) SET l.release_count = 9")
+    assert await run_page(neo4j_driver, person_page) == 1
+    assert await run_page(neo4j_driver, label_page) == 1
+    assert await credit_counts(neo4j_driver, "Flood") == flood
+    assert (await one(neo4j_driver, "MATCH (l:Label {id: 'L1'}) RETURN l.release_count AS rc"))["rc"] == 1
 
 
 @pytest.mark.asyncio

@@ -1128,6 +1128,7 @@ def build_label_stats_page_cypher() -> str:
 
     Returns ``last`` (next cursor) and ``processed``. Bounded by ``$size``, not by the
     ~millions of labels in the graph; most labels have few releases so a page is quick.
+    Each property is written only when it differs, so a rerun over unchanged data writes nothing.
     """
     return """
     MATCH (l:Label)
@@ -1150,7 +1151,9 @@ def build_label_stats_page_cypher() -> str:
             MATCH (l)<-[:ON]-(r:Release)-[:IS]->(g:Genre)
             RETURN count(DISTINCT g) AS gc
         }
-        SET l.release_count = rc, l.artist_count = ac, l.genre_count = gc
+        FOREACH (_ IN CASE WHEN l.release_count IS NULL OR l.release_count <> rc THEN [1] ELSE [] END | SET l.release_count = rc)
+        FOREACH (_ IN CASE WHEN l.artist_count IS NULL OR l.artist_count <> ac THEN [1] ELSE [] END | SET l.artist_count = ac)
+        FOREACH (_ IN CASE WHEN l.genre_count IS NULL OR l.genre_count <> gc THEN [1] ELSE [] END | SET l.genre_count = gc)
     }
     RETURN max(l.id) AS last, count(l) AS processed
     """
