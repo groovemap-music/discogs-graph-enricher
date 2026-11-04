@@ -65,6 +65,38 @@ def _distinct_pairs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list({(row["genre"], row["style"]): row for row in rows}.values())
 
 
+# Delete the BY, ON, DERIVED_FROM and IS (to Genre, to Style) edges a release's NEW
+# version no longer asserts, in one statement with one seek and one expansion per
+# release. They were five statements, each seeking every release again. Each edge type
+# keeps its own keep-list and target label, so what is deleted is exactly what the
+# separate prunes deleted. The source-scoped ISSUED_ON and CREDITED_TO prunes and the
+# incoming CREDITED_ON prune keep their own statements: they are shared with the
+# single-record path and scoped differently.
+PRUNE_RELEASE_EDGES_CYPHER = """
+UNWIND $records AS record
+MATCH (:Release {id: record.key})-[rel:BY|ON|DERIVED_FROM|IS]->(t)
+WHERE (type(rel) = 'BY' AND t:Artist AND NOT t.id IN record.artists)
+   OR (type(rel) = 'ON' AND t:Label AND NOT t.id IN record.labels)
+   OR (type(rel) = 'DERIVED_FROM' AND t:Master AND NOT t.id IN record.masters)
+   OR (type(rel) = 'IS' AND t:Genre AND NOT t.name IN record.genres)
+   OR (type(rel) = 'IS' AND t:Style AND NOT t.name IN record.styles)
+DELETE rel
+"""
+
+
+def _release_prune_record(release: dict[str, Any]) -> dict[str, Any]:
+    """Return the PRUNE_RELEASE_EDGES_CYPHER keep-lists for one release."""
+    master = usable_master_id(release.get("master_id"))
+    return {
+        "key": release["id"],
+        "artists": [a["id"] for a in (release.get("artists") or []) if a.get("id")],
+        "labels": [x["id"] for x in (release.get("labels") or []) if x.get("id")],
+        "masters": [] if master is None else [master],
+        "genres": [g for g in (release.get("genres") or []) if g],
+        "styles": [st for st in (release.get("styles") or []) if st],
+    }
+
+
 class Neo4jBatchProjector:
     """Build and execute entity-specific writes within processor-owned batches."""
 
@@ -661,50 +693,9 @@ class Neo4jBatchProjector:
                 # genres=["Jazz"] kept (r)-[:IS]->(Rock) forever — permanently inflating
                 # Rock.release_count and listing the release under a genre it no longer
                 # has.
-                await self._prune_stale_edges(
-                    tx,
-                    "Release",
-                    releases_to_process,
-                    rel_type="BY",
-                    target_label="Artist",
-                    target_key="id",
-                    desired=lambda r: [a["id"] for a in (r.get("artists") or []) if a.get("id")],
-                )
-                await self._prune_stale_edges(
-                    tx,
-                    "Release",
-                    releases_to_process,
-                    rel_type="ON",
-                    target_label="Label",
-                    target_key="id",
-                    desired=lambda r: [x["id"] for x in (r.get("labels") or []) if x.get("id")],
-                )
-                await self._prune_stale_edges(
-                    tx,
-                    "Release",
-                    releases_to_process,
-                    rel_type="DERIVED_FROM",
-                    target_label="Master",
-                    target_key="id",
-                    desired=lambda r: [m] if (m := usable_master_id(r.get("master_id"))) is not None else [],
-                )
-                await self._prune_stale_edges(
-                    tx,
-                    "Release",
-                    releases_to_process,
-                    rel_type="IS",
-                    target_label="Genre",
-                    target_key="name",
-                    desired=lambda r: [g for g in (r.get("genres") or []) if g],
-                )
-                await self._prune_stale_edges(
-                    tx,
-                    "Release",
-                    releases_to_process,
-                    rel_type="IS",
-                    target_label="Style",
-                    target_key="name",
-                    desired=lambda r: [st for st in (r.get("styles") or []) if st],
+                await tx.run(
+                    PRUNE_RELEASE_EDGES_CYPHER,
+                    records=[_release_prune_record(release) for release in releases_to_process],
                 )
 
                 # Process artist relationships (Release)-[:BY]->(Artist)

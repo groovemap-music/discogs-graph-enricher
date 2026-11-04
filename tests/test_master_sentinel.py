@@ -129,8 +129,8 @@ class TestBatchProjectionMasterSentinel:
         await Neo4jBatchProcessor(driver)._process_releases_batch([self._release(master_id)])
 
         assert not [q for q, _ in executed if "MERGE (m:Master" in q]
-        prunes = [p for q, p in executed if "DELETE rel" in q and "[rel:DERIVED_FROM]" in q]
-        assert [p["records"] for p in prunes] == [[{"key": "1", "keep": []}]]
+        prunes = [p for q, p in executed if "DELETE rel" in q and "DERIVED_FROM" in q]
+        assert [[r["masters"] for r in p["records"]] for p in prunes] == [[[]]]
 
     @pytest.mark.asyncio
     async def test_missing_key_creates_no_master(self) -> None:
@@ -149,8 +149,8 @@ class TestBatchProjectionMasterSentinel:
 
         merges = [p for q, p in executed if "MERGE (m:Master" in q]
         assert merges == [{"masters": [{"release_id": "1", "master_id": expected}]}]
-        prunes = [p for q, p in executed if "DELETE rel" in q and "[rel:DERIVED_FROM]" in q]
-        assert [p["records"] for p in prunes] == [[{"key": "1", "keep": [expected]}]]
+        prunes = [p for q, p in executed if "DELETE rel" in q and "DERIVED_FROM" in q]
+        assert [[r["masters"] for r in p["records"]] for p in prunes] == [[[expected]]]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("master_id", ["0", 0, ""])
