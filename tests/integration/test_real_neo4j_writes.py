@@ -222,6 +222,42 @@ async def test_release_batch_writes_representative_catalog_edges(neo4j_driver: A
 
 
 @pytest.mark.asyncio
+async def test_repeated_genres_and_styles_in_one_batch_project_one_node_and_edge_each(neo4j_driver: AsyncDriver) -> None:
+    """Genre/Style/PART_OF are merged once per distinct value, with every release edge kept."""
+    messages = [
+        pending(
+            "releases",
+            {
+                "id": f"dup-{n}",
+                "title": f"Dup {n}",
+                "sha256": f"dup-{n}",
+                "genres": genres,
+                "styles": styles,
+                "formats": [],
+            },
+        )
+        for n, (genres, styles) in enumerate(
+            [(["Rock"], ["Punk", "Garage"]), (["Rock"], ["Punk"]), (["Rock", "Pop"], ["Punk"]), (["Jazz"], [])],
+        )
+    ]
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    await import_releases(processor, *messages)
+    # A second import of the same data must leave the graph unchanged.
+    await import_releases(processor, *[pending("releases", {**m.data, "sha256": m.data["sha256"] + "-v2"}) for m in messages])
+
+    shape = await one(
+        neo4j_driver,
+        """
+        MATCH (g:Genre) WITH count(g) AS genres
+        MATCH (s:Style) WITH genres, count(s) AS styles
+        MATCH (:Release)-[i:IS]->() WITH genres, styles, count(i) AS is_edges
+        MATCH (:Style)-[p:PART_OF]->(:Genre) RETURN genres, styles, is_edges, count(p) AS part_of
+        """,
+    )
+    assert shape == {"genres": 3, "styles": 2, "is_edges": 9, "part_of": 2}
+
+
+@pytest.mark.asyncio
 async def test_multi_genre_release_does_not_create_cartesian_part_of_edges(neo4j_driver: AsyncDriver) -> None:
     """Genre/style co-occurrence on a multi-genre release must not be persisted as taxonomy."""
     processor = Neo4jBatchProcessor(neo4j_driver)
