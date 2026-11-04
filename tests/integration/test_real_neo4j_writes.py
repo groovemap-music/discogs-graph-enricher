@@ -221,6 +221,52 @@ async def test_release_batch_writes_representative_catalog_edges(neo4j_driver: A
     ) == {"title": "Release One", "artists": 1, "labels": 1, "masters": 1, "genres": 1, "styles": 1}
 
 
+def prune_release(version: str, artists: list[str], labels: list[str], master: str, genres: list[str], styles: list[str]) -> PendingMessage:
+    return pending(
+        "releases",
+        {
+            "id": "P1",
+            "title": "P1",
+            "sha256": version,
+            "artists": [{"id": a} for a in artists],
+            "labels": [{"id": x} for x in labels],
+            "master_id": master,
+            "genres": genres,
+            "styles": styles,
+            "formats": [],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_one_prune_statement_removes_exactly_the_edges_a_reimport_drops(neo4j_driver: AsyncDriver) -> None:
+    """BY, ON, DERIVED_FROM and IS (Genre and Style apart) are pruned together, each by its own keep-list."""
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    await import_releases(
+        processor,
+        pending("releases", {"id": "BYSTANDER", "title": "B", "sha256": "b", "artists": [{"id": "A2"}], "genres": ["Rock"], "formats": []}),
+        prune_release("v1", ["A1", "A2"], ["L1", "L2"], "M1", ["Rock", "Jazz"], ["Punk", "Bebop"]),
+    )
+    await import_releases(processor, prune_release("v2", ["A1"], ["L2"], "M2", ["Jazz"], ["Bebop"]))
+
+    edges = await one(
+        neo4j_driver,
+        """
+        MATCH (:Release {id: 'P1'})-[e:BY|ON|DERIVED_FROM|IS]->(t)
+        RETURN collect(type(e) + ':' + coalesce(t.id, t.name)) AS edges
+        """,
+    )
+    assert sorted(edges["edges"]) == ["BY:A1", "DERIVED_FROM:M2", "IS:Bebop", "IS:Jazz", "ON:L2"]
+    # A release outside the batch is untouched, and the shared nodes survive the pruned edges.
+    bystander = await one(neo4j_driver, "MATCH (:Release {id: 'BYSTANDER'})-[e:BY|IS]->() RETURN count(e) AS edges")
+    assert bystander == {"edges": 2}
+    assert (await one(neo4j_driver, "MATCH (n) WHERE n:Artist OR n:Label OR n:Genre OR n:Style RETURN count(n) AS nodes"))["nodes"] == 2 + 2 + 2 + 2
+
+    # Dropping everything leaves no edge of those types.
+    await import_releases(processor, prune_release("v3", [], [], "0", [], []))
+    assert await one(neo4j_driver, "MATCH (:Release {id: 'P1'})-[e:BY|ON|DERIVED_FROM|IS]->() RETURN count(e) AS edges") == {"edges": 0}
+
+
 @pytest.mark.asyncio
 async def test_multi_genre_release_does_not_create_cartesian_part_of_edges(neo4j_driver: AsyncDriver) -> None:
     """Genre/style co-occurrence on a multi-genre release must not be persisted as taxonomy."""

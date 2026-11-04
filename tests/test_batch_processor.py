@@ -627,6 +627,13 @@ class TestStaleEdgePruning:
     def _prunes(executed: list[tuple[str, dict[str, Any]]], rel_type: str, target: str) -> list[dict[str, Any]]:
         return [params for query, params in executed if "DELETE rel" in query and f"[rel:{rel_type}]" in query and f":{target})" in query]
 
+    @staticmethod
+    def _release_prune(executed: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+        """The one statement that prunes a release batch's BY/ON/DERIVED_FROM/IS edges."""
+        prunes = [params for query, params in executed if "DELETE rel" in query and "type(rel) = 'DERIVED_FROM'" in query]
+        assert len(prunes) == 1, "the release prunes are one statement per batch"
+        return prunes[0]
+
     @pytest.mark.asyncio
     async def test_release_prunes_dropped_genre_edges(self) -> None:
         mock_driver, _session, executed = self._tracking_session()
@@ -643,11 +650,11 @@ class TestStaleEdgePruning:
             ]
         )
 
-        genre_prunes = self._prunes(executed, "IS", "Genre")
-        assert len(genre_prunes) == 1
         # Only the genres the NEW version asserts are kept; "Rock" no longer matches
         # the keep-list, so its edge is deleted.
-        assert genre_prunes[0]["records"] == [{"key": "1", "keep": ["Jazz"]}]
+        (record,) = self._release_prune(executed)["records"]
+        assert record["key"] == "1"
+        assert record["genres"] == ["Jazz"]
 
     @pytest.mark.asyncio
     async def test_release_prunes_every_managed_edge_type(self) -> None:
@@ -674,10 +681,13 @@ class TestStaleEdgePruning:
             ]
         )
 
-        assert self._prunes(executed, "BY", "Artist")[0]["records"] == [{"key": "1", "keep": ["A1"]}]
-        assert self._prunes(executed, "ON", "Label")[0]["records"] == [{"key": "1", "keep": ["L1"]}]
-        assert self._prunes(executed, "DERIVED_FROM", "Master")[0]["records"] == [{"key": "1", "keep": ["M1"]}]
-        assert self._prunes(executed, "IS", "Style")[0]["records"] == [{"key": "1", "keep": ["Bebop"]}]
+        assert self._release_prune(executed)["records"] == [
+            {"key": "1", "artists": ["A1"], "labels": ["L1"], "masters": ["M1"], "genres": ["Jazz"], "styles": ["Bebop"]}
+        ]
+        # One keep-list and one target label per edge type, all in the one statement.
+        query = next(q for q, _ in executed if "type(rel) = 'DERIVED_FROM'" in q)
+        for rel_type, target in (("BY", "Artist"), ("ON", "Label"), ("DERIVED_FROM", "Master"), ("IS", "Genre"), ("IS", "Style")):
+            assert f"type(rel) = '{rel_type}' AND t:{target}" in query
 
     @pytest.mark.asyncio
     async def test_release_with_no_associations_prunes_them_all(self) -> None:
@@ -690,10 +700,7 @@ class TestStaleEdgePruning:
             [PendingMessage("releases", {"id": "1", "title": "R", "sha256": "newhash"}, AsyncMock(), AsyncMock())]
         )
 
-        for rel_type, target in (("BY", "Artist"), ("ON", "Label"), ("DERIVED_FROM", "Master"), ("IS", "Genre"), ("IS", "Style")):
-            prunes = self._prunes(executed, rel_type, target)
-            assert len(prunes) == 1, f"{rel_type}->{target} prune must run even with nothing to keep"
-            assert prunes[0]["records"] == [{"key": "1", "keep": []}]
+        assert self._release_prune(executed)["records"] == [{"key": "1", "artists": [], "labels": [], "masters": [], "genres": [], "styles": []}]
 
     @pytest.mark.asyncio
     async def test_master_prunes_dropped_genre_and_style_edges(self) -> None:
