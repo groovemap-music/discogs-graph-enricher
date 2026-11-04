@@ -3,6 +3,18 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.5.0 (2026-11-04)
+
+### Feat
+
+- **graphinator**: stamp ExtractionCompletion.maintained_at when post-import maintenance completes
+
+### Fix
+
+- **docs**: export stub names with psql -At so quotes and backslashes stay valid JSON
+- **graph**: name Artist and Label stubs from the release that references them
+- **maintenance**: page and checkpoint the aggregate sweeps so they finish on the full graph
+
 ## v0.4.0 (2026-11-01)
 
 ### Feat
