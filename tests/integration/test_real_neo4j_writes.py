@@ -15,7 +15,7 @@ from neo4j.exceptions import ServiceUnavailable
 
 import graphinator.graphinator as graphinator
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor, PendingMessage
-from graphinator.entity_projection import process_release
+from graphinator.entity_projection import process_artist, process_label, process_release
 from graphinator.person_credits import CREDIT_COUNT_PROPERTIES
 
 
@@ -634,3 +634,125 @@ async def test_maintained_at_stamp_on_real_neo4j(neo4j_driver: AsyncDriver, monk
     # Stamping a version with no node fails loudly instead of pretending.
     with pytest.raises(RuntimeError):
         await graphinator._stamp_maintenance_success("never-seen")
+
+
+# --- names carried by release references (stub nodes) ------------------------------------
+
+
+def named_release(sha256: str = "nr-a") -> dict[str, Any]:
+    return {
+        "id": "NR1",
+        "title": "NR1",
+        "sha256": sha256,
+        "formats": [],
+        "artists": [{"id": "A1", "name": " Stub Artist "}, {"id": "A2"}],
+        "labels": [{"id": "L1", "name": "Stub Label", "catno": "X 1"}, {"id": "L2", "name": "  "}],
+        "master_id": "M1",
+    }
+
+
+async def names(driver: AsyncDriver) -> dict[str, Any]:
+    row = await one(
+        driver,
+        """
+        MATCH (n) WHERE (n:Artist OR n:Label OR n:Master) AND n.id IN ['A1', 'A2', 'L1', 'L2', 'M1']
+        RETURN collect([n.id, n.name]) AS pairs
+        """,
+    )
+    return {pair[0]: pair[1] for pair in row["pairs"]}
+
+
+async def single_path(driver: AsyncDriver, fn: Any, record: dict[str, Any]) -> None:
+    async with driver.session(database="neo4j") as session:
+        await session.execute_write(fn, record)
+
+
+@pytest.mark.asyncio
+async def test_batch_release_names_the_artist_and_label_stubs_it_creates(neo4j_driver: AsyncDriver) -> None:
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    await import_releases(processor, pending("releases", named_release()))
+    # A reference with no usable name stays unnamed; the master reference carries no title.
+    assert await names(neo4j_driver) == {"A1": "Stub Artist", "A2": None, "L1": "Stub Label", "L2": None, "M1": None}
+    # Stubs stay recognisable: no sha256.
+    assert (await one(neo4j_driver, "MATCH (n:Label {id: 'L1'}) RETURN n.sha256 AS hash"))["hash"] is None
+
+
+@pytest.mark.asyncio
+async def test_single_release_names_the_artist_and_label_stubs_it_creates(neo4j_driver: AsyncDriver) -> None:
+    await single_path(neo4j_driver, process_release, named_release())
+    assert await names(neo4j_driver) == {"A1": "Stub Artist", "A2": None, "L1": "Stub Label", "L2": None, "M1": None}
+
+
+@pytest.mark.asyncio
+async def test_batch_entity_record_overwrites_a_stub_name_and_release_never_overwrites_it(neo4j_driver: AsyncDriver) -> None:
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    # Stub first, entity second: the entity's own name wins.
+    await import_releases(processor, pending("releases", named_release()))
+    await enqueue(processor, pending("labels", {"id": "L1", "name": "Real Label", "sha256": "l1"}))
+    await enqueue(processor, pending("artists", {"id": "A1", "name": "Real Artist", "sha256": "a1"}))
+    assert await processor.flush_queue("labels") is True
+    assert await processor.flush_queue("artists") is True
+    assert (await names(neo4j_driver))["L1"] == "Real Label"
+    assert (await names(neo4j_driver))["A1"] == "Real Artist"
+    # Entity first, a later (changed) release second: the entity's name is untouched.
+    changed = named_release("nr-b")
+    changed["labels"][0]["name"] = "Different Spelling"
+    changed["artists"][0]["name"] = "Different Artist"
+    await import_releases(processor, pending("releases", changed))
+    assert (await names(neo4j_driver))["L1"] == "Real Label"
+    assert (await names(neo4j_driver))["A1"] == "Real Artist"
+
+
+@pytest.mark.asyncio
+async def test_single_path_both_arrival_orders_keep_the_entity_name(neo4j_driver: AsyncDriver) -> None:
+    await single_path(neo4j_driver, process_release, named_release())
+    await single_path(neo4j_driver, process_label, {"id": "L1", "name": "Real Label", "sha256": "l1"})
+    await single_path(neo4j_driver, process_artist, {"id": "A1", "name": "Real Artist", "sha256": "a1"})
+    assert (await names(neo4j_driver))["L1"] == "Real Label"
+    assert (await names(neo4j_driver))["A1"] == "Real Artist"
+
+    changed = named_release("nr-b")
+    changed["labels"][0]["name"] = "Different Spelling"
+    changed["artists"][0]["name"] = "Different Artist"
+    await single_path(neo4j_driver, process_release, changed)
+    assert (await names(neo4j_driver))["L1"] == "Real Label"
+    assert (await names(neo4j_driver))["A1"] == "Real Artist"
+
+
+@pytest.mark.asyncio
+async def test_a_later_release_fills_a_missing_name_but_not_an_existing_one(neo4j_driver: AsyncDriver) -> None:
+    """A stub first seen with no name takes the name from the next release that has one."""
+    unnamed = named_release()
+    unnamed["labels"][0].pop("name")
+    await single_path(neo4j_driver, process_release, unnamed)
+    assert (await names(neo4j_driver))["L1"] is None
+    await single_path(neo4j_driver, process_release, named_release("nr-b"))
+    assert (await names(neo4j_driver))["L1"] == "Stub Label"
+
+
+@pytest.mark.asyncio
+async def test_stub_name_backfill_is_batched_resumable_and_fill_only(neo4j_driver: AsyncDriver, tmp_path: Any) -> None:
+    from graphinator.stub_name_backfill import backfill
+
+    async with neo4j_driver.session(database="neo4j") as session:
+        await session.run("CREATE (:Label {id: 'L1'}), (:Label {id: 'L2'}), (:Label {id: 'L3', name: 'Own Name'}), (:Artist {id: 'A1'})")
+    lines = [
+        '{"kind": "Label", "id": "L1", "name": "One"}',
+        '{"kind": "Label", "id": "L2", "name": "Two"}',
+        '{"kind": "Label", "id": "L3", "name": "Not Mine"}',
+        "not json",
+        '{"kind": "Artist", "id": "A1", "name": "Artist One"}',
+    ]
+    source = tmp_path / "names.ndjson"
+    source.write_text("\n".join(lines) + "\n")
+    checkpoint = tmp_path / "checkpoint"
+
+    totals = await backfill(neo4j_driver, source, batch_size=2, checkpoint=checkpoint)
+
+    assert totals["filled"] == 3
+    assert totals["skipped"] == 1
+    assert checkpoint.read_text().strip() == "5"
+    got = await one(neo4j_driver, "MATCH (n) WHERE n.id IN ['L1','L2','L3','A1'] RETURN collect([n.id, n.name]) AS p")
+    assert sorted(got["p"]) == [["A1", "Artist One"], ["L1", "One"], ["L2", "Two"], ["L3", "Own Name"]]
+    # A re-run resumes after the checkpoint and has nothing left to do.
+    assert (await backfill(neo4j_driver, source, batch_size=2, checkpoint=checkpoint))["lines"] == 0

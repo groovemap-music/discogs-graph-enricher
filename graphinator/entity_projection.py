@@ -22,6 +22,7 @@ from graphinator.media_projection import (
     resolve_media_block,
 )
 from graphinator.person_credits import PRUNE_CREDITED_ON_CYPHER, credited_on_prune_record, person_credit_rows
+from graphinator.reference_name import reference_name
 
 
 async def process_artist(tx: Any, record: dict[str, Any]) -> bool:
@@ -320,8 +321,10 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         valid_artists = [artist for artist in artists if artist.get("id")]
         if valid_artists:
             await tx.run(
-                "UNWIND $artists AS artist MATCH (r:Release {id: $release_id}) MERGE (a_r:Artist {id: artist.id}) MERGE (r)-[:BY]->(a_r)",
-                artists=valid_artists,
+                "UNWIND $artists AS artist MATCH (r:Release {id: $release_id}) MERGE (a_r:Artist {id: artist.id}) "
+                "ON CREATE SET a_r.name = artist.name ON MATCH SET a_r.name = coalesce(a_r.name, artist.name) "
+                "MERGE (r)-[:BY]->(a_r)",
+                artists=[{"id": artist["id"], "name": reference_name(artist)} for artist in valid_artists],
                 release_id=record["id"],
             )
 
@@ -330,8 +333,10 @@ async def process_release(tx: Any, record: dict[str, Any]) -> bool:
         valid_labels = [label for label in labels if label.get("id")]
         if valid_labels:
             await tx.run(
-                "UNWIND $labels AS label MATCH (r:Release {id: $release_id}) MERGE (l_r:Label {id: label.id}) MERGE (r)-[:ON]->(l_r)",
-                labels=valid_labels,
+                "UNWIND $labels AS label MATCH (r:Release {id: $release_id}) MERGE (l_r:Label {id: label.id}) "
+                "ON CREATE SET l_r.name = label.name ON MATCH SET l_r.name = coalesce(l_r.name, label.name) "
+                "MERGE (r)-[:ON]->(l_r)",
+                labels=[{"id": label["id"], "name": reference_name(label)} for label in valid_labels],
                 release_id=record["id"],
             )
 
