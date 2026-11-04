@@ -716,6 +716,48 @@ async def test_sweeps_write_only_properties_that_changed(neo4j_driver: AsyncDriv
 
 
 @pytest.mark.asyncio
+async def test_an_over_limit_person_name_cannot_lose_the_release(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With the real unique index on Person.name, a name past its 8,164-byte key limit is bounded, not fatal."""
+    async with neo4j_driver.session(database="neo4j") as session:
+        await session.run("CREATE CONSTRAINT person_name_key IF NOT EXISTS FOR (p:Person) REQUIRE p.name IS UNIQUE")
+    fits = "a" * 8000  # the largest name left as received
+    ascii_long = "b" * 9000
+    wide_long = "€" * 4000  # 12,000 bytes in 4,000 characters
+
+    def release(sha: str) -> PendingMessage:
+        return credited_release("LONG1", sha, (fits, "Producer"), (ascii_long, "Mixed By"), (wide_long, "Bass"), ("Flood", "Producer"))
+
+    # Control: with the guard off the real index refuses the batch and the release is nacked.
+    with monkeypatch.context() as unguarded:
+        unguarded.setattr("graphinator.person_credits.PERSON_NAME_MAX_BYTES", 10**9)
+        control = release("control")
+        config = BatchConfig(batch_size=1, min_batch_size=1, max_flush_retries=1, max_poison_retries=1, backoff_initial=0.01, backoff_max=0.01)
+        unguarded_processor = Neo4jBatchProcessor(neo4j_driver, config)
+        await enqueue(unguarded_processor, control)
+        await unguarded_processor.flush_queue("releases")
+        control.nack_callback.assert_awaited()
+        control.ack_callback.assert_not_awaited()
+    assert (await one(neo4j_driver, "MATCH (r:Release {id: 'LONG1'}) RETURN count(r) AS n"))["n"] == 0
+
+    processor = Neo4jBatchProcessor(neo4j_driver)
+    await import_releases(processor, release("v1"))
+    # Re-importing the same data is idempotent: one Person per distinct name.
+    await import_releases(processor, release("v2"))
+
+    people = await one(
+        neo4j_driver,
+        """
+        MATCH (p:Person)-[c:CREDITED_ON]->(:Release {id: 'LONG1'})
+        RETURN count(DISTINCT p) AS people, count(c) AS credits, max(size(p.name)) AS longest
+        """,
+    )
+    assert people["people"] == 4
+    assert people["credits"] == 4
+    assert people["longest"] <= 8000
+    assert (await one(neo4j_driver, "MATCH (p:Person {name: $name}) RETURN count(p) AS n", name=fits))["n"] == 1
+
+
+@pytest.mark.asyncio
 async def test_maintained_at_stamp_on_real_neo4j(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
     """Stamp, failure record, idempotence and per-version independence in real Cypher."""
     monkeypatch.setattr(graphinator, "graph", neo4j_driver)

@@ -26,10 +26,15 @@ of the two categories.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import Any
 
+import structlog
 from common.credit_roles import ALL_CATEGORIES, categorize_role
+
+
+logger = structlog.get_logger(__name__)
 
 
 # Category names are interpolated into Cypher as property names and variables (Cypher
@@ -42,6 +47,30 @@ for _category in ALL_CATEGORIES:
         raise ValueError(msg)
 
 CREDIT_COUNT_PROPERTY = "credit_count"
+
+# ``Person.name`` is the node key, so it is backed by a unique RANGE index, and Neo4j
+# refuses to index a value over 8,164 bytes of UTF-8 (measured on Neo4j 2026: the same
+# for 1-, 2-, 3- and 4-byte characters; 8,165 is rejected). One such name would fail the
+# whole write batch, be retried, and end with the release nacked and lost. The longest real
+# name on lux is 4,159 characters, so real data fits; this bounds the pathological one.
+PERSON_NAME_MAX_BYTES = 8000
+
+
+def bound_person_name(name: str) -> str:
+    """Return ``name``, or a deterministic bounded form when it is too long to index.
+
+    A name within :data:`PERSON_NAME_MAX_BYTES` UTF-8 bytes is returned unchanged, so every
+    existing Person keeps its identity. A longer one is cut on a character boundary and
+    ends in a digest of the full name: the credit is kept, the same input always maps to
+    the same Person (re-imports stay idempotent), and two different long names that share a
+    prefix do not collapse into one Person.
+    """
+    encoded = name.encode("utf-8")
+    if len(encoded) <= PERSON_NAME_MAX_BYTES:
+        return name
+    suffix = f"... [{hashlib.sha256(encoded).hexdigest()[:16]}]"
+    keep = PERSON_NAME_MAX_BYTES - len(suffix.encode("utf-8"))
+    return encoded[:keep].decode("utf-8", errors="ignore") + suffix
 
 
 def credit_count_property(category: str) -> str:
@@ -60,14 +89,19 @@ def person_credit_rows(release_id: Any, extraartists: list[dict[str, Any]] | Non
     """Return one CREDITED_ON row per usable extraartists credit of a release.
 
     A credit without a name or a role is not projected. ``artist_id`` is carried only
-    when Discogs links the credit to an artist, for the ``SAME_AS`` edge.
+    when Discogs links the credit to an artist, for the ``SAME_AS`` edge. A name too long
+    for the Person index is replaced by :func:`bound_person_name`'s bounded form.
     """
     rows: list[dict[str, Any]] = []
+    bounded = 0
     for credit in extraartists or []:
         name = credit.get("name")
         role = credit.get("role", "")
         if not (name and role):
             continue
+        if isinstance(name, str) and (limited := bound_person_name(name)) != name:
+            bounded += 1
+            name = limited
         row: dict[str, Any] = {
             "name": name,
             "role": role,
@@ -77,6 +111,9 @@ def person_credit_rows(release_id: Any, extraartists: list[dict[str, Any]] | Non
         if artist_id := credit.get("id"):
             row["artist_id"] = artist_id
         rows.append(row)
+    if bounded:
+        # Counts only: a name this long is not safe to log.
+        logger.warning("⚠️ Person name over the index limit was bounded", release_id=release_id, bounded=bounded, limit_bytes=PERSON_NAME_MAX_BYTES)
     return rows
 
 
