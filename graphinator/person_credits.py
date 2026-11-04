@@ -14,8 +14,9 @@ leaderboard:
   is ``CREDITED_ON`` with that category.
 - ``credit_count`` — the number of DISTINCT releases the person is ``CREDITED_ON`` at all.
 
-Every property is written on every Person on every pass, and a category the person no
-longer has reads ``0`` — never an absent property. Writing the zero is what makes a
+Every property holds a value on every Person after every pass (an unchanged one is not
+rewritten, see :func:`build_credit_count_page_cypher`), and a category the person no
+longer has reads ``0`` — never an absent property. Holding the zero is what makes a
 removed credit visible: an absent property would need a separate ``REMOVE`` for exactly
 the people who lost a category, and a reader could not tell "lost it" from "never
 recomputed". ``credit_count`` is not the sum of the per-category counts: a person who
@@ -117,7 +118,14 @@ def build_credit_count_page_cypher() -> str:
     category_sums = ",\n            ".join(
         f"sum(CASE WHEN '{category}' IN categories THEN 1 ELSE 0 END) AS count_{category}" for category in ALL_CATEGORIES
     )
-    category_sets = ",\n            ".join(f"p.{credit_count_property(category)} = count_{category}" for category in ALL_CATEGORIES)
+    # Compare before writing, per property: an unchanged value is not SET, so a rerun over
+    # unchanged data takes no write lock and updates none of the eight credit_count indexes.
+    # IS NULL covers a property never written; a stale value (including a lost category that
+    # must now read 0) differs and is rewritten.
+    counted = [(CREDIT_COUNT_PROPERTY, "total"), *((credit_count_property(category), f"count_{category}") for category in ALL_CATEGORIES)]
+    guarded_sets = "\n        ".join(
+        f"FOREACH (_ IN CASE WHEN p.{prop} IS NULL OR p.{prop} <> {value} THEN [1] ELSE [] END | SET p.{prop} = {value})" for prop, value in counted
+    )
     return f"""
     MATCH (p:Person)
     WHERE p.name > $cursor
@@ -129,8 +137,7 @@ def build_credit_count_page_cypher() -> str:
         WITH p,
             count(r) AS total,
             {category_sums}
-        SET p.{CREDIT_COUNT_PROPERTY} = total,
-            {category_sets}
+        {guarded_sets}
     }}
     RETURN max(p.name) AS last, count(p) AS processed
     """
