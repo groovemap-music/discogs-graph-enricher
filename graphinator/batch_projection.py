@@ -44,6 +44,26 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+_MERGE_GENRES_CYPHER = """
+UNWIND $names AS name
+MERGE (:Genre {name: name})
+"""
+
+_MERGE_STYLES_CYPHER = """
+UNWIND $names AS name
+MERGE (:Style {name: name})
+"""
+
+
+def _distinct_values(rows: list[dict[str, Any]], key: str) -> list[Any]:
+    """Return the distinct ``key`` values of ``rows`` in first-seen order."""
+    return list(dict.fromkeys(row[key] for row in rows))
+
+
+def _distinct_pairs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return ``{genre, style}`` rows with repeats removed, in first-seen order."""
+    return list({(row["genre"], row["style"]): row for row in rows}.values())
+
 
 class Neo4jBatchProjector:
     """Build and execute entity-specific writes within processor-owned batches."""
@@ -463,11 +483,14 @@ class Neo4jBatchProjector:
                                     }
                                 )
                 if genre_data:
+                    # Merge each distinct Genre once per batch, then only MATCH it per row: the same few
+                    # names repeat across every record of a batch.
+                    await tx.run(_MERGE_GENRES_CYPHER, names=_distinct_values(genre_data, "genre"))
                     await tx.run(
                         """
                         UNWIND $genres AS rel
                         MATCH (m:Master {id: rel.master_id})
-                        MERGE (g:Genre {name: rel.genre})
+                        MATCH (g:Genre {name: rel.genre})
                         MERGE (m)-[:IS]->(g)
                         """,
                         genres=genre_data,
@@ -486,11 +509,14 @@ class Neo4jBatchProjector:
                                     }
                                 )
                 if style_data:
+                    # Merge each distinct Style once per batch, then only MATCH it per row: the same few
+                    # names repeat across every record of a batch.
+                    await tx.run(_MERGE_STYLES_CYPHER, names=_distinct_values(style_data, "style"))
                     await tx.run(
                         """
                         UNWIND $styles AS rel
                         MATCH (m:Master {id: rel.master_id})
-                        MERGE (s:Style {name: rel.style})
+                        MATCH (s:Style {name: rel.style})
                         MERGE (m)-[:IS]->(s)
                         """,
                         styles=style_data,
@@ -515,6 +541,8 @@ class Neo4jBatchProjector:
                                     }
                                 )
                 if genre_style_data:
+                    # The same few (genre, style) pairs repeat across a batch; merge each once.
+                    genre_style_data = _distinct_pairs(genre_style_data)
                     await tx.run(
                         """
                         UNWIND $pairs AS pair
@@ -766,11 +794,14 @@ class Neo4jBatchProjector:
                                     }
                                 )
                 if genre_data:
+                    # Merge each distinct Genre once per batch, then only MATCH it per row: the same few
+                    # names repeat across every record of a batch.
+                    await tx.run(_MERGE_GENRES_CYPHER, names=_distinct_values(genre_data, "genre"))
                     await tx.run(
                         """
                         UNWIND $genres AS rel
                         MATCH (r:Release {id: rel.release_id})
-                        MERGE (g:Genre {name: rel.genre})
+                        MATCH (g:Genre {name: rel.genre})
                         MERGE (r)-[:IS]->(g)
                         """,
                         genres=genre_data,
@@ -789,11 +820,14 @@ class Neo4jBatchProjector:
                                     }
                                 )
                 if style_data:
+                    # Merge each distinct Style once per batch, then only MATCH it per row: the same few
+                    # names repeat across every record of a batch.
+                    await tx.run(_MERGE_STYLES_CYPHER, names=_distinct_values(style_data, "style"))
                     await tx.run(
                         """
                         UNWIND $styles AS rel
                         MATCH (r:Release {id: rel.release_id})
-                        MERGE (s:Style {name: rel.style})
+                        MATCH (s:Style {name: rel.style})
                         MERGE (r)-[:IS]->(s)
                         """,
                         styles=style_data,
@@ -818,6 +852,8 @@ class Neo4jBatchProjector:
                                     }
                                 )
                 if genre_style_data:
+                    # The same few (genre, style) pairs repeat across a batch; merge each once.
+                    genre_style_data = _distinct_pairs(genre_style_data)
                     await tx.run(
                         """
                         UNWIND $pairs AS pair
