@@ -885,6 +885,167 @@ async def test_genre_style_label_stats_are_computed_by_paged_statements(neo4j_dr
     assert l3 == {"rc": 0, "ac": 0, "gc": 0}
 
 
+# catalog-api's statement for the two artist counts, verbatim from its
+# tests/test_explore_artist_stats_integration.py (bead gm-catalog-api-87pz). The sweep has
+# to store exactly what this computes.
+CATALOG_API_ARTIST_COUNTS = """
+MATCH (a:Artist)
+CALL (a) {
+    OPTIONAL MATCH (r:Release)-[:BY]->(a)
+    WITH a, count(DISTINCT r) AS release_count
+    OPTIONAL MATCH (r2:Release)-[:BY]->(a)
+    OPTIONAL MATCH (r2)-[:ON]->(l:Label)
+    WITH a, release_count, count(DISTINCT l) AS label_count
+    RETURN a.id AS id, release_count, label_count
+}
+RETURN id, release_count, label_count ORDER BY id
+"""
+
+# The whole histogram, with no ORDER BY or LIMIT tricks, for comparing with what the sweep stored.
+LIVE_GENRE_HISTOGRAM = """
+MATCH (a:Artist)<-[:BY]-(r:Release)-[:IS]->(g:Genre)
+RETURN a.id AS id, g.name AS genre, count(DISTINCT r) AS releases
+"""
+
+LIVE_LABEL_STYLES = """
+MATCH (l:Label)<-[:ON]-(r:Release)-[:IS]->(s:Style)
+RETURN l.id AS id, s.name AS style, count(DISTINCT r) AS releases ORDER BY id, style
+"""
+
+STORED_LABEL_STYLES = """
+MATCH (l:Label)-[h:HAS_STYLE]->(s:Style)
+RETURN l.id AS id, s.name AS style, h.release_count AS releases ORDER BY id, style
+"""
+
+ARTIST_STATS_SEED = """
+CREATE (rock:Genre {name: 'Rock'}), (jazz:Genre {name: 'Jazz'}), (pop:Genre {name: 'Pop'}),
+       (punk:Style {name: 'Punk'}), (bop:Style {name: 'Bebop'}),
+       (l1:Label {id: 'L1'}), (l2:Label {id: 'L2'}), (l3:Label {id: 'L3'}),
+       (heavy:Artist {id: 'A1'}), (tied:Artist {id: 'A2'}), (none:Artist {id: 'A3'}), (masters:Artist {id: 'A4'}),
+       (various:Artist {id: '194'}),
+       (m:Master {id: 'M1'}), (m)-[:BY]->(masters), (m)-[:IS]->(rock),
+       (r1:Release {id: 'R1'}), (r2:Release {id: 'R2'}), (r3:Release {id: 'R3'}), (r4:Release {id: 'R4'}),
+       (r1)-[:BY]->(heavy), (r1)-[:IS]->(rock), (r1)-[:IS]->(jazz), (r1)-[:IS]->(punk), (r1)-[:ON]->(l1), (r1)-[:ON]->(l2),
+       (r2)-[:BY]->(heavy), (r2)-[:IS]->(rock), (r2)-[:IS]->(punk), (r2)-[:ON]->(l1),
+       (r3)-[:BY]->(heavy), (r3)-[:BY]->(tied), (r3)-[:IS]->(jazz), (r3)-[:IS]->(bop), (r3)-[:ON]->(l2),
+       (r4)-[:BY]->(tied), (r4)-[:IS]->(rock)
+WITH various, rock, jazz, pop, punk, bop, l1, l2
+UNWIND range(1, 500) AS i
+WITH various, 'V' + i AS id, CASE WHEN i % 5 = 0 THEN rock ELSE pop END AS genre,
+     CASE WHEN i % 2 = 0 THEN punk ELSE bop END AS style, CASE WHEN i % 3 = 0 THEN l1 ELSE l2 END AS label
+CREATE (r:Release {id: id})-[:BY]->(various), (r)-[:IS]->(genre), (r)-[:IS]->(style), (r)-[:ON]->(label)
+"""
+
+
+async def run_artist_and_label_stats(driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch, run_key: str) -> None:
+    monkeypatch.setattr(graphinator, "graph", driver)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "LABEL_STATS_PAGE_SIZE", 2)
+    monkeypatch.setattr(graphinator, "ARTIST_STATS_PAGE_SIZE", 2)
+    token = graphinator._maintenance_run_key.set(run_key)
+    try:
+        assert await graphinator.compute_genre_style_stats() is True
+        assert await graphinator.compute_artist_stats() is True
+    finally:
+        graphinator._maintenance_run_key.reset(token)
+
+
+async def rows(driver: AsyncDriver, cypher: str) -> list[dict[str, Any]]:
+    async with driver.session(database="neo4j") as session:
+        result = await session.run(cypher)
+        return [dict(record) async for record in result]
+
+
+def exact_primary_genres(histogram: list[dict[str, Any]]) -> dict[str, str]:
+    """The most releases, then the alphabetically first name, computed outside Cypher."""
+    best: dict[str, tuple[int, str]] = {}
+    for row in histogram:
+        candidate = (-row["releases"], row["genre"])
+        if row["id"] not in best or candidate < best[row["id"]]:
+            best[row["id"]] = candidate
+    return {artist: genre for artist, (_, genre) in best.items()}
+
+
+@pytest.mark.asyncio
+async def test_artist_stats_equal_the_live_counts_including_a_hub(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored values against catalog-api's statement and an exhaustive genre histogram."""
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "integration-run")
+
+    stored = await rows(
+        neo4j_driver,
+        "MATCH (a:Artist) RETURN a.id AS id, a.release_count AS release_count, a.label_count AS label_count, a.primary_genre AS genre ORDER BY id",
+    )
+    assert [{k: row[k] for k in ("id", "release_count", "label_count")} for row in stored] == await rows(neo4j_driver, CATALOG_API_ARTIST_COUNTS)
+    assert {row["id"]: row["genre"] for row in stored if row["genre"]} == exact_primary_genres(await rows(neo4j_driver, LIVE_GENRE_HISTOGRAM))
+
+    by_id = {row["id"]: row for row in stored}
+    # Rock on two of three releases, Jazz on two: the same tie rule, with a real count behind it.
+    assert by_id["A1"] == {"id": "A1", "release_count": 3, "label_count": 2, "genre": "Jazz"}
+    # A hub is computed like anyone else: every release counted, none sampled.
+    assert by_id["194"] == {"id": "194", "release_count": 500, "label_count": 2, "genre": "Pop"}
+    # One Jazz and one Rock release: the tie goes to the alphabetically first name, every time.
+    assert by_id["A2"]["genre"] == "Jazz"
+    # No releases, and a Master credit that is not a Release: zero counts, no genre.
+    assert by_id["A3"] == {"id": "A3", "release_count": 0, "label_count": 0, "genre": None}
+    assert by_id["A4"] == {"id": "A4", "release_count": 0, "label_count": 0, "genre": None}
+
+
+@pytest.mark.asyncio
+async def test_label_style_edges_equal_the_live_counts(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "integration-run")
+
+    stored = await rows(neo4j_driver, STORED_LABEL_STYLES)
+    assert stored == await rows(neo4j_driver, LIVE_LABEL_STYLES)
+    assert {"id": "L1", "style": "Punk", "releases": 2 + 83} in stored
+    labels = await rows(neo4j_driver, "MATCH (l:Label {id: 'L3'}) RETURN l.release_count AS rc, l.artist_count AS ac, l.genre_count AS gc")
+    assert labels == [{"rc": 0, "ac": 0, "gc": 0}]
+    assert await rows(neo4j_driver, "MATCH (:Label {id: 'L3'})-[h:HAS_STYLE]->() RETURN h") == []
+
+
+@pytest.mark.asyncio
+async def test_a_later_pass_follows_the_graph_and_an_unchanged_one_writes_nothing(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A removed style loses its edge, a lost genre loses its property, and a rerun is free."""
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "run-1")
+
+    async with neo4j_driver.session(database="neo4j") as session:
+        before = await (await session.run(graphinator.build_artist_stats_page_cypher(), cursor="", size=100)).consume()
+        label_before = await (await session.run(graphinator.build_label_stats_page_cypher(), cursor="", size=100)).consume()
+    assert before.counters.properties_set == 0
+    assert label_before.counters.properties_set == 0
+    assert label_before.counters.relationships_created == 0
+    assert label_before.counters.relationships_deleted == 0
+
+    # Bebop leaves L2 entirely (R3 and every odd V release), and A2 loses its genres.
+    await rows(neo4j_driver, "MATCH (:Style {name: 'Bebop'})<-[e:IS]-(:Release) DELETE e")
+    await rows(neo4j_driver, "MATCH (:Artist {id: 'A2'})<-[:BY]-(:Release)-[e:IS]->(:Genre) DELETE e")
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "run-2")
+
+    assert await rows(neo4j_driver, STORED_LABEL_STYLES) == await rows(neo4j_driver, LIVE_LABEL_STYLES)
+    assert await rows(neo4j_driver, "MATCH (:Label)-[h:HAS_STYLE]->(:Style {name: 'Bebop'}) RETURN h") == []
+    assert await rows(neo4j_driver, "MATCH (a:Artist {id: 'A2'}) RETURN a.primary_genre AS genre, a.release_count AS rc") == [
+        {"genre": None, "rc": 2}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_derived_style_edges_do_not_keep_an_orphaned_stub_label(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stub Label with only HAS_STYLE left is collected; a stub with a real edge is kept."""
+    await rows(
+        neo4j_driver,
+        """
+        CREATE (orphan:Label {id: 'L-orphan'})-[:HAS_STYLE {release_count: 3}]->(s:Style {name: 'Punk'}),
+               (kept:Label {id: 'L-kept'})-[:HAS_STYLE {release_count: 1}]->(s),
+               (:Release {id: 'R1'})-[:ON]->(kept)
+        """,
+    )
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    assert await graphinator.cleanup_stub_nodes("labels") is True
+    assert await rows(neo4j_driver, "MATCH (l:Label) RETURN l.id AS id") == [{"id": "L-kept"}]
+
+
 _ORACLE_METRICS = {
     "release_count": "MATCH (n)<-[:IS]-(r:Release) RETURN count(DISTINCT r) AS v",
     "artist_count": "MATCH (n)<-[:IS]-(r:Release)-[:BY]->(a:Artist) RETURN count(DISTINCT a) AS v",
@@ -1073,3 +1234,355 @@ async def test_stub_name_backfill_is_batched_resumable_and_fill_only(neo4j_drive
     assert sorted(got["p"]) == [["A1", "Artist One"], ["L1", "One"], ["L2", "Two"], ["L3", "Own Name"]]
     # A re-run resumes after the checkpoint and has nothing left to do.
     assert (await backfill(neo4j_driver, source, batch_size=2, checkpoint=checkpoint))["lines"] == 0
+
+
+# ── Stats refresh on an already-stamped dump ───────────────────────────────
+
+_REAL_REFRESH_HELPERS = {
+    "_load_extraction_signals": _LOAD_EXTRACTION_SIGNALS,
+    "_is_extraction_maintained": _REAL_MAINTENANCE_HELPERS["_is_extraction_maintained"],
+    "_latest_extraction_version": _REAL_MAINTENANCE_HELPERS["_latest_extraction_version"],
+    "_stamp_maintenance_success": _REAL_MAINTENANCE_HELPERS["_stamp_maintenance_success"],
+}
+
+DUMP = "20261101"
+MAINTAINED_AT = "2026-11-04T23:46:15.057Z"
+
+# What lux holds after a pass by the code before STATS_VERSION: stamped and succeeded, every
+# step done under the plain version, and no Artist stats or HAS_STYLE edges anywhere.
+STAMPED_DUMP_SEED = """
+CREATE (:ExtractionCompletion {version: $version, signals: ['releases', 'artists', 'labels', 'masters'],
+                               created_at: datetime('2026-11-02T00:00:00Z'), maintained_at: datetime($maintained_at),
+                               maintenance_status: 'succeeded'})
+WITH 1 AS _
+UNWIND ['genre_stats', 'style_stats', 'label_stats', 'person_credit_counts'] AS step
+CREATE (:MaintenanceCheckpoint {step: step, run_key: $version, cursor: 'zzz', size: 100, done: true})
+"""
+
+
+@pytest_asyncio.fixture
+async def stamped_dump(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> AsyncDriver:
+    """A stamped dump on real Neo4j, with the real latch helpers and no refresh running."""
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    async with neo4j_driver.session(database="neo4j") as session:
+        await (await session.run(STAMPED_DUMP_SEED, version=DUMP, maintained_at=MAINTAINED_AT)).consume()
+    for name, helper in _REAL_REFRESH_HELPERS.items():
+        monkeypatch.setattr(graphinator, name, helper)
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    monkeypatch.setattr(graphinator, "batch_processor", None)
+    monkeypatch.setattr(graphinator, "post_import_maintenance_task", None)
+    monkeypatch.setattr(graphinator, "stats_refresh_task", None)
+    monkeypatch.setattr(graphinator, "message_counts", dict.fromkeys(graphinator.message_counts, 0))
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "STATS_REFRESH_VERSION_CHECK_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "LABEL_STATS_PAGE_SIZE", 2)
+    monkeypatch.setattr(graphinator, "ARTIST_STATS_PAGE_SIZE", 2)
+    return neo4j_driver
+
+
+async def dump_node(driver: AsyncDriver, version: str = DUMP) -> dict[str, Any]:
+    return await one(
+        driver,
+        """
+        MATCH (m:ExtractionCompletion {version: $version})
+        RETURN toString(m.maintained_at) AS maintained_at, m.maintenance_status AS status,
+               m.maintenance_error AS error, m.stats_version AS stats_version
+        """,
+        version=version,
+    )
+
+
+async def stats_equal_live(driver: AsyncDriver) -> bool:
+    stored = await rows(
+        driver,
+        "MATCH (a:Artist) RETURN a.id AS id, a.release_count AS release_count, a.label_count AS label_count, a.primary_genre AS genre ORDER BY id",
+    )
+    counts = [{k: row[k] for k in ("id", "release_count", "label_count")} for row in stored]
+    genres = {row["id"]: row["genre"] for row in stored if row["genre"]}
+    return (
+        counts == await rows(driver, CATALOG_API_ARTIST_COUNTS)
+        and genres == exact_primary_genres(await rows(driver, LIVE_GENRE_HISTOGRAM))
+        and await rows(driver, STORED_LABEL_STYLES) == await rows(driver, LIVE_LABEL_STYLES)
+    )
+
+
+def count_artist_pages(monkeypatch: pytest.MonkeyPatch, *, crash_at: int | None = None, pause_at: int | None = None) -> dict[str, Any]:
+    """Wrap the Artist page statement: record each cursor, and crash or pause on the Nth page."""
+    real_run = graphinator.maintenance_paging.run_statement
+    seen: dict[str, Any] = {"cursors": [], "reached": asyncio.Event(), "release": asyncio.Event()}
+
+    async def run(graph: Any, cypher: str, **params: Any) -> Any:
+        if "MATCH (a:Artist)" in cypher:
+            seen["cursors"].append(params["cursor"])
+            page = len(seen["cursors"])
+            if page == crash_at:
+                raise RuntimeError("connection lost")
+            if page == pause_at:
+                seen["reached"].set()
+                await seen["release"].wait()
+        return await real_run(graph, cypher, **params)
+
+    monkeypatch.setattr(graphinator.maintenance_paging, "run_statement", run)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_a_restart_on_a_stamped_dump_writes_the_stats_and_keeps_the_stamp(stamped_dump: AsyncDriver) -> None:
+    """Lux's case: no pass will run, and label_stats is done, yet the values must appear."""
+    assert await graphinator.resume_pending_maintenance() is False, "a stamped dump gets no maintenance pass"
+    assert await rows(stamped_dump, "MATCH (a:Artist) WHERE a.release_count IS NOT NULL RETURN a") == []
+
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+
+    assert await stats_equal_live(stamped_dump)
+    assert await dump_node(stamped_dump) == {
+        "maintained_at": MAINTAINED_AT,
+        "status": "succeeded",
+        "error": None,
+        "stats_version": graphinator.STATS_VERSION,
+    }
+    # The steps a refresh has no business repeating keep their checkpoints.
+    assert await rows(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.run_key AS key") == [{"key": DUMP}]
+
+    # The next start finds nothing to do.
+    assert await graphinator.resume_stats_refresh() is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_keeps_the_stamp_and_resumes_after_its_last_page(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS", 1)
+    failing = count_artist_pages(monkeypatch, crash_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is False
+
+    assert await dump_node(stamped_dump) == {"maintained_at": MAINTAINED_AT, "status": "succeeded", "error": None, "stats_version": None}
+    label_step = await one(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'label_stats'}) RETURN c.done AS done")
+    assert label_step == {"done": True}
+    committed = await one(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'artist_stats'}) RETURN c.cursor AS cursor, c.done AS done")
+    assert committed["cursor"] == failing["cursors"][1]
+    assert committed["done"] is False
+
+    # The next start: the committed page is not redone, and the Label sweep does not rerun.
+    monkeypatch.undo()
+    monkeypatch.setattr(graphinator, "graph", stamped_dump)
+    for name, helper in _REAL_REFRESH_HELPERS.items():
+        monkeypatch.setattr(graphinator, name, helper)
+    monkeypatch.setattr(graphinator, "stats_refresh_task", None)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "ARTIST_STATS_PAGE_SIZE", 2)
+    resumed = count_artist_pages(monkeypatch)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+
+    assert resumed["cursors"][0] == committed["cursor"]
+    assert await stats_equal_live(stamped_dump)
+    assert (await dump_node(stamped_dump))["stats_version"] == graphinator.STATS_VERSION
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_is_single_flight_within_and_across_restarts(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    first = graphinator.stats_refresh_task
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    assert await graphinator.resume_stats_refresh() is False, "a second trigger must not start a second sweep"
+    assert graphinator.stats_refresh_task is first
+
+    # A restart: the task dies mid-page, and the new process continues after the committed page.
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    resumed_from = await one(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'artist_stats'}) RETURN c.cursor AS cursor")
+    assert resumed_from["cursor"] == paused["cursors"][1]
+    paused["cursors"].clear()
+    paused["release"].set()
+
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+    assert paused["cursors"][0] == resumed_from["cursor"]
+    assert await stats_equal_live(stamped_dump)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("stamped_dump")
+async def test_a_maintenance_trigger_takes_over_from_a_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real pass's trigger is acked and cannot be replayed, so a refresh must never swallow it."""
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    full_pass = AsyncMock(return_value=True)
+    monkeypatch.setattr(graphinator, "run_post_import_maintenance", full_pass)
+    assert await graphinator.resume_stats_refresh() is True
+    refresh = graphinator.stats_refresh_task
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    graphinator.start_post_import_maintenance("20261201")
+    assert await graphinator.post_import_maintenance_task is True
+    full_pass.assert_awaited_once_with("20261201")
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+
+    assert graphinator.start_stats_refresh(DUMP) is True  # the slot is free again once it has finished
+    paused["release"].set()
+    await graphinator.stats_refresh_task
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_stops_when_a_newer_dump_appears(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    await rows(
+        stamped_dump, "CREATE (:ExtractionCompletion {version: '20261201', signals: ['artists'], created_at: datetime('2026-12-02T00:00:00Z')})"
+    )
+    paused["release"].set()
+
+    assert await graphinator.stats_refresh_task is False
+    assert len(paused["cursors"]) == 2, "no page runs after the newer dump is seen"
+    assert await dump_node(stamped_dump) == {"maintained_at": MAINTAINED_AT, "status": "succeeded", "error": None, "stats_version": None}
+    # The new dump is still importing, so nothing restarts; its own pass writes the stats.
+    assert await graphinator.resume_stats_refresh() is False
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_stops_when_messages_arrive_before_any_new_dump_node(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new dump writes long before its first ExtractionCompletion node exists."""
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    graphinator.message_counts["artists"] += 1
+    paused["release"].set()
+
+    assert await graphinator.stats_refresh_task is False
+    assert len(paused["cursors"]) == 2
+    assert (await dump_node(stamped_dump))["stats_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_pass_stamps_the_stats_version_and_needs_no_refresh(stamped_dump: AsyncDriver) -> None:
+    await rows(stamped_dump, "MATCH (m:ExtractionCompletion) REMOVE m.maintained_at")
+    await graphinator.run_post_import_maintenance(DUMP)
+
+    assert (await dump_node(stamped_dump))["stats_version"] == graphinator.STATS_VERSION
+    assert await graphinator.resume_stats_refresh() is False
+
+
+@pytest.mark.asyncio
+async def test_a_step_finished_by_older_code_is_not_skipped_and_stamped_as_current(stamped_dump: AsyncDriver) -> None:
+    """Older code finished label_stats but died before its stamp: this pass must redo it."""
+    await rows(stamped_dump, "MATCH (m:ExtractionCompletion) REMOVE m.maintained_at")
+    assert await rows(stamped_dump, "MATCH ()-[h:HAS_STYLE]->() RETURN h") == []
+
+    assert await graphinator.run_post_import_maintenance(DUMP) is True
+
+    assert await stats_equal_live(stamped_dump)
+
+
+# ── What catalog-api reads ─────────────────────────────────────────────────
+
+# The completeness marker, verbatim as agreed with gm-catalog-api-j4ml. A reader trusts
+# HAS_STYLE only when this returns maintained and stats_version >= 1.
+HAS_STYLE_MARKER = """
+MATCH (m:ExtractionCompletion)
+RETURN m.stats_version AS stats_version, m.maintained_at IS NOT NULL AS maintained
+ORDER BY coalesce(m.created_at, datetime({epochMillis: 0})) DESC
+LIMIT 1
+"""
+
+# How gm-catalog-api-575h tells "computed, no genre" from "not reached yet".
+PRIMARY_GENRE_STATE = """
+MATCH (a:Artist {id: $id})
+RETURN a.primary_genre AS genre, a.release_count IS NOT NULL AS computed
+"""
+
+
+async def has_style_is_trusted(driver: AsyncDriver) -> bool:
+    marker = await rows(driver, HAS_STYLE_MARKER)
+    return bool(marker) and marker[0]["maintained"] and (marker[0]["stats_version"] or 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_the_marker_appears_only_once_every_label_has_its_edges(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert await has_style_is_trusted(stamped_dump) is False
+
+    # Labels finished but Artists not: the edges are complete, yet the refresh has not ended.
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS", 1)
+    count_artist_pages(monkeypatch, crash_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is False
+    assert await has_style_is_trusted(stamped_dump) is False
+
+    monkeypatch.undo()
+    monkeypatch.setattr(graphinator, "graph", stamped_dump)
+    for name, helper in _REAL_REFRESH_HELPERS.items():
+        monkeypatch.setattr(graphinator, name, helper)
+    monkeypatch.setattr(graphinator, "stats_refresh_task", None)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+
+    assert await has_style_is_trusted(stamped_dump) is True
+    assert await rows(stamped_dump, STORED_LABEL_STYLES) == await rows(stamped_dump, LIVE_LABEL_STYLES)
+
+
+@pytest.mark.asyncio
+async def test_the_marker_is_withheld_while_a_label_sweep_is_partial(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Part of the labels have edges: a reader must not see a shortened candidate set as complete."""
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(graphinator, "LABEL_STATS_PAGE_SIZE", 1)
+    real_run = graphinator.maintenance_paging.run_statement
+    pages = {"n": 0}
+
+    async def crash_on_second_label_page(graph: Any, cypher: str, **params: Any) -> Any:
+        if "MATCH (l:Label)" in cypher:
+            pages["n"] += 1
+            if pages["n"] == 2:
+                raise RuntimeError("connection lost")
+        return await real_run(graph, cypher, **params)
+
+    monkeypatch.setattr(graphinator.maintenance_paging, "run_statement", crash_on_second_label_page)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is False
+
+    partial = await rows(stamped_dump, STORED_LABEL_STYLES)
+    assert partial, "the first label's edges were committed"
+    assert partial != await rows(stamped_dump, LIVE_LABEL_STYLES)
+    assert await has_style_is_trusted(stamped_dump) is False
+
+
+@pytest.mark.asyncio
+async def test_a_new_dump_withdraws_the_marker_until_its_own_pass(stamped_dump: AsyncDriver) -> None:
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+    assert await has_style_is_trusted(stamped_dump) is True
+
+    await rows(
+        stamped_dump, "CREATE (:ExtractionCompletion {version: '20261201', signals: ['artists'], created_at: datetime('2026-12-02T00:00:00Z')})"
+    )
+    assert await has_style_is_trusted(stamped_dump) is False
+
+    await graphinator.run_post_import_maintenance("20261201")
+    assert await has_style_is_trusted(stamped_dump) is True
+
+
+@pytest.mark.asyncio
+async def test_computed_with_no_genre_differs_from_not_reached(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def state(artist_id: str) -> dict[str, Any]:
+        return await one(stamped_dump, PRIMARY_GENRE_STATE, id=artist_id)
+
+    assert await state("A3") == {"genre": None, "computed": False}, "not reached: read it live"
+
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+    # Mid-sweep, a committed page is computed and a later one is not. Keys sort '194', 'A1', ...
+    assert (await state("194")) == {"genre": "Pop", "computed": True}
+    assert (await state("A3")) == {"genre": None, "computed": False}
+    paused["release"].set()
+    assert await graphinator.stats_refresh_task is True
+
+    assert await state("A3") == {"genre": None, "computed": True}, "computed, no genre: no live read"
+    assert await state("A1") == {"genre": "Jazz", "computed": True}

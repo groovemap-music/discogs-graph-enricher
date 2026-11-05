@@ -43,15 +43,22 @@ class FakePagedGraph:
     """Records every page and checkpoint; ``fail`` lets a test raise on chosen statements."""
 
     def __init__(
-        self, persons: list[str] | None = None, labels: list[str] | None = None, genres: list[str] | None = None, styles: list[str] | None = None
+        self,
+        persons: list[str] | None = None,
+        labels: list[str] | None = None,
+        genres: list[str] | None = None,
+        styles: list[str] | None = None,
+        artists: list[str] | None = None,
     ):
         self.persons = sorted(persons or [])
         self.labels = sorted(labels or [])
         self.genres = sorted(genres or [])
         self.styles = sorted(styles or [])
+        self.artists = sorted(artists or [])
         self.checkpoints: dict[str, dict[str, Any]] = {}
         self.person_pages: list[list[str]] = []
         self.label_pages: list[list[str]] = []
+        self.artist_pages: list[list[str]] = []
         self.metric_sets: list[tuple[str, str]] = []  # (key, property)
         self.page_sizes: list[int] = []
         self.statements: list[str] = []
@@ -92,6 +99,8 @@ class FakePagedGraph:
             return self._page("person", self.persons, self.person_pages, params)
         if "MATCH (l:Label)" in cypher:
             return self._page("label", self.labels, self.label_pages, params)
+        if "MATCH (a:Artist)" in cypher:
+            return self._page("artist", self.artists, self.artist_pages, params)
         if "RETURN n.name AS key" in cypher:
             self._maybe_fail("keys", params)
             source = self.genres if "(n:Genre)" in cypher else self.styles

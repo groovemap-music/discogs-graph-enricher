@@ -112,6 +112,7 @@ EXTRACTION_LATCH_UNKNOWN_VERSION = "unknown"
 # (see check_file_completion). Strong references are held here so the loop cannot
 # garbage-collect the task mid-flight.
 post_import_maintenance_task: asyncio.Task[bool] | None = None
+stats_refresh_task: asyncio.Task[bool] | None = None
 maintenance_tasks: set[asyncio.Task[bool]] = set()
 current_task = None
 current_progress = 0.0
@@ -702,8 +703,8 @@ async def _stamp_maintenance_success(version: str) -> None:
 
     Idempotent: the first stamp wins (coalesce), so a re-run never moves it, and any
     earlier maintenance_error is cleared. Only this version's node is touched, and only
-    maintenance_* properties — never `signals`, which stays owned by the latch writer.
-    Runs under extraction_latch_lock like every other write to this node.
+    maintenance_* properties and stats_version — never `signals`, which stays owned by the
+    latch writer. Runs under extraction_latch_lock like every other write to this node.
     """
     if graph is None:
         raise RuntimeError("Neo4j driver is not initialized")
@@ -713,11 +714,13 @@ async def _stamp_maintenance_success(version: str) -> None:
             """
             MATCH (m:ExtractionCompletion {version: $version})
             SET m.maintained_at = coalesce(m.maintained_at, datetime()),
-                m.maintenance_status = 'succeeded'
+                m.maintenance_status = 'succeeded',
+                m.stats_version = $stats_version
             REMOVE m.maintenance_error, m.maintenance_failed_at
             RETURN count(m) AS stamped
             """,
             version=version,
+            stats_version=STATS_VERSION,
         )
         record = await result.single()
         await result.consume()
@@ -775,6 +778,155 @@ async def resume_pending_maintenance() -> bool:
     logger.info("♻️ Resuming interrupted post-import maintenance", version=version)
     start_post_import_maintenance(version)
     return True
+
+
+async def _stats_refresh_version() -> str | None:
+    """Return the newest dump's version when its stored stats are behind STATS_VERSION.
+
+    Only a finished dump qualifies. One still importing, or stamped by neither a pass nor a
+    refresh, is left to the maintenance pass that follows it, which writes every stat.
+    """
+    if graph is None:
+        return None
+    version = await _latest_extraction_version()
+    if version is None:
+        return None
+    signals = await _load_extraction_signals(version)
+    if not signals.issuperset(DATA_TYPES) or not await _is_extraction_maintained(version):
+        return None
+    async with graph.session(database="neo4j") as session:
+        result = await session.run(
+            "MATCH (m:ExtractionCompletion {version: $version}) RETURN max(m.stats_version) AS stats_version",
+            version=version,
+        )
+        record = await result.single()
+    return None if record is not None and record["stats_version"] == STATS_VERSION else version
+
+
+async def resume_stats_refresh() -> bool:
+    """Start a stats refresh if the newest dump needs one. Returns True if one was started.
+
+    A dump stamped by older code never gets the stats that code did not write: its
+    maintained_at stops resume_pending_maintenance, and the next dump can be a month away.
+    This runs at every start, so deploying a new STATS_VERSION is the whole trigger, a
+    finished refresh is never repeated, and an interrupted one continues after its last
+    committed page.
+    """
+    try:
+        version = await _stats_refresh_version()
+    except Exception as e:
+        logger.error("❌ Could not check whether the stored stats are current", error=str(e))
+        return False
+    if version is None:
+        return False
+    return start_stats_refresh(version)
+
+
+def start_stats_refresh(version: str) -> bool:
+    """Launch a stats refresh as a detached task unless maintenance or a refresh is running.
+
+    It has its own slot because start_post_import_maintenance drops a trigger while its slot
+    is busy, and a real pass's trigger cannot be replayed: that function cancels this task.
+    """
+    global stats_refresh_task
+
+    if post_import_maintenance_task is not None and not post_import_maintenance_task.done():
+        logger.info("⏳ Post-import maintenance is running — it writes every stat, so no refresh is needed")
+        return False
+    if stats_refresh_task is not None and not stats_refresh_task.done():
+        logger.info("⏳ Stats refresh already running — ignoring duplicate trigger")
+        return False
+
+    logger.info("♻️ Refreshing stats on the newest dump", version=version, stats_version=STATS_VERSION)
+    task = asyncio.create_task(run_stats_refresh(version))
+    stats_refresh_task = task
+    maintenance_tasks.add(task)
+    task.add_done_callback(maintenance_tasks.discard)
+    return True
+
+
+def _stop_if_superseded(version: str) -> maintenance_paging.BeforePage:
+    """Build the check that stops a refresh once a new dump has started.
+
+    A new dump writes long before its first ExtractionCompletion node exists, so an arriving
+    message counts as well as a newer node. Sweeping alongside those writers would contend
+    for the locks on Style nodes, and the dump's own maintenance pass replaces the result.
+    """
+    messages_at_start = sum(message_counts.values())
+    next_version_check = 0.0
+
+    async def before_page() -> None:
+        nonlocal next_version_check
+        if sum(message_counts.values()) != messages_at_start:
+            raise maintenance_paging.MaintenanceStopped("catalog messages are arriving")
+        now = time.monotonic()
+        if now >= next_version_check:
+            next_version_check = now + STATS_REFRESH_VERSION_CHECK_SECONDS
+            latest = await _latest_extraction_version()
+            if latest != version:
+                raise maintenance_paging.MaintenanceStopped(f"a newer dump has arrived: {latest}")
+
+    return before_page
+
+
+async def _stamp_stats_version(version: str) -> None:
+    """Record that ``version`` carries the current stats. Never touches maintained_at."""
+    if graph is None:
+        raise RuntimeError("Neo4j driver is not initialized")
+
+    async with extraction_latch_lock, graph.session(database="neo4j") as session:
+        result = await session.run(
+            """
+            MATCH (m:ExtractionCompletion {version: $version})
+            SET m.stats_version = $stats_version
+            RETURN count(m) AS stamped
+            """,
+            version=version,
+            stats_version=STATS_VERSION,
+        )
+        record = await result.single()
+        await result.consume()
+    if record is None or not record["stamped"]:
+        raise RuntimeError(f"No ExtractionCompletion node for version {version!r} to stamp")
+
+
+async def run_stats_refresh(version: str) -> bool:
+    """Bring the stats of a stamped dump up to STATS_VERSION, retrying on failure.
+
+    Runs only the Label and Artist sweeps, under the same run key as a pass of this stats
+    version, so the checkpoints from older code do not skip them and a restart continues
+    after the last committed page. It leaves maintained_at, maintenance_status and
+    maintenance_error alone: the graph stays final for readers, and a failure is logged
+    and retried at the next start rather than recorded against a stamped dump.
+
+    Returns:
+        True if the stats are current and stamped; False if the refresh failed or stopped.
+    """
+    run_key_token = _maintenance_run_key.set(maintenance_run_key(version))
+    guard_token = _maintenance_before_page.set(_stop_if_superseded(version))
+    try:
+        for attempt in range(1, POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS + 1):
+            failed_steps: list[str] = []
+            for name, step in (("label_stats", compute_label_stats), ("artist_stats", compute_artist_stats)):
+                if (step_failure := await _run_maintenance_step(name, step)) is not None:
+                    failed_steps.append(step_failure)
+            if not failed_steps:
+                await _stamp_stats_version(version)
+                logger.info("✅ Stats refresh complete", version=version, stats_version=STATS_VERSION)
+                return True
+            if attempt < POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS:
+                delay = POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1))
+                logger.warning("⚠️ Stats refresh failed — retrying", attempt=attempt, failed_steps=failed_steps, retry_in_seconds=delay)
+                await asyncio.sleep(delay)
+        logger.error("❌ Stats refresh failed after every attempt — it continues at the next start", version=version, failed_steps=failed_steps)
+    except maintenance_paging.MaintenanceStopped as e:
+        logger.warning("🛑 Stats refresh stopped — the new dump's maintenance pass writes these stats", version=version, reason=str(e))
+    except Exception as e:
+        logger.error("❌ Stats refresh could not complete — it continues at the next start", version=version, error=str(e))
+    finally:
+        _maintenance_before_page.reset(guard_token)
+        _maintenance_run_key.reset(run_key_token)
+    return False
 
 
 async def check_file_completion(data: dict[str, Any], data_type: str, message: AbstractIncomingMessage) -> bool:
@@ -931,6 +1083,12 @@ def start_post_import_maintenance(version: str | None = None) -> None:
         logger.info("⏳ Post-import maintenance already running — ignoring duplicate trigger")
         return
 
+    # A full pass covers everything a refresh would do, and its trigger is acked and cannot
+    # be replayed, so it always wins. Dropping it for a running refresh would lose the pass.
+    if stats_refresh_task is not None and not stats_refresh_task.done():
+        logger.info("⏭️ Stopping the stats refresh — full post-import maintenance takes over")
+        stats_refresh_task.cancel()
+
     task = asyncio.create_task(run_post_import_maintenance(version))
     post_import_maintenance_task = task
     maintenance_tasks.add(task)
@@ -956,8 +1114,10 @@ async def run_post_import_maintenance(version: str | None = None) -> bool:
     failure = "post-import maintenance failed"
     # Identifies this run to the per-step checkpoints. A versioned run is resumable
     # across retries AND restarts (resume_pending_maintenance passes the same version);
-    # an unversioned manual run is only resumable within this call.
-    run_key = version if version is not None else f"adhoc-{time.time_ns()}"
+    # an unversioned manual run is only resumable within this call. STATS_VERSION is part
+    # of the key so a step the previous code finished is not skipped and then stamped as
+    # current.
+    run_key = maintenance_run_key(version) if version is not None else f"adhoc-{time.time_ns()}"
     token = _maintenance_run_key.set(run_key)
     try:
         return await _run_post_import_maintenance_attempts(version, failure)
@@ -972,6 +1132,8 @@ async def _run_maintenance_step(name: str, step: Any) -> str | None:
     """
     try:
         ok = await step()
+    except maintenance_paging.MaintenanceStopped:
+        raise
     except Exception as e:
         logger.error(f"❌ Maintenance step {name} raised", step=name, error=str(e))
         return f"{name}: {type(e).__name__}: {e}"
@@ -1009,7 +1171,7 @@ async def _run_post_import_maintenance_attempts(version: str | None, failure: st
                 # that is a deferral, not a per-step failure.
                 logger.error(
                     "❌ Batch queues did not drain — deferring every maintenance step rather than sweeping while writers are still active",
-                    skipped_steps=["stub_cleanup", "sentinel_master_cleanup", "genre_style_label_stats", "person_credit_counts"],
+                    skipped_steps=["stub_cleanup", "sentinel_master_cleanup", "genre_style_label_stats", "artist_stats", "person_credit_counts"],
                 )
                 failed_steps.append("batch_queue_drain")
             elif graph is not None:
@@ -1028,6 +1190,8 @@ async def _run_post_import_maintenance_attempts(version: str | None, failure: st
                     # Aggregate stats on Genre/Style/Label nodes, over a graph that is no
                     # longer being written.
                     ("genre_style_label_stats", compute_genre_style_stats),
+                    # Release and label counts and the primary genre on every Artist.
+                    ("artist_stats", compute_artist_stats),
                     # Recount every Person's credits from the CREDITED_ON edges as they
                     # stand after the import (re-imported releases have already pruned the
                     # credits Discogs removed), so removals are reflected as well as additions.
@@ -1083,10 +1247,32 @@ async def _run_post_import_maintenance_attempts(version: str | None, failure: st
 # on a timeout / memory pressure and the working size is remembered in the checkpoint.
 GENRE_STYLE_STATS_PAGE_SIZE = 10
 LABEL_STATS_PAGE_SIZE = 100
+ARTIST_STATS_PAGE_SIZE = 1000
+
+# The version of what the stats sweeps write. Bump it when a sweep's output changes:
+# ExtractionCompletion.stats_version then differs from this on the newest dump, and the
+# next start refreshes it (see resume_stats_refresh) instead of leaving the new values
+# missing until the next dump. 1 added the Artist stats and the HAS_STYLE edges.
+STATS_VERSION = 1
+
+# How often a running refresh asks Neo4j whether a newer dump has arrived. Arriving
+# messages are checked before every page; this read is throttled to keep pages cheap.
+STATS_REFRESH_VERSION_CHECK_SECONDS = 30.0
 
 # Identifies the run being maintained to the checkpoints (the dump version). ``None``
 # outside run_post_import_maintenance, which disables checkpoint persistence.
 _maintenance_run_key: contextvars.ContextVar[str | None] = contextvars.ContextVar("maintenance_run_key", default=None)
+
+# Runs before every page of a sweep. Set only by a stats refresh, which has to stop if a
+# new dump starts writing; a full maintenance pass runs after the writers have drained.
+_maintenance_before_page: contextvars.ContextVar[maintenance_paging.BeforePage | None] = contextvars.ContextVar(
+    "maintenance_before_page", default=None
+)
+
+
+def maintenance_run_key(version: str) -> str:
+    """Return the checkpoint run key of ``version`` under the current stats version."""
+    return f"{version}@stats-{STATS_VERSION}"
 
 
 def _node_stat_metrics(node: str) -> list[tuple[tuple[str, ...], str]]:
@@ -1143,33 +1329,98 @@ def build_label_stats_page_cypher() -> str:
     Returns ``last`` (next cursor) and ``processed``. Bounded by ``$size``, not by the
     ~millions of labels in the graph; most labels have few releases so a page is quick.
     Each property is written only when it differs, so a rerun over unchanged data writes nothing.
+
+    Writes ``release_count``, ``artist_count`` and ``genre_count`` on the Label, and one
+    ``(:Label)-[:HAS_STYLE {release_count}]->(:Style)`` per style of its releases, with no
+    cap on styles. The style counts are an edge and not list properties because
+    ``/api/label/{id}/similar`` has to go from a style to the labels carrying it: on lux
+    Pop Rock reaches 74,053 of the 2.43M labels, which an edge reads directly and a list
+    property could only find by scanning every Label. An edge whose style the label no
+    longer has is deleted, so the edges always equal a live count.
+
+    The artists, genres and styles share ONE expansion of each release, which on lux
+    takes the largest label (1818, 762,594 releases) from 21.4M db hits to 14.4M, in 2.7 s
+    and 64 MB. ``count(r)`` per target needs no ``DISTINCT``: ``BY`` and ``IS`` are
+    ``MERGE``d, so a release has at most one edge to a target.
     """
     return """
     MATCH (l:Label)
     WHERE l.id > $cursor
     WITH l ORDER BY l.id LIMIT $size
-    CALL {
-        WITH l
-        CALL {
-            WITH l
-            MATCH (l)<-[:ON]-(r:Release)
+    CALL (l) {
+        CALL (l) {
+            OPTIONAL MATCH (l)<-[:ON]-(r:Release)
             RETURN count(DISTINCT r) AS rc
         }
-        CALL {
-            WITH l
-            MATCH (l)<-[:ON]-(r:Release)-[:BY]->(a:Artist)
-            RETURN count(DISTINCT a) AS ac
-        }
-        CALL {
-            WITH l
-            MATCH (l)<-[:ON]-(r:Release)-[:IS]->(g:Genre)
-            RETURN count(DISTINCT g) AS gc
+        CALL (l) {
+            OPTIONAL MATCH (l)<-[:ON]-(r:Release)-[:BY|IS]->(t)
+            WHERE t:Artist OR t:Genre OR t:Style
+            WITH t, count(r) AS n
+            RETURN count(CASE WHEN t:Artist THEN 1 END) AS ac,
+                count(CASE WHEN t:Genre THEN 1 END) AS gc,
+                collect(CASE WHEN t:Style THEN {style: t, releases: n} END) AS styles
         }
         FOREACH (_ IN CASE WHEN l.release_count IS NULL OR l.release_count <> rc THEN [1] ELSE [] END | SET l.release_count = rc)
         FOREACH (_ IN CASE WHEN l.artist_count IS NULL OR l.artist_count <> ac THEN [1] ELSE [] END | SET l.artist_count = ac)
         FOREACH (_ IN CASE WHEN l.genre_count IS NULL OR l.genre_count <> gc THEN [1] ELSE [] END | SET l.genre_count = gc)
+        WITH l, styles
+        CALL (l, styles) {
+            MATCH (l)-[stale:HAS_STYLE]->(old:Style)
+            WHERE NOT old IN [row IN styles | row.style]
+            DELETE stale
+        }
+        CALL (l, styles) {
+            UNWIND styles AS row
+            WITH l, row.style AS style, row.releases AS releases
+            MERGE (l)-[h:HAS_STYLE]->(style)
+            FOREACH (_ IN CASE WHEN h.release_count IS NULL OR h.release_count <> releases THEN [1] ELSE [] END | SET h.release_count = releases)
+        }
     }
     RETURN max(l.id) AS last, count(l) AS processed
+    """
+
+
+def build_artist_stats_page_cypher() -> str:
+    """Keyed page of Artist aggregates: the ``$size`` artists with ``id > $cursor``.
+
+    Writes three properties, each only when it differs, so a rerun over unchanged data
+    writes nothing:
+
+    - ``release_count``: the distinct releases ``BY`` the artist. Only Releases count, and
+      Masters are ``BY`` the artist too.
+    - ``label_count``: the distinct labels those releases are ``ON``.
+    - ``primary_genre``: the Genre on the most of those releases, every release counted.
+      A tie goes to the alphabetically first genre name, so the answer never depends on
+      storage order. An artist with no genre has no property, and a genre lost since the
+      last pass removes it.
+
+    Every artist is computed the same way, placeholders included: Various (id 194,
+    1,361,622 releases) takes 4.0 s, 29M db hits and 49 MB on lux, inside the 600 s
+    transaction budget. Labels and genres share ONE expansion of each release. The
+    ``ORDER BY`` sits before the ``collect``, which keeps that order.
+    """
+    return """
+    MATCH (a:Artist)
+    WHERE a.id > $cursor
+    WITH a ORDER BY a.id LIMIT $size
+    CALL (a) {
+        CALL (a) {
+            OPTIONAL MATCH (a)<-[:BY]-(r:Release)
+            RETURN count(DISTINCT r) AS rc
+        }
+        CALL (a) {
+            OPTIONAL MATCH (a)<-[:BY]-(r:Release)-[:ON|IS]->(t)
+            WHERE t:Label OR t:Genre
+            WITH t, count(r) AS n
+            ORDER BY n DESC, CASE WHEN t:Genre THEN t.name END
+            RETURN count(CASE WHEN t:Label THEN 1 END) AS lc,
+                head(collect(CASE WHEN t:Genre THEN t.name END)) AS pg
+        }
+        FOREACH (_ IN CASE WHEN a.release_count IS NULL OR a.release_count <> rc THEN [1] ELSE [] END | SET a.release_count = rc)
+        FOREACH (_ IN CASE WHEN a.label_count IS NULL OR a.label_count <> lc THEN [1] ELSE [] END | SET a.label_count = lc)
+        FOREACH (_ IN CASE WHEN coalesce(a.primary_genre, '') <> coalesce(pg, '') THEN [1] ELSE [] END | SET a.primary_genre = pg)
+    }
+    RETURN max(a.id) AS last, count(a) AS processed
     """
 
 
@@ -1178,7 +1429,8 @@ async def compute_genre_style_stats() -> bool:
 
     Sets release_count, artist_count, label_count, style_count/genre_count,
     and first_year properties on each Genre and Style node.  Also sets
-    release_count, artist_count, genre_count on Label nodes.
+    release_count, artist_count, genre_count on Label nodes, and the label's
+    per-style release counts on its HAS_STYLE edges.
 
     - Genre/Style counts are read by explore/genre and explore/style endpoints,
       replacing 4 expensive traversal queries (~200M DB hits for Rock)
@@ -1187,6 +1439,8 @@ async def compute_genre_style_stats() -> bool:
       (~184M DB hits) with an index seek (~100 DB hits).
     - Label counts are read by explore/label, replacing a 1.2M DB-hit
       traversal (for Reprise Records with 55K releases) with ~3 DB hits.
+    - HAS_STYLE edges are read by /api/label/{id}/similar, which otherwise walks
+      every release of a style (19.6M DB hits for Pop Rock).
 
     Resumable: each of Genre, Style and Label is a keyed-page sweep checkpointed after
     every page (see :mod:`graphinator.maintenance_paging`), so no single transaction is
@@ -1200,13 +1454,23 @@ async def compute_genre_style_stats() -> bool:
         False if the computation failed. Every failing sweep is logged with its
         step name; a failure does not skip the sweeps after it.
     """
+    return await _run_stat_sweeps(("Genre", "Style", "Label"))
+
+
+async def compute_label_stats() -> bool:
+    """Run only the Label sweep of :func:`compute_genre_style_stats`, for a stats refresh."""
+    return await _run_stat_sweeps(("Label",))
+
+
+async def _run_stat_sweeps(node_labels: tuple[str, ...]) -> bool:
+    """Run the named Genre, Style and Label sweeps, each checkpointed, in the order given."""
     if graph is None:
         return True
 
     run_key = _maintenance_run_key.get()
-    sweeps: list[tuple[str, Any, int]] = [
-        (
-            "Genre",
+    before_page = _maintenance_before_page.get()
+    available: dict[str, tuple[Any, int]] = {
+        "Genre": (
             maintenance_paging.per_key_page_processor(
                 graph,
                 list_keys_cypher="MATCH (n:Genre) WHERE n.name > $cursor RETURN n.name AS key ORDER BY key LIMIT $size",
@@ -1214,8 +1478,7 @@ async def compute_genre_style_stats() -> bool:
             ),
             GENRE_STYLE_STATS_PAGE_SIZE,
         ),
-        (
-            "Style",
+        "Style": (
             maintenance_paging.per_key_page_processor(
                 graph,
                 list_keys_cypher="MATCH (n:Style) WHERE n.name > $cursor RETURN n.name AS key ORDER BY key LIMIT $size",
@@ -1223,15 +1486,15 @@ async def compute_genre_style_stats() -> bool:
             ),
             GENRE_STYLE_STATS_PAGE_SIZE,
         ),
-        (
-            "Label",
+        "Label": (
             maintenance_paging.keyed_page_processor(graph, build_label_stats_page_cypher()),
             LABEL_STATS_PAGE_SIZE,
         ),
-    ]
+    }
 
     ok = True
-    for index, (node_label, process_page, page_size) in enumerate(sweeps):
+    for index, node_label in enumerate(node_labels):
+        process_page, page_size = available[node_label]
         if index:
             await asyncio.sleep(MAINTENANCE_SETTLE_SECONDS)
         step = f"{node_label.lower()}_stats"
@@ -1243,8 +1506,11 @@ async def compute_genre_style_stats() -> bool:
                 run_key=run_key,
                 process_page=process_page,
                 page_size=page_size,
+                before_page=before_page,
             )
             logger.info(f"✅ {node_label} stats computed", step=step, processed=processed)
+        except maintenance_paging.MaintenanceStopped:
+            raise
         except Exception as e:
             # Keep going: the other sweeps are independent, and the checkpoint keeps
             # this one's progress for the retry.
@@ -1252,6 +1518,46 @@ async def compute_genre_style_stats() -> bool:
             ok = False
 
     return ok
+
+
+async def compute_artist_stats() -> bool:
+    """Pre-compute ``release_count``, ``label_count`` and ``primary_genre`` on every Artist.
+
+    See :func:`build_artist_stats_page_cypher` for what each property holds. Explore reads
+    the two counts, and ``/api/network/cluster`` reads ``primary_genre``, instead of
+    walking each artist's whole discography per request.
+
+    Artists are processed in keyed pages of ``ARTIST_STATS_PAGE_SIZE``, checkpointed after
+    each page and halved on a timeout or transaction-memory pressure, so the sweep resumes
+    after its last committed page instead of restarting.
+
+    Returns:
+        True if the stats were written (or there is no driver), False if the sweep failed
+        (logged with the step name), so the detached maintenance task retries it.
+    """
+    if graph is None:
+        return True
+
+    step = "artist_stats"
+    try:
+        await asyncio.sleep(MAINTENANCE_SETTLE_SECONDS)
+        logger.info("📊 Computing aggregate stats on Artist nodes...", step=step)
+        processed = await maintenance_paging.run_checkpointed_step(
+            graph,
+            step=step,
+            run_key=_maintenance_run_key.get(),
+            process_page=maintenance_paging.keyed_page_processor(graph, build_artist_stats_page_cypher()),
+            page_size=ARTIST_STATS_PAGE_SIZE,
+            before_page=_maintenance_before_page.get(),
+        )
+        logger.info("✅ Artist stats computed", step=step, processed=processed)
+    except maintenance_paging.MaintenanceStopped:
+        raise
+    except Exception as e:
+        logger.error("❌ Failed to compute Artist stats", step=step, error=str(e))
+        return False
+
+    return True
 
 
 async def compute_person_credit_counts() -> bool:
@@ -1478,11 +1784,13 @@ async def cleanup_stub_nodes(data_type: str) -> bool:
     # relationship blocks, and the edge is never rebuilt. Keeping the stub preserves
     # both the edge and the id, and a later dump upgrades it in place — the fill-in
     # path MERGEs on id, so the stub simply gains its properties and sha256.
-    # Truly orphaned stubs still get collected here.
+    # Truly orphaned stubs still get collected here. HAS_STYLE does not hold a stub: it is
+    # derived from the ON edges by the Label stats sweep, which runs after this one, so a
+    # label left with no releases must not be kept alive by last pass's derived edges.
     def _build_cleanup_cypher(batch_size: int | None) -> str:
         return f"""
     MATCH (n:{label})
-    WHERE n.sha256 IS NULL AND NOT (n)--()
+    WHERE n.sha256 IS NULL AND NOT EXISTS {{ (n)-[e]-() WHERE NOT e:HAS_STYLE }}
     CALL {{
         WITH n
         DETACH DELETE n
@@ -2046,8 +2354,10 @@ async def main() -> None:
             logger.info("🔄 Started batch periodic flush task")
 
         # A restart mid-maintenance loses the (already acked) trigger; the durable
-        # node says whether the newest dump still needs its maintenance pass.
-        await resume_pending_maintenance()
+        # node says whether the newest dump still needs its maintenance pass. If it does
+        # not, a dump stamped by older code may still need the current stats.
+        if not await resume_pending_maintenance():
+            await resume_stats_refresh()
 
         # Start periodic queue checker task
         connection_check_task = asyncio.create_task(periodic_queue_checker())

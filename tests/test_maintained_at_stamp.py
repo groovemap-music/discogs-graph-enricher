@@ -73,6 +73,7 @@ def steps(monkeypatch: pytest.MonkeyPatch, *, stats_ok: Any = True) -> AsyncMock
     monkeypatch.setattr(g, "cleanup_sentinel_master", AsyncMock(return_value=True))
     stats = AsyncMock(side_effect=stats_ok) if isinstance(stats_ok, BaseException) else AsyncMock(return_value=stats_ok)
     monkeypatch.setattr(g, "compute_genre_style_stats", stats)
+    monkeypatch.setattr(g, "compute_artist_stats", AsyncMock(return_value=True))
     monkeypatch.setattr(g, "compute_person_credit_counts", AsyncMock(return_value=True))
     return stats
 

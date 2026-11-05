@@ -16,14 +16,15 @@ The graph projector matches or merges these stable keys:
 | Medium | `id` |
 | MediaFamily | `name` |
 | Company | `id` |
-| ExtractionCompletion | `version` (also carries `signals` and the `maintained_at` stamp; see [completion tracking](file-completion-tracking.md#maintenance-completion-stamp-maintained_at)) |
+| ExtractionCompletion | `version` (also carries `signals`, `stats_version` and the `maintained_at` stamp; see [completion tracking](file-completion-tracking.md#maintenance-completion-stamp-maintained_at)) |
 
 The owning schema should provide the constraints and indexes appropriate to those
 lookups. The full deployed inventory is authoritative in `database-schema`; copying
 its DDL here would create a second, drifting source of truth.
 
-`discogs-graph-enricher` also refreshes denormalized Genre, Style, and Label aggregate
-properties after a completed extraction. Those properties reduce work for readers,
+`discogs-graph-enricher` also refreshes denormalized Genre, Style, Label, and Artist
+aggregate properties and the derived `(:Label)-[:HAS_STYLE {release_count}]->(:Style)`
+edges after a completed extraction. Those values reduce work for readers,
 but read-query indexes and performance targets belong to
 [`catalog-api`](https://github.com/groovemap-music/catalog-api/blob/main/docs/query-performance-optimizations.md).
 

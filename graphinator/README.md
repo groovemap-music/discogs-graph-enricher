@@ -149,13 +149,14 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 1. **Artist** - Musical artists
 
-   - Properties: id, name, resource_url, releases_url, sha256
+   - Properties: id, name, resource_url, releases_url, sha256, release_count\*, label_count\*, primary_genre\*
    - Relationships: MEMBER_OF (to band), ALIAS_OF (to primary)
+   - \*Pre-computed by `compute_artist_stats()` (see [Pre-Computed Node Properties](#-pre-computed-node-properties))
 
 1. **Label** - Record labels
 
    - Properties: id, name, sha256, release_count\*, artist_count\*, genre_count\*
-   - Relationships: SUBLABEL_OF (to parent label)
+   - Relationships: SUBLABEL_OF (to parent label), HAS_STYLE\* (to Style)
    - \*Pre-computed by `compute_genre_style_stats()` (see [Pre-Computed Node Properties](#-pre-computed-node-properties))
 
 1. **Release** - Album/single releases
@@ -329,11 +330,12 @@ After all queues have been consumed, the graphinator performs cleanup and enrich
 1. **Stub Node Cleanup** — Removes Artist, Label, Master, and Release nodes that have no `sha256` property and no relationships, which are created as side effects of `MERGE` operations when referenced entities (e.g., artists, labels) haven't been ingested yet. A stub that still has edges is kept so a later dump can fill it in place
 1. **Sentinel Master Cleanup** — Deletes the `(:Master {id: "0"})` node a graph loaded before the Discogs "no master" sentinel fix may still carry; a no-op on graphs built since
 1. **Aggregate Stats Computation** — Runs `compute_genre_style_stats()` to pre-compute node properties (see below)
+1. **Artist Stats** — Runs `compute_artist_stats()` to pre-compute each Artist's counts and primary genre (see below)
 1. **Person Credit Counts** — Runs `compute_person_credit_counts()` to recount every Person's credits (see below)
 
 ### 📊 Pre-Computed Node Properties
 
-After graph import of releases, the graphinator runs `compute_genre_style_stats()` and `compute_person_credit_counts()` to set aggregate properties directly on nodes. These pre-computed stats avoid expensive traversal queries at API request time.
+After graph import of releases, the graphinator runs `compute_genre_style_stats()`, `compute_artist_stats()` and `compute_person_credit_counts()` to set aggregate properties directly on nodes. These pre-computed stats avoid expensive traversal queries at API request time.
 
 **Genre nodes:**
 
@@ -362,6 +364,39 @@ After graph import of releases, the graphinator runs `compute_genre_style_stats(
 | `release_count` | Number of releases on this label                       |
 | `artist_count`  | Number of distinct artists on this label               |
 | `genre_count`   | Number of distinct genres across this label's releases |
+
+**Label style counts** — `(:Label)-[:HAS_STYLE {release_count}]->(:Style)`, one edge per style of the label's releases with no cap on styles. `release_count` is the number of the label's releases in that style. It is an edge rather than list properties so a reader can go from a style to the labels carrying it without scanning every Label. A label with no styles has no edges, and an edge for a style the label has lost is deleted by the next pass. The edges are derived from `ON` and `IS`, so they never keep an otherwise orphaned stub Label alive.
+
+**Artist nodes** — `compute_artist_stats()`, read by Explore and `/api/network/cluster`:
+
+| Property        | Description                                                                                                                                |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `release_count` | Number of distinct releases `BY` the artist; Masters are not counted                                                                       |
+| `label_count`   | Number of distinct labels those releases are `ON`                                                                                          |
+| `primary_genre` | The Genre on the most of those releases, every release counted; a tie goes to the alphabetically first name; absent when there is no genre |
+
+Every Artist is computed the same way, with no cap and no sampling, so a placeholder such as Various (id 194, 1.36M releases) gets exact values too. An artist with no releases reads `0` for both counts.
+
+**Reading these safely.** There is no placeholder value. On an Artist, `release_count` is written on every artist in the same transaction as `primary_genre`, so:
+
+| `release_count` | `primary_genre` | Meaning                                  |
+| --------------- | --------------- | ---------------------------------------- |
+| present         | present         | The artist's primary genre               |
+| present         | absent          | Computed: the artist has no genre        |
+| absent          | absent          | Not reached yet: compute it live         |
+
+`HAS_STYLE` has no per-label stamp. Its completeness marker is `stats_version` on the newest `ExtractionCompletion` node, the same node `maintained_at` is on. Read that node and no other, and trust the edges only when it has `maintained_at` and `stats_version >= 1`; otherwise compute live:
+
+```cypher
+MATCH (m:ExtractionCompletion)
+RETURN m.stats_version AS stats_version, m.maintained_at IS NOT NULL AS maintained
+ORDER BY coalesce(m.created_at, datetime({epochMillis: 0})) DESC
+LIMIT 1
+```
+
+`stats_version` is written only after every label and artist has been swept, and never after a failed or stopped sweep. A new dump's node withdraws the marker until that dump's own pass. Once the marker is set, a label with no edges has no styles. As with every stored stat, the edges can be one dump old between the start of an import and that dump's first `extraction_complete`, when its node appears.
+
+A dump stamped before these stats existed gets them from a refresh at the next start, with no manual step. See [Stats refresh on a stamped dump](../docs/file-completion-tracking.md#stats-refresh-on-a-stamped-dump-stats_version).
 
 **Person nodes** — `compute_person_credit_counts()`, read by the catalog-api role leaderboard and backed by the `person_credit_count*` range indexes in `database-schema`:
 
