@@ -150,6 +150,14 @@ whenever a sweep's output changes.
 - This relies on one service instance, the deployed shape: a second running instance would
   repeat the work. Every write is guarded and idempotent, so that wastes time and changes
   no value.
+- Recovery depends on why it ended. A refresh stopped by a newer dump is finished by that
+  dump's own pass, which writes every stat. One stopped by arriving messages, or failed, stays
+  unstamped and continues after its last committed page at the next restart, or is replaced by
+  the next dump's pass. Nothing retries it while the service keeps running.
+- A later `STATS_VERSION` does not withdraw the old marker: `stats_version` keeps its old value
+  until the refresh finishes, so a reader checking `stats_version >= 1` keeps trusting
+  `HAS_STYLE` while that refresh is rewriting it. Before a bump that changes those edges, raise
+  the minimum those readers require, or they can read a part-written set.
 
 ### Deploying `STATS_VERSION` 1
 
