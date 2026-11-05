@@ -1,7 +1,7 @@
 # Shared batch runtime migration attestation
 
 > Status (2026-10-26): point-in-time record. The `groovemap-runtime` pin has since moved to
-> `6d0425f908e01a446b040e2993045e2afe30460e` (2026-10-30); `pyproject.toml` and `uv.lock`
+> `ecde48bdc30784ee0370166463f1d1a466544f35` (2026-11-05); `pyproject.toml` and `uv.lock`
 > are authoritative for the current revision.
 
 This consumer is pinned in both `pyproject.toml` and `uv.lock` to the reviewed
