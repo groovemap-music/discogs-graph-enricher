@@ -90,6 +90,16 @@ completed_files: set[str] = set()  # Track which files have completed processing
 # valid records. Batch mode gets the same protection from _flush_queue's
 # re-enqueue+backoff, which never nacks.
 outage_backoff = OutageBackoff(SERVICE_NAME)
+# An end-of-type marker waits out a Neo4j failure here before each requeue. RabbitMQ 4.3.5
+# and 4.4.0 do not spend x-delivery-limit on nack(requeue=True), so nothing else slows a
+# marker down or ever stops it: x-delivery-count stays absent and it never dead-letters.
+marker_backoff = OutageBackoff(f"{SERVICE_NAME}-marker")
+# Hand-outs a marker may use, read from x-acquired-count, which counts every kind of return.
+# At the 60 s backoff cap this is about 8.2 hours of failure before the flush retries each
+# cycle adds, provided only nacks return it: see docs/file-completion-tracking.md. A marker
+# blocks nothing while it waits, and losing one means that type's signal never lands, so
+# the budget is wide.
+MARKER_MAX_REQUEUES = 500
 # Track which data types have delivered an extraction_complete signal. Stub
 # cleanup and aggregate stats are deferred until EVERY type has signalled, so
 # cross-type stub creation (release batches MERGE Artist/Label/Master stubs)
@@ -929,6 +939,23 @@ async def run_stats_refresh(version: str) -> bool:
     return False
 
 
+async def requeue_marker(message: AbstractIncomingMessage, data_type: str, reason: str) -> None:
+    """Return a marker to the broker after a pause, or dead-letter it once its budget is spent."""
+    headers = getattr(message, "headers", None) or {}
+    acquired = headers.get("x-acquired-count", 0)
+    if isinstance(acquired, int) and acquired >= MARKER_MAX_REQUEUES:
+        logger.critical(
+            "🚨 End-of-type marker dead-lettered: its requeue budget is spent, so this type's signal has NOT landed",
+            data_type=data_type,
+            reason=reason,
+            deliveries=acquired + 1,
+        )
+        await message.nack(requeue=False)
+        return
+    await marker_backoff.wait()
+    await message.nack(requeue=True)
+
+
 async def check_file_completion(data: dict[str, Any], data_type: str, message: AbstractIncomingMessage) -> bool:
     """Check if message is a file completion or extraction completion message."""
     if data.get("type") == "file_complete":
@@ -946,7 +973,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
                 "❌ Flush incomplete — requeueing file_complete instead of marking the file done",
                 data_type=data_type,
             )
-            await message.nack(requeue=True)
+            await requeue_marker(message, data_type, "flush_incomplete")
             return True
 
         # Mark complete only after flush succeeds
@@ -956,6 +983,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         if CONSUMER_CANCEL_DELAY > 0 and data_type in queues:
             await schedule_consumer_cancellation(data_type, queues[data_type])
 
+        marker_backoff.reset()
         await message.ack()
         return True
 
@@ -966,6 +994,12 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
             version=data.get("version"),
         )
 
+        # The grace timer file_complete armed must not fire while this marker waits out a
+        # failure: it would come back to a queue with no consumer. Landing re-arms the timer.
+        pending_cancel = consumer_cancel_tasks.pop(data_type, None)
+        if pending_cancel is not None:
+            pending_cancel.cancel()
+
         # Flush remaining batches for this data type before cleanup
         if batch_processor is not None and not await batch_processor.flush_queue(data_type):
             # Records are still pending, so this type is NOT complete. Recording
@@ -975,7 +1009,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
                 "❌ Flush incomplete — requeueing extraction_complete instead of recording the signal",
                 data_type=data_type,
             )
-            await message.nack(requeue=True)
+            await requeue_marker(message, data_type, "flush_incomplete")
             return True
 
         # Record this type's completion signal (idempotent — safe under
@@ -992,7 +1026,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
                 version=version,
                 error=str(e),
             )
-            await message.nack(requeue=True)
+            await requeue_marker(message, data_type, "latch_write_failed")
             return True
 
         # extraction_complete is this type's terminal signal, so it must also
@@ -1024,6 +1058,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
                 received=sorted(signals),
                 pending=sorted(set(DATA_TYPES) - signals),
             )
+            marker_backoff.reset()
             await message.ack()
             return True
 
@@ -1043,10 +1078,11 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
                 version=version,
                 error=str(e),
             )
-            await message.nack(requeue=True)
+            await requeue_marker(message, data_type, "maintenance_state_unreadable")
             return True
         if already_maintained:
             logger.info("✅ Post-import maintenance already stamped for this version — skipping", version=version)
+            marker_backoff.reset()
             await message.ack()
             return True
 
@@ -1059,6 +1095,7 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         # four consumers die, the signal is redelivered, maintenance restarts from
         # scratch, and after x-delivery-limit=20 redeliveries the trigger is
         # dead-lettered and maintenance never completes at all.
+        marker_backoff.reset()
         await message.ack()
 
         # Maintenance now runs detached with its own retry, because the AMQP

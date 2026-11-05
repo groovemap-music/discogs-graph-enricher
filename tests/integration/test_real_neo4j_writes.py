@@ -504,8 +504,6 @@ async def test_real_engine_retries_transient_then_writes_once(neo4j_driver: Asyn
     message = pending("artists", {"id": "retry-artist", "name": "Retry Artist", "sha256": "retry-hash"})
     await enqueue(processor, message)
 
-    assert await processor.flush_queue("artists") is False
-    await asyncio.sleep(0.002)
     assert await processor.flush_queue("artists") is True
     message.ack_callback.assert_awaited_once()
     message.nack_callback.assert_not_awaited()

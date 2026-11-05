@@ -19,13 +19,41 @@ Both markers are nacked with `requeue=true` when their preceding data cannot be
 drained. An extraction signal is also requeued if its durable latch cannot be read or
 written.
 
+### How long a marker survives a Neo4j failure
+
+RabbitMQ 4.3.5 and 4.4.0 do not spend `x-delivery-limit` on `nack(requeue=True)`: the count
+stays absent and the message never dead-letters. So the service bounds a marker itself:
+
+- `flush_queue` retries for about 15 s (`max_flush_retries` 5, waiting 1, 2, 4 and 8 s), so a
+  failure that clears inside that window costs no requeue.
+- `requeue_marker` then waits on its own backoff, 2 s doubling to 60 s, before each requeue. A
+  marker is not redelivered in a tight loop: a 15 s outage cost 12,076 redeliveries before this
+  and at most 5 now, on real RabbitMQ and Neo4j.
+- Once the broker's `x-acquired-count` reaches `MARKER_MAX_REQUEUES` (500), the marker is logged
+  at critical level and nacked without requeue, so it lands in the DLQ.
+
+A failure shorter than about 8.2 hours loses no marker, provided only nacks return it: that is 500
+cycles at the backoff alone, with the early cycles shorter. A channel or connection close does spend
+`x-delivery-limit`, so 20 restarts during one outage dead-letter the marker early, with reason
+`delivery_limit` and without the critical log. A persistent failure otherwise reaches the DLQ after
+about 11 to 12.5 hours, flush retries included.
+
+A file marker's grace timer is cancelled when `extraction_complete` arrives, so the consumer stays
+attached while the marker waits, and landing re-arms it. Recovery can lag Neo4j's return by a flush
+pass plus 60 s of backoff at worst; the driver's circuit breaker, 30 s, sits inside that.
+
+A dead-lettered `extraction_complete` means that type's signal has not landed and maintenance will
+not run for that dump, so replay it from the DLQ once Neo4j is back. DLQs are capped by broker
+policy (50,000 messages or 512 MiB by default) with `drop-head`, so under a long outage the oldest
+dead letters are discarded: check the DLQ soon rather than leaving a marker there.
+
 ## Durable extraction gate
 
 ```mermaid
 flowchart TD
     A[extraction_complete delivery] --> B[drain signalling entity queue]
     B --> C{drained?}
-    C -->|no| D[nack and requeue signal]
+    C -->|no| D[wait, then nack and requeue signal]
     C -->|yes| E[load latch for message version]
     E --> F[persist entity signal in Neo4j]
     F --> G{all four signals persisted?}

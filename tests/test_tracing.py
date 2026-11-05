@@ -290,7 +290,7 @@ class TestFlushSpan:
 
         processor = self._processor(AsyncMock(side_effect=DatabaseUnavailableError("neo4j is down")))
         await self._enqueue(processor, self._pending([None]))
-        await processor.flush_queue("artists")
+        await processor._engine.flush("artists")
 
         flush = spans.only("flush neo4j artist")
         assert flush.attributes["outcome"] == "failed"
