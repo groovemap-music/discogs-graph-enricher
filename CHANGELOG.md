@@ -3,6 +3,15 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.6.1 (2026-11-05)
+
+### Fix
+
+- **person-names**: strip padding from a credit name before it keys a Person
+- **redelivery**: stop malformed records hot-looping and bound every requeue
+- **markers**: keep the consumer attached while a marker waits out a failure
+- **markers**: pace end-of-type markers through a Neo4j failure and bound them
+
 ## v0.6.0 (2026-11-05)
 
 ### Operator notes
