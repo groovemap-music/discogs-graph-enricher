@@ -12,6 +12,7 @@ the Neo4j knowledge graph.
 - [File and extraction completion](file-completion-tracking.md)
 - [Neo4j and RabbitMQ resilience](database-resilience.md)
 - [Neo4j schema and index ownership](neo4j-indexing.md)
+- [Person names with surrounding whitespace](person-name-whitespace.md)
 
 ## Performance and provenance
 
