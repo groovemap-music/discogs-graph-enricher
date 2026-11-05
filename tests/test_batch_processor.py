@@ -192,8 +192,6 @@ class TestSharedBatchRuntimeAdapter:
         for message in messages:
             await processor._engine.submit("artists", message, message)
 
-        assert await processor.flush_queue("artists") is False
-        await asyncio.sleep(0.002)
         assert await processor.flush_queue("artists") is True
         assert seen == [["0", "1", "2"], ["0"], ["1", "2"]]
         assert all(message.ack_callback.await_count == 1 for message in messages)

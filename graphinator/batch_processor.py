@@ -8,6 +8,7 @@ and exception classification, telemetry, and the service-facing facade.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import time
@@ -275,7 +276,19 @@ class Neo4jBatchProcessor:
         return True
 
     async def flush_queue(self, data_type: str) -> bool:
-        return await self._engine.flush(data_type)
+        """Drain one entity, waiting out transient backoff instead of giving up at once.
+
+        The engine returns ``False`` immediately while a key is in backoff, so a single flush
+        cannot outlast even a short Neo4j failure. ``False`` here means records are still pending
+        after every attempt, and they stay queued for the periodic flush.
+        """
+        for attempt in range(1, self.config.max_flush_retries + 1):
+            if await self._engine.flush(data_type):
+                return True
+            if attempt < self.config.max_flush_retries:
+                await asyncio.sleep(min(self.config.backoff_max, self.config.backoff_initial * self.config.backoff_multiplier ** (attempt - 1)))
+        logger.error("❌ Flush retry limit reached, records kept for retry", data_type=data_type, max_retries=self.config.max_flush_retries)
+        return False
 
     async def write(self, key: str, payloads: Sequence[PendingMessage]) -> Sequence[BatchItemResult]:
         """Implement BatchSink by delegating to the local Neo4j projector."""

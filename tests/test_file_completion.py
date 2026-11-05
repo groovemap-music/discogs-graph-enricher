@@ -63,3 +63,31 @@ async def test_artist_handler_returns_after_completion_marker() -> None:
         await service.on_artist_message(message)
     completion.assert_awaited_once()
     process.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_marker_requeues_after_backoff_while_budget_remains() -> None:
+    message = AsyncMock()
+    message.headers = {"x-acquired-count": 3}
+    with patch.object(service.marker_backoff, "wait", AsyncMock()) as wait:
+        await service.requeue_marker(message, "artists", "flush_incomplete")
+    wait.assert_awaited_once()
+    message.nack.assert_awaited_once_with(requeue=True)
+
+
+@pytest.mark.asyncio
+async def test_first_delivery_of_a_marker_has_no_header_and_requeues() -> None:
+    message = AsyncMock()
+    message.headers = None
+    await service.requeue_marker(message, "artists", "flush_incomplete")
+    message.nack.assert_awaited_once_with(requeue=True)
+
+
+@pytest.mark.asyncio
+async def test_marker_dead_letters_without_waiting_once_budget_is_spent() -> None:
+    message = AsyncMock()
+    message.headers = {"x-acquired-count": service.MARKER_MAX_REQUEUES}
+    with patch.object(service.marker_backoff, "wait", AsyncMock()) as wait:
+        await service.requeue_marker(message, "artists", "flush_incomplete")
+    wait.assert_not_awaited()
+    message.nack.assert_awaited_once_with(requeue=False)
