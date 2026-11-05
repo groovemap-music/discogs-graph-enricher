@@ -65,6 +65,10 @@ PAGE_RETRY_BASE_DELAY_SECONDS = 30.0
 START_CURSOR = ""
 
 
+class MaintenanceStopped(Exception):
+    """A paged sweep was told to stop between pages. Its checkpoint keeps every committed page."""
+
+
 def tx_timeout_seconds() -> float | None:
     """Return the optional client transaction timeout backstop, or ``None``."""
     raw = os.environ.get(MAINTENANCE_TX_TIMEOUT_ENV, "").strip()
@@ -164,6 +168,9 @@ async def write_checkpoint(graph: Any, step: str, run_key: str, checkpoint: Chec
 # means the key space after ``cursor`` is exhausted.
 PageProcessor = Callable[[str, int], Awaitable[tuple[str | None, int]]]
 
+# Runs before every page. Raising MaintenanceStopped ends the sweep between pages.
+BeforePage = Callable[[], Awaitable[None]]
+
 
 async def run_checkpointed_step(
     graph: Any,
@@ -173,6 +180,7 @@ async def run_checkpointed_step(
     process_page: PageProcessor,
     page_size: int,
     min_page_size: int = MIN_PAGE_SIZE,
+    before_page: BeforePage | None = None,
 ) -> int:
     """Drive ``process_page`` across the key space, committing a checkpoint per page.
 
@@ -185,6 +193,7 @@ async def run_checkpointed_step(
         process_page: Processes the page after ``cursor`` and reports where it ended.
         page_size: Starting page size, unless the checkpoint remembers a smaller one.
         min_page_size: Page-size floor for the halving backoff.
+        before_page: Called before every page; see :data:`BeforePage`.
 
     Returns:
         The number of items processed by THIS call (0 if the step was already done).
@@ -193,6 +202,7 @@ async def run_checkpointed_step(
         Whatever ``process_page`` raises that is not page-retryable, and the last
         retryable error once ``MAX_FAILURES_AT_MIN_PAGE`` attempts at the minimum page
         size have failed. The checkpoint keeps every committed page either way.
+        :class:`MaintenanceStopped` if ``before_page`` stops the sweep.
     """
     checkpoint = Checkpoint()
     if run_key is not None:
@@ -209,6 +219,8 @@ async def run_checkpointed_step(
     failures_at_min = 0
 
     while True:
+        if before_page is not None:
+            await before_page()
         try:
             last, processed = await process_page(cursor, size)
         except Exception as e:

@@ -1234,3 +1234,248 @@ async def test_stub_name_backfill_is_batched_resumable_and_fill_only(neo4j_drive
     assert sorted(got["p"]) == [["A1", "Artist One"], ["L1", "One"], ["L2", "Two"], ["L3", "Own Name"]]
     # A re-run resumes after the checkpoint and has nothing left to do.
     assert (await backfill(neo4j_driver, source, batch_size=2, checkpoint=checkpoint))["lines"] == 0
+
+
+# ── Stats refresh on an already-stamped dump ───────────────────────────────
+
+_REAL_REFRESH_HELPERS = {
+    "_load_extraction_signals": _LOAD_EXTRACTION_SIGNALS,
+    "_is_extraction_maintained": _REAL_MAINTENANCE_HELPERS["_is_extraction_maintained"],
+    "_latest_extraction_version": _REAL_MAINTENANCE_HELPERS["_latest_extraction_version"],
+    "_stamp_maintenance_success": _REAL_MAINTENANCE_HELPERS["_stamp_maintenance_success"],
+}
+
+DUMP = "20261101"
+MAINTAINED_AT = "2026-11-04T23:46:15.057Z"
+
+# What lux holds after a pass by the code before STATS_VERSION: stamped and succeeded, every
+# step done under the plain version, and no Artist stats or HAS_STYLE edges anywhere.
+STAMPED_DUMP_SEED = """
+CREATE (:ExtractionCompletion {version: $version, signals: ['releases', 'artists', 'labels', 'masters'],
+                               created_at: datetime('2026-11-02T00:00:00Z'), maintained_at: datetime($maintained_at),
+                               maintenance_status: 'succeeded'})
+WITH 1 AS _
+UNWIND ['genre_stats', 'style_stats', 'label_stats', 'person_credit_counts'] AS step
+CREATE (:MaintenanceCheckpoint {step: step, run_key: $version, cursor: 'zzz', size: 100, done: true})
+"""
+
+
+@pytest_asyncio.fixture
+async def stamped_dump(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> AsyncDriver:
+    """A stamped dump on real Neo4j, with the real latch helpers and no refresh running."""
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    async with neo4j_driver.session(database="neo4j") as session:
+        await (await session.run(STAMPED_DUMP_SEED, version=DUMP, maintained_at=MAINTAINED_AT)).consume()
+    for name, helper in _REAL_REFRESH_HELPERS.items():
+        monkeypatch.setattr(graphinator, name, helper)
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    monkeypatch.setattr(graphinator, "batch_processor", None)
+    monkeypatch.setattr(graphinator, "post_import_maintenance_task", None)
+    monkeypatch.setattr(graphinator, "stats_refresh_task", None)
+    monkeypatch.setattr(graphinator, "message_counts", dict.fromkeys(graphinator.message_counts, 0))
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "STATS_REFRESH_VERSION_CHECK_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "LABEL_STATS_PAGE_SIZE", 2)
+    monkeypatch.setattr(graphinator, "ARTIST_STATS_PAGE_SIZE", 2)
+    return neo4j_driver
+
+
+async def dump_node(driver: AsyncDriver, version: str = DUMP) -> dict[str, Any]:
+    return await one(
+        driver,
+        """
+        MATCH (m:ExtractionCompletion {version: $version})
+        RETURN toString(m.maintained_at) AS maintained_at, m.maintenance_status AS status,
+               m.maintenance_error AS error, m.stats_version AS stats_version
+        """,
+        version=version,
+    )
+
+
+async def stats_equal_live(driver: AsyncDriver) -> bool:
+    stored = await rows(
+        driver,
+        "MATCH (a:Artist) RETURN a.id AS id, a.release_count AS release_count, a.label_count AS label_count, a.primary_genre AS genre ORDER BY id",
+    )
+    counts = [{k: row[k] for k in ("id", "release_count", "label_count")} for row in stored]
+    genres = {row["id"]: row["genre"] for row in stored if row["genre"]}
+    return (
+        counts == await rows(driver, CATALOG_API_ARTIST_COUNTS)
+        and genres == exact_primary_genres(await rows(driver, LIVE_GENRE_HISTOGRAM))
+        and await rows(driver, STORED_LABEL_STYLES) == await rows(driver, LIVE_LABEL_STYLES)
+    )
+
+
+def count_artist_pages(monkeypatch: pytest.MonkeyPatch, *, crash_at: int | None = None, pause_at: int | None = None) -> dict[str, Any]:
+    """Wrap the Artist page statement: record each cursor, and crash or pause on the Nth page."""
+    real_run = graphinator.maintenance_paging.run_statement
+    seen: dict[str, Any] = {"cursors": [], "reached": asyncio.Event(), "release": asyncio.Event()}
+
+    async def run(graph: Any, cypher: str, **params: Any) -> Any:
+        if "MATCH (a:Artist)" in cypher:
+            seen["cursors"].append(params["cursor"])
+            page = len(seen["cursors"])
+            if page == crash_at:
+                raise RuntimeError("connection lost")
+            if page == pause_at:
+                seen["reached"].set()
+                await seen["release"].wait()
+        return await real_run(graph, cypher, **params)
+
+    monkeypatch.setattr(graphinator.maintenance_paging, "run_statement", run)
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_a_restart_on_a_stamped_dump_writes_the_stats_and_keeps_the_stamp(stamped_dump: AsyncDriver) -> None:
+    """Lux's case: no pass will run, and label_stats is done, yet the values must appear."""
+    assert await graphinator.resume_pending_maintenance() is False, "a stamped dump gets no maintenance pass"
+    assert await rows(stamped_dump, "MATCH (a:Artist) WHERE a.release_count IS NOT NULL RETURN a") == []
+
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+
+    assert await stats_equal_live(stamped_dump)
+    assert await dump_node(stamped_dump) == {
+        "maintained_at": MAINTAINED_AT,
+        "status": "succeeded",
+        "error": None,
+        "stats_version": graphinator.STATS_VERSION,
+    }
+    # The steps a refresh has no business repeating keep their checkpoints.
+    assert await rows(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.run_key AS key") == [{"key": DUMP}]
+
+    # The next start finds nothing to do.
+    assert await graphinator.resume_stats_refresh() is False
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_keeps_the_stamp_and_resumes_after_its_last_page(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS", 1)
+    failing = count_artist_pages(monkeypatch, crash_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is False
+
+    assert await dump_node(stamped_dump) == {"maintained_at": MAINTAINED_AT, "status": "succeeded", "error": None, "stats_version": None}
+    label_step = await one(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'label_stats'}) RETURN c.done AS done")
+    assert label_step == {"done": True}
+    committed = await one(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'artist_stats'}) RETURN c.cursor AS cursor, c.done AS done")
+    assert committed["cursor"] == failing["cursors"][1]
+    assert committed["done"] is False
+
+    # The next start: the committed page is not redone, and the Label sweep does not rerun.
+    monkeypatch.undo()
+    monkeypatch.setattr(graphinator, "graph", stamped_dump)
+    for name, helper in _REAL_REFRESH_HELPERS.items():
+        monkeypatch.setattr(graphinator, name, helper)
+    monkeypatch.setattr(graphinator, "stats_refresh_task", None)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "ARTIST_STATS_PAGE_SIZE", 2)
+    resumed = count_artist_pages(monkeypatch)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+
+    assert resumed["cursors"][0] == committed["cursor"]
+    assert await stats_equal_live(stamped_dump)
+    assert (await dump_node(stamped_dump))["stats_version"] == graphinator.STATS_VERSION
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_is_single_flight_within_and_across_restarts(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    first = graphinator.stats_refresh_task
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    assert await graphinator.resume_stats_refresh() is False, "a second trigger must not start a second sweep"
+    assert graphinator.stats_refresh_task is first
+
+    # A restart: the task dies mid-page, and the new process continues after the committed page.
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    resumed_from = await one(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'artist_stats'}) RETURN c.cursor AS cursor")
+    assert resumed_from["cursor"] == paused["cursors"][1]
+    paused["cursors"].clear()
+    paused["release"].set()
+
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+    assert paused["cursors"][0] == resumed_from["cursor"]
+    assert await stats_equal_live(stamped_dump)
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("stamped_dump")
+async def test_a_maintenance_trigger_takes_over_from_a_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real pass's trigger is acked and cannot be replayed, so a refresh must never swallow it."""
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    full_pass = AsyncMock(return_value=True)
+    monkeypatch.setattr(graphinator, "run_post_import_maintenance", full_pass)
+    assert await graphinator.resume_stats_refresh() is True
+    refresh = graphinator.stats_refresh_task
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    graphinator.start_post_import_maintenance("20261201")
+    assert await graphinator.post_import_maintenance_task is True
+    full_pass.assert_awaited_once_with("20261201")
+    with pytest.raises(asyncio.CancelledError):
+        await refresh
+
+    assert graphinator.start_stats_refresh(DUMP) is True  # the slot is free again once it has finished
+    paused["release"].set()
+    await graphinator.stats_refresh_task
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_stops_when_a_newer_dump_appears(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    await rows(
+        stamped_dump, "CREATE (:ExtractionCompletion {version: '20261201', signals: ['artists'], created_at: datetime('2026-12-02T00:00:00Z')})"
+    )
+    paused["release"].set()
+
+    assert await graphinator.stats_refresh_task is False
+    assert len(paused["cursors"]) == 2, "no page runs after the newer dump is seen"
+    assert await dump_node(stamped_dump) == {"maintained_at": MAINTAINED_AT, "status": "succeeded", "error": None, "stats_version": None}
+    # The new dump is still importing, so nothing restarts; its own pass writes the stats.
+    assert await graphinator.resume_stats_refresh() is False
+
+
+@pytest.mark.asyncio
+async def test_a_refresh_stops_when_messages_arrive_before_any_new_dump_node(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new dump writes long before its first ExtractionCompletion node exists."""
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+
+    graphinator.message_counts["artists"] += 1
+    paused["release"].set()
+
+    assert await graphinator.stats_refresh_task is False
+    assert len(paused["cursors"]) == 2
+    assert (await dump_node(stamped_dump))["stats_version"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_pass_stamps_the_stats_version_and_needs_no_refresh(stamped_dump: AsyncDriver) -> None:
+    await rows(stamped_dump, "MATCH (m:ExtractionCompletion) REMOVE m.maintained_at")
+    await graphinator.run_post_import_maintenance(DUMP)
+
+    assert (await dump_node(stamped_dump))["stats_version"] == graphinator.STATS_VERSION
+    assert await graphinator.resume_stats_refresh() is False
+
+
+@pytest.mark.asyncio
+async def test_a_step_finished_by_older_code_is_not_skipped_and_stamped_as_current(stamped_dump: AsyncDriver) -> None:
+    """Older code finished label_stats but died before its stamp: this pass must redo it."""
+    await rows(stamped_dump, "MATCH (m:ExtractionCompletion) REMOVE m.maintained_at")
+    assert await rows(stamped_dump, "MATCH ()-[h:HAS_STYLE]->() RETURN h") == []
+
+    assert await graphinator.run_post_import_maintenance(DUMP) is True
+
+    assert await stats_equal_live(stamped_dump)

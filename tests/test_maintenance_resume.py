@@ -102,6 +102,50 @@ async def test_artist_stats_without_a_driver_is_a_no_op() -> None:
         assert await g.compute_artist_stats() is True
 
 
+@pytest.mark.asyncio
+async def test_before_page_stops_a_sweep_between_pages_without_a_retry() -> None:
+    graph = FakePagedGraph(artists=[str(i) for i in range(1000, 1025)])
+    calls = {"n": 0}
+
+    async def stop_on_third() -> None:
+        calls["n"] += 1
+        if calls["n"] == 3:
+            raise mp.MaintenanceStopped("a newer dump has arrived")
+
+    with patch.object(g, "graph", graph), pytest.raises(mp.MaintenanceStopped):
+        await mp.run_checkpointed_step(
+            graph,
+            step="artist_stats",
+            run_key="2026-11",
+            process_page=mp.keyed_page_processor(graph, g.build_artist_stats_page_cypher()),
+            page_size=10,
+            before_page=stop_on_third,
+        )
+
+    assert [len(page) for page in graph.artist_pages] == [10, 10]
+    assert graph.checkpoints["artist_stats"]["cursor"] == "1019"
+    assert graph.checkpoints["artist_stats"]["done"] is False
+
+
+def test_the_run_key_carries_the_stats_version() -> None:
+    assert g.maintenance_run_key("20261101") == f"20261101@stats-{g.STATS_VERSION}"
+
+
+@pytest.mark.asyncio
+async def test_no_refresh_is_started_alongside_a_running_pass() -> None:
+    running = MagicMock()
+    running.done.return_value = False
+    with patch.object(g, "post_import_maintenance_task", running), patch.object(g, "stats_refresh_task", None):
+        assert g.start_stats_refresh("20261101") is False
+
+
+@pytest.mark.asyncio
+async def test_a_stats_check_that_cannot_read_neo4j_starts_nothing() -> None:
+    with patch.object(g, "_stats_refresh_version", AsyncMock(side_effect=RuntimeError("down"))), patch.object(g, "start_stats_refresh") as start:
+        assert await g.resume_stats_refresh() is False
+    start.assert_not_called()
+
+
 def test_genre_style_metrics_are_grouped_by_what_they_share() -> None:
     """The three counts that walk the same release chain share one statement; the others stay apart."""
     for node in ("Genre", "Style"):

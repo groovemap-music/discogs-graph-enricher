@@ -38,18 +38,19 @@ flowchart TD
     L -->|yes| N[remove unresolved stubs with no edges]
     N --> S[remove legacy no-master sentinel]
     S --> O[refresh genre, style, and label aggregates]
-    O --> P[recount every Person's credit counts]
+    O --> R[refresh artist aggregates]
+    R --> P[recount every Person's credit counts]
     P --> Q[stamp maintained_at on the version's node]
 ```
 
-The aggregate steps are resumable. Genre, Style, Label and Person-credit sweeps run as
-short keyed pages (for example `Label.id > $cursor ORDER BY id LIMIT $size`), not as one
+The aggregate steps are resumable. Genre, Style, Label, Artist and Person-credit sweeps run
+as short keyed pages (for example `Label.id > $cursor ORDER BY id LIMIT $size`), not as one
 statement over the whole graph, so no single transaction is bounded by graph size and the
 server's `db.transaction.timeout` is not what limits them. After each page the cursor is
-committed to a `MaintenanceCheckpoint` node keyed by step and dump version; a retry or a
-restart continues after the last committed page, a finished step is skipped, and a page
+committed to a `MaintenanceCheckpoint` node keyed by step, under a run key of the dump
+version and the stats version (`20261101@stats-1`); a retry or a restart continues after the last committed page, a finished step is skipped, and a page
 that times out or hits transaction-memory pressure is retried at half the size (the size
-that worked is remembered). A new dump version starts every sweep again. A failing step is
+that worked is remembered). A new dump version or a new `STATS_VERSION` starts every sweep again. A failing step is
 logged by name, the remaining steps still run, and `maintained_at` is only stamped when
 every step succeeded; otherwise `maintenance_error` names the failed steps.
 
@@ -73,9 +74,11 @@ Maintenance performs these steps in order:
    fully imported record and is kept so a later dump can fill it in place.
 3. Delete the `(:Master {id: "0"})` node that graphs loaded before the Discogs
    "no master" sentinel fix may still carry, detaching its edges in chunks first.
-4. Recompute the Genre, Style, and Label aggregate properties documented in the
+4. Recompute the Genre, Style, and Label aggregate properties and the `HAS_STYLE` edges
+   documented in the
    [service reference](../graphinator/README.md#-pre-computed-node-properties).
-5. Recount `credit_count` and `credit_count_<category>` on every Person — one count per
+5. Recompute the Artist aggregate properties documented in the same reference.
+6. Recount `credit_count` and `credit_count_<category>` on every Person — one count per
    category in the shared `common.credit_roles.ALL_CATEGORIES` vocabulary, each the
    number of distinct releases the person is `CREDITED_ON` with that category, plus the
    distinct-release total. The recount is full rather than incremental, so a credit a
@@ -105,6 +108,7 @@ per `version`:
 | `maintenance_status` | `succeeded` or `failed` (outcome of the most recent finished pass). |
 | `maintenance_error` | Truncated reason from a pass that failed every retry. Cleared by a later success. Never coexists with a failure recorded after `maintained_at`: a stamped node is not modified by later failures. |
 | `maintenance_failed_at` | When `maintenance_error` was recorded. |
+| `stats_version` | The `STATS_VERSION` the dump's stats were last written at. See [the stats refresh](#stats-refresh-on-a-stamped-dump-stats_version). |
 
 Guarantees:
 
@@ -118,6 +122,68 @@ Guarantees:
   failure). Older versions are superseded and not resumed. A redelivered final signal
   for an already-stamped version skips maintenance.
 - No runtime DDL: the node is still matched by `version`.
+
+## Stats refresh on a stamped dump (`stats_version`)
+
+A dump stamped by older code never gets the stats that code did not write:
+`maintained_at` stops `resume_pending_maintenance()`, and the old checkpoints mark the steps
+done. The next dump can be a month away. So `STATS_VERSION` in `graphinator/graphinator.py`
+names what the sweeps write, and each pass records it as
+`ExtractionCompletion.stats_version`.
+
+At every start, if the newest dump has all four signals and `maintained_at`, and its
+`stats_version` differs from the code's, `resume_stats_refresh()` runs the Label and Artist
+sweeps once. Deploying is the whole trigger: there is no manual step. Bump `STATS_VERSION`
+whenever a sweep's output changes.
+
+- It never touches `maintained_at`, `maintenance_status` or `maintenance_error`, so readers
+  keep seeing a final graph while the values arrive.
+- The run key includes the stats version, so older checkpoints do not skip it, and a retry
+  or restart continues after the last committed page.
+- A failed refresh is logged and retried at the next start. `stats_version` is written
+  only once both sweeps have finished.
+- It has its own task slot, and only one runs at a time. A real maintenance trigger cancels
+  it, because that trigger is acked and cannot be replayed, and the pass writes every stat.
+- It stops between pages if a catalog message arrives or a newer version appears. Messages
+  are checked before every page, because a new dump writes long before its first
+  `ExtractionCompletion` node exists. That dump's own pass then writes the stats.
+- This relies on one service instance, the deployed shape: a second running instance would
+  repeat the work. Every write is guarded and idempotent, so that wastes time and changes
+  no value.
+
+### Deploying `STATS_VERSION` 1
+
+Deploy this after the Discogs load has finished. The refresh starts on its own right after
+the deploy and writes to Neo4j on lux:
+
+| | Estimate for lux | Basis |
+| --- | --- | --- |
+| Refresh time | about 12 minutes, in the 10 to 15 minute range | 10,287 Artist pages at 61 ms, plus about 75 s for the HAS_STYLE edges |
+| Store growth | about 0.8 GB | 0.38 GB of edges and up to 0.42 GB on Artist |
+| Later passes | about 9 minutes added, less for unchanged data | 47 ms per Artist page, plus about 45 s for reading the edges |
+
+Reads were measured on lux (44 ms per Artist page across five sampled pages, and about 5.0M
+edges from two 1% samples of 2.43M labels). Writes and store size were measured on a
+disposable Neo4j, so lux's write rate may differ:
+
+- 75.3 bytes per `HAS_STYLE` edge (34.1 relationship, 41.2 property) and 41.2 bytes per
+  Artist, on 500,001 Artists with the same five properties as lux and 2,108,503 edges.
+- 14 ms of writes per Artist page, 3 ms per checkpoint, and 15 µs per edge created. Reading
+  an unchanged edge adds 9 µs. On lux the Label page read itself costs 42% fewer db hits
+  (6.38M to 3.67M across five sampled pages), which offsets part of that.
+
+The largest pages were proven on the same real Neo4j, with lux's 10-minute transaction
+timeout and a 512 MiB transaction-memory cap (lux has 3 GiB), at lux's real hub sizes. Neither
+page needed a retry.
+
+| Page | Hub | Time | Peak transaction memory |
+| --- | --- | --- | --- |
+| Artist, with Various | 1,361,622 releases on 176,001 labels | 4.6 s | 49.3 MB |
+| Label, with 1818 | 762,594 releases by 495,001 artists | 2.2 s | 60.0 MB |
+
+The Neo4j readers in `catalog-api` must land after this refresh, or keep their live fallback
+until then. Until it finishes, the new Artist properties and `HAS_STYLE` edges are missing
+or partial.
 
 Follow-up (deployment repo, not part of this change): once a release containing this
 stamp ships, `just discogs-import-status` in `groovemap-music/deployment` should require

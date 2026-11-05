@@ -377,6 +377,8 @@ After graph import of releases, the graphinator runs `compute_genre_style_stats(
 
 Every Artist is computed the same way, with no cap and no sampling, so a placeholder such as Various (id 194, 1.36M releases) gets exact values too. An artist with no releases reads `0` for both counts.
 
+A dump stamped before these stats existed gets them from a refresh at the next start, with no manual step. See [Stats refresh on a stamped dump](../docs/file-completion-tracking.md#stats-refresh-on-a-stamped-dump-stats_version).
+
 **Person nodes** — `compute_person_credit_counts()`, read by the catalog-api role leaderboard and backed by the `person_credit_count*` range indexes in `database-schema`:
 
 | Property                  | Description                                                                         |
