@@ -91,3 +91,23 @@ async def test_marker_dead_letters_without_waiting_once_budget_is_spent() -> Non
         await service.requeue_marker(message, "artists", "flush_incomplete")
     wait.assert_not_awaited()
     message.nack.assert_awaited_once_with(requeue=False)
+
+
+@pytest.mark.asyncio
+async def test_a_record_requeues_after_backoff_while_budget_remains() -> None:
+    message = AsyncMock()
+    message.headers = {"x-acquired-count": 3}
+    with patch.object(service.outage_backoff, "wait", AsyncMock()) as wait:
+        await service.requeue_record(message)
+    wait.assert_awaited_once()
+    message.nack.assert_awaited_once_with(requeue=True)
+
+
+@pytest.mark.asyncio
+async def test_a_record_dead_letters_without_waiting_once_budget_is_spent() -> None:
+    message = AsyncMock()
+    message.headers = {"x-acquired-count": service.RECORD_MAX_REQUEUES}
+    with patch.object(service.outage_backoff, "wait", AsyncMock()) as wait:
+        await service.requeue_record(message)
+    wait.assert_not_awaited()
+    message.nack.assert_awaited_once_with(requeue=False)
