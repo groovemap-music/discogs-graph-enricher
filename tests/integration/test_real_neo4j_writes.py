@@ -1479,3 +1479,110 @@ async def test_a_step_finished_by_older_code_is_not_skipped_and_stamped_as_curre
     assert await graphinator.run_post_import_maintenance(DUMP) is True
 
     assert await stats_equal_live(stamped_dump)
+
+
+# ── What catalog-api reads ─────────────────────────────────────────────────
+
+# The completeness marker, verbatim as agreed with gm-catalog-api-j4ml. A reader trusts
+# HAS_STYLE only when this returns maintained and stats_version >= 1.
+HAS_STYLE_MARKER = """
+MATCH (m:ExtractionCompletion)
+RETURN m.stats_version AS stats_version, m.maintained_at IS NOT NULL AS maintained
+ORDER BY coalesce(m.created_at, datetime({epochMillis: 0})) DESC
+LIMIT 1
+"""
+
+# How gm-catalog-api-575h tells "computed, no genre" from "not reached yet".
+PRIMARY_GENRE_STATE = """
+MATCH (a:Artist {id: $id})
+RETURN a.primary_genre AS genre, a.release_count IS NOT NULL AS computed
+"""
+
+
+async def has_style_is_trusted(driver: AsyncDriver) -> bool:
+    marker = await rows(driver, HAS_STYLE_MARKER)
+    return bool(marker) and marker[0]["maintained"] and (marker[0]["stats_version"] or 0) >= 1
+
+
+@pytest.mark.asyncio
+async def test_the_marker_appears_only_once_every_label_has_its_edges(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    assert await has_style_is_trusted(stamped_dump) is False
+
+    # Labels finished but Artists not: the edges are complete, yet the refresh has not ended.
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS", 1)
+    count_artist_pages(monkeypatch, crash_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is False
+    assert await has_style_is_trusted(stamped_dump) is False
+
+    monkeypatch.undo()
+    monkeypatch.setattr(graphinator, "graph", stamped_dump)
+    for name, helper in _REAL_REFRESH_HELPERS.items():
+        monkeypatch.setattr(graphinator, name, helper)
+    monkeypatch.setattr(graphinator, "stats_refresh_task", None)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+
+    assert await has_style_is_trusted(stamped_dump) is True
+    assert await rows(stamped_dump, STORED_LABEL_STYLES) == await rows(stamped_dump, LIVE_LABEL_STYLES)
+
+
+@pytest.mark.asyncio
+async def test_the_marker_is_withheld_while_a_label_sweep_is_partial(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Part of the labels have edges: a reader must not see a shortened candidate set as complete."""
+    monkeypatch.setattr(graphinator, "POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(graphinator, "LABEL_STATS_PAGE_SIZE", 1)
+    real_run = graphinator.maintenance_paging.run_statement
+    pages = {"n": 0}
+
+    async def crash_on_second_label_page(graph: Any, cypher: str, **params: Any) -> Any:
+        if "MATCH (l:Label)" in cypher:
+            pages["n"] += 1
+            if pages["n"] == 2:
+                raise RuntimeError("connection lost")
+        return await real_run(graph, cypher, **params)
+
+    monkeypatch.setattr(graphinator.maintenance_paging, "run_statement", crash_on_second_label_page)
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is False
+
+    partial = await rows(stamped_dump, STORED_LABEL_STYLES)
+    assert partial, "the first label's edges were committed"
+    assert partial != await rows(stamped_dump, LIVE_LABEL_STYLES)
+    assert await has_style_is_trusted(stamped_dump) is False
+
+
+@pytest.mark.asyncio
+async def test_a_new_dump_withdraws_the_marker_until_its_own_pass(stamped_dump: AsyncDriver) -> None:
+    assert await graphinator.resume_stats_refresh() is True
+    assert await graphinator.stats_refresh_task is True
+    assert await has_style_is_trusted(stamped_dump) is True
+
+    await rows(
+        stamped_dump, "CREATE (:ExtractionCompletion {version: '20261201', signals: ['artists'], created_at: datetime('2026-12-02T00:00:00Z')})"
+    )
+    assert await has_style_is_trusted(stamped_dump) is False
+
+    await graphinator.run_post_import_maintenance("20261201")
+    assert await has_style_is_trusted(stamped_dump) is True
+
+
+@pytest.mark.asyncio
+async def test_computed_with_no_genre_differs_from_not_reached(stamped_dump: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def state(artist_id: str) -> dict[str, Any]:
+        return await one(stamped_dump, PRIMARY_GENRE_STATE, id=artist_id)
+
+    assert await state("A3") == {"genre": None, "computed": False}, "not reached: read it live"
+
+    paused = count_artist_pages(monkeypatch, pause_at=2)
+    assert await graphinator.resume_stats_refresh() is True
+    await asyncio.wait_for(paused["reached"].wait(), 30)
+    # Mid-sweep, a committed page is computed and a later one is not. Keys sort '194', 'A1', ...
+    assert (await state("194")) == {"genre": "Pop", "computed": True}
+    assert (await state("A3")) == {"genre": None, "computed": False}
+    paused["release"].set()
+    assert await graphinator.stats_refresh_task is True
+
+    assert await state("A3") == {"genre": None, "computed": True}, "computed, no genre: no live read"
+    assert await state("A1") == {"genre": "Jazz", "computed": True}

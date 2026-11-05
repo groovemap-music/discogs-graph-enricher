@@ -377,6 +377,25 @@ After graph import of releases, the graphinator runs `compute_genre_style_stats(
 
 Every Artist is computed the same way, with no cap and no sampling, so a placeholder such as Various (id 194, 1.36M releases) gets exact values too. An artist with no releases reads `0` for both counts.
 
+**Reading these safely.** There is no placeholder value. On an Artist, `release_count` is written on every artist in the same transaction as `primary_genre`, so:
+
+| `release_count` | `primary_genre` | Meaning                                  |
+| --------------- | --------------- | ---------------------------------------- |
+| present         | present         | The artist's primary genre               |
+| present         | absent          | Computed: the artist has no genre        |
+| absent          | absent          | Not reached yet: compute it live         |
+
+`HAS_STYLE` has no per-label stamp. Its completeness marker is `stats_version` on the newest `ExtractionCompletion` node, the same node `maintained_at` is on. Read that node and no other, and trust the edges only when it has `maintained_at` and `stats_version >= 1`; otherwise compute live:
+
+```cypher
+MATCH (m:ExtractionCompletion)
+RETURN m.stats_version AS stats_version, m.maintained_at IS NOT NULL AS maintained
+ORDER BY coalesce(m.created_at, datetime({epochMillis: 0})) DESC
+LIMIT 1
+```
+
+`stats_version` is written only after every label and artist has been swept, and never after a failed or stopped sweep. A new dump's node withdraws the marker until that dump's own pass. Once the marker is set, a label with no edges has no styles. As with every stored stat, the edges can be one dump old between the start of an import and that dump's first `extraction_complete`, when its node appears.
+
 A dump stamped before these stats existed gets them from a refresh at the next start, with no manual step. See [Stats refresh on a stamped dump](../docs/file-completion-tracking.md#stats-refresh-on-a-stamped-dump-stats_version).
 
 **Person nodes** — `compute_person_credit_counts()`, read by the catalog-api role leaderboard and backed by the `person_credit_count*` range indexes in `database-schema`:
