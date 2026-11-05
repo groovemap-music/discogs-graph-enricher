@@ -3,6 +3,36 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.6.0 (2026-11-05)
+
+### Operator notes
+
+- **First start writes to Neo4j and needs operator go-ahead.** The first start after this deploy runs
+  the `STATS_VERSION` 1 refresh on its own, with no manual step. Estimated on lux: about 12 minutes and
+  about 0.8 GB of store growth. Deploy it after the Discogs load has finished, and only with operator
+  go-ahead. See `docs/file-completion-tracking.md`.
+- **Publish nothing to graphinator's queues during the refresh.** An arriving catalog message stops the
+  refresh between pages, and nothing retries it until the next restart or the next dump's pass.
+- **Batch engine fix.** `groovemap-runtime` is pinned to `ecde48b`, which stops one busy queue starving
+  every other queue's periodic flush and the memory growth that followed from it. The pin also carries
+  the other runtime commits since the previous pin.
+
+### Feat
+
+- **maintenance**: refresh stats on a dump stamped by older code
+- **maintenance**: precompute artist stats and label style counts
+
+### Fix
+
+- **projection**: bound Person names to what the unique index can hold
+
+### Perf
+
+- **maintenance**: compute Genre and Style counts with fewer traversals
+- **projection**: prune a release batch's BY, ON, DERIVED_FROM and IS edges in one statement
+- **projection**: merge each distinct Genre, Style and PART_OF pair once per batch
+- **maintenance**: skip unchanged writes in Label and Person sweeps
+
 ## v0.5.0 (2026-11-04)
 
 ### Feat
