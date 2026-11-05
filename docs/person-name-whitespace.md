@@ -6,6 +6,14 @@ a person the same way. A name that differs only by surrounding whitespace is the
 second person in both stores. This records how often that happens and the options.
 Nothing here has been migrated.
 
+**Update 2026-11-05:** the operator chose a full reset and fresh ingest, so the one-off merge
+(steps 4 to 6 below) is cancelled. What ships is step 1: `common.person_names.strip_person_name`
+is used by `person_credit_rows` here and by `discogs-sql-loader`'s `_credits`, so a fresh ingest
+creates no padded Person in either store. A credit whose name is only padding is skipped and
+counted (a warning with counts only). One measured name on lux is padded with U+2800 BRAILLE
+PATTERN BLANK (category So), which the rule does not strip yet; adding it is a separate change in
+`python-libraries`.
+
 **Decision: option B, after the Discogs load.** The operator chose this on 2026-11-04. It
 is filed as its own bead, and nothing has been migrated yet.
 

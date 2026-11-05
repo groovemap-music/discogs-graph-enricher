@@ -32,6 +32,7 @@ from typing import Any
 
 import structlog
 from common.credit_roles import ALL_CATEGORIES, categorize_role
+from common.person_names import strip_person_name
 
 
 logger = structlog.get_logger(__name__)
@@ -88,15 +89,24 @@ CREDIT_COUNT_PROPERTIES: tuple[str, ...] = (
 def person_credit_rows(release_id: Any, extraartists: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     """Return one CREDITED_ON row per usable extraartists credit of a release.
 
-    A credit without a name or a role is not projected. ``artist_id`` is carried only
-    when Discogs links the credit to an artist, for the ``SAME_AS`` edge. A name too long
+    A credit without a name or a role is not projected. The name is stripped of surrounding
+    padding first (:func:`common.person_names.strip_person_name`, shared with discogs-sql-loader
+    so both stores key a person alike); a name that is all padding is skipped and counted.
+    Known gap: U+2800 BRAILLE PATTERN BLANK (category So) is padding on one measured name
+    and the shared rule does not strip it yet. ``artist_id`` is carried only when Discogs
+    links the credit to an artist, for the ``SAME_AS`` edge. A name too long
     for the Person index is replaced by :func:`bound_person_name`'s bounded form.
     """
     rows: list[dict[str, Any]] = []
     bounded = 0
+    padding_only = 0
     for credit in extraartists or []:
         name = credit.get("name")
         role = credit.get("role", "")
+        # Strip FIRST and test the result: an all-padding name must not become a blank Person.
+        if isinstance(name, str) and name and role and not (name := strip_person_name(name)):
+            padding_only += 1
+            continue
         if not (name and role):
             continue
         if isinstance(name, str) and (limited := bound_person_name(name)) != name:
@@ -111,6 +121,9 @@ def person_credit_rows(release_id: Any, extraartists: list[dict[str, Any]] | Non
         if artist_id := credit.get("id"):
             row["artist_id"] = artist_id
         rows.append(row)
+    if padding_only:
+        # Counts only: the name is padding, so there is nothing to log but how many.
+        logger.warning("⚠️ Credit with an all-padding Person name was skipped", release_id=release_id, skipped=padding_only)
     if bounded:
         # Counts only: a name this long is not safe to log.
         logger.warning("⚠️ Person name over the index limit was bounded", release_id=release_id, bounded=bounded, limit_bytes=PERSON_NAME_MAX_BYTES)
