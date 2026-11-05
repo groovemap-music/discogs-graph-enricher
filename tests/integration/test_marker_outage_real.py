@@ -85,6 +85,8 @@ class Stack:
     channel: aio_pika.abc.AbstractChannel
     queue_name: str
     dlq: aio_pika.abc.AbstractQueue
+    queue: aio_pika.abc.AbstractQueue
+    tag: str = ""
     marker_deliveries: list[float] = field(default_factory=list)
 
     async def publish(self, body: dict[str, Any]) -> None:
@@ -144,7 +146,7 @@ async def stack(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Stack]:
     queue = await channel.declare_queue(
         name, durable=True, arguments={"x-queue-type": "quorum", "x-delivery-limit": 20, "x-dead-letter-exchange": f"{name}.dlx"}
     )
-    built = Stack(proxy, channel, name, dlq)
+    built = Stack(proxy, channel, name, dlq, queue)
     loop = asyncio.get_running_loop()
 
     async def handle(message: aio_pika.abc.AbstractIncomingMessage) -> None:
@@ -153,9 +155,13 @@ async def stack(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Stack]:
         await graphinator.on_artist_message(message)
 
     tag = await queue.consume(handle)
+    built.tag = tag
     try:
         yield built
     finally:
+        for task in list(graphinator.consumer_cancel_tasks.values()):
+            task.cancel()
+        graphinator.consumer_cancel_tasks.clear()
         with contextlib.suppress(Exception):
             await queue.cancel(tag)
         await proxy.cut()
@@ -222,6 +228,55 @@ async def test_a_short_failure_at_the_end_of_a_type_loses_no_marker(stack: Stack
     await until(landed, 120)
     assert await stack.depth(f"{stack.queue_name}.dlq") == 0
     assert during_outage <= 5, f"marker redelivered {during_outage} times in a 15 s outage"
+
+
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("marker", ["file_complete", "extraction_complete"])
+async def test_a_failure_inside_the_flush_retries_costs_no_requeue(stack: Stack, marker: str) -> None:
+    """Neo4j returns while flush_queue is still retrying, so the first delivery lands the marker."""
+    await load_records(stack)
+    await stack.proxy.cut()
+    await stack.publish({"type": marker, "version": VERSION, "total_processed": RECORDS})
+
+    async def delivered() -> bool:
+        return len(stack.marker_deliveries) == 1
+
+    await until(delivered, 10)
+    await asyncio.sleep(1.5)
+    await stack.proxy.open()
+
+    async def landed() -> bool:
+        artists, signals = await stored()
+        done = signals == ["artists"] if marker == "extraction_complete" else "artists" in graphinator.completed_files
+        return done and artists == RECORDS
+
+    await until(landed, 30)
+    assert len(stack.marker_deliveries) == 1, "the marker went back to the broker although the flush could still succeed"
+
+
+@pytest.mark.timeout(180)
+async def test_the_grace_timer_cannot_strand_a_marker_in_backoff(stack: Stack, monkeypatch: pytest.MonkeyPatch) -> None:
+    """file_complete arms the timer, extraction_complete waits out a failure past it, consumer stays."""
+    monkeypatch.setattr(graphinator, "CONSUMER_CANCEL_DELAY", 3)
+    monkeypatch.setitem(graphinator.queues, "artists", stack.queue)
+    monkeypatch.setitem(graphinator.consumer_tags, "artists", stack.tag)
+    await stack.publish({"type": "file_complete", "total_processed": 0})
+
+    async def armed() -> bool:
+        return "artists" in graphinator.consumer_cancel_tasks
+
+    await until(armed, 10)
+    await stack.proxy.cut()
+    await stack.publish({"type": "extraction_complete", "version": VERSION})
+    await asyncio.sleep(8)
+    assert "artists" in graphinator.consumer_tags, "the grace timer cancelled the consumer while the marker was in backoff"
+    await stack.proxy.open()
+
+    async def landed() -> bool:
+        return (await stored())[1] == ["artists"]
+
+    await until(landed, 120)
+    assert "artists" in graphinator.consumer_cancel_tasks, "landing the marker did not re-arm the grace timer"
 
 
 @pytest.mark.timeout(180)

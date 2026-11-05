@@ -32,12 +32,20 @@ stays absent and the message never dead-letters. So the service bounds a marker 
 - Once the broker's `x-acquired-count` reaches `MARKER_MAX_REQUEUES` (500), the marker is logged
   at critical level and nacked without requeue, so it lands in the DLQ.
 
-A failure shorter than about 8.2 hours loses no marker: 500 cycles at the backoff alone, with the
-early cycles shorter. A persistent failure ends in the DLQ after about 10.4 hours when each cycle
-also runs the flush retries, plus any time the driver spends failing to connect. A dead-lettered
-`extraction_complete` means that type's signal has not landed and maintenance will not run for
-that dump, so replay it from the DLQ once Neo4j is back. Recovery can lag Neo4j's return by up to
-60 s, the driver's circuit breaker window.
+A failure shorter than about 8.2 hours loses no marker, provided only nacks return it: that is 500
+cycles at the backoff alone, with the early cycles shorter. A channel or connection close does spend
+`x-delivery-limit`, so 20 restarts during one outage dead-letter the marker early, with reason
+`delivery_limit` and without the critical log. A persistent failure otherwise reaches the DLQ after
+about 11 to 12.5 hours, flush retries included.
+
+A file marker's grace timer is cancelled when `extraction_complete` arrives, so the consumer stays
+attached while the marker waits, and landing re-arms it. Recovery can lag Neo4j's return by a flush
+pass plus 60 s of backoff at worst; the driver's circuit breaker, 30 s, sits inside that.
+
+A dead-lettered `extraction_complete` means that type's signal has not landed and maintenance will
+not run for that dump, so replay it from the DLQ once Neo4j is back. DLQs are capped by broker
+policy (50,000 messages or 512 MiB by default) with `drop-head`, so under a long outage the oldest
+dead letters are discarded: check the DLQ soon rather than leaving a marker there.
 
 ## Durable extraction gate
 

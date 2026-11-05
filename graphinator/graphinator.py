@@ -95,9 +95,10 @@ outage_backoff = OutageBackoff(SERVICE_NAME)
 # marker down or ever stops it: x-delivery-count stays absent and it never dead-letters.
 marker_backoff = OutageBackoff(f"{SERVICE_NAME}-marker")
 # Hand-outs a marker may use, read from x-acquired-count, which counts every kind of return.
-# At the 60 s backoff cap this is at least 8.3 hours of failure, and each cycle adds the
-# flush retries on top. A marker blocks nothing while it waits, and losing one means that
-# type's signal never lands, so the budget is wide.
+# At the 60 s backoff cap this is about 8.2 hours of failure before the flush retries each
+# cycle adds, provided only nacks return it: see docs/file-completion-tracking.md. A marker
+# blocks nothing while it waits, and losing one means that type's signal never lands, so
+# the budget is wide.
 MARKER_MAX_REQUEUES = 500
 # Track which data types have delivered an extraction_complete signal. Stub
 # cleanup and aggregate stats are deferred until EVERY type has signalled, so
@@ -992,6 +993,12 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
             data_type=data_type,
             version=data.get("version"),
         )
+
+        # The grace timer file_complete armed must not fire while this marker waits out a
+        # failure: it would come back to a queue with no consumer. Landing re-arms the timer.
+        pending_cancel = consumer_cancel_tasks.pop(data_type, None)
+        if pending_cancel is not None:
+            pending_cancel.cancel()
 
         # Flush remaining batches for this data type before cleanup
         if batch_processor is not None and not await batch_processor.flush_queue(data_type):
