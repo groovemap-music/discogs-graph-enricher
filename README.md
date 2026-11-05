@@ -86,8 +86,8 @@ catalog.
 
 ## Failure and drain behavior
 
-- Transient Neo4j failures are retried with bounded backoff without spending the
-  RabbitMQ delivery-limit budget on healthy records.
+- Transient Neo4j failures are retried with bounded backoff, and a record that keeps
+  failing reaches the dead-letter queue at a stated bound.
 - Poison records are isolated so healthy records in the same batch can complete.
 - Shutdown first cancels consumers, then drains or safely re-enqueues in-flight work;
   a delivery is never negatively acknowledged while its consumer is still subscribed.

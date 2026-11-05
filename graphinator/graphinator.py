@@ -12,12 +12,15 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from common import (
+    DEFAULT_MAX_REQUEUES,
     AsyncResilientNeo4jDriver,
     AsyncResilientRabbitMQ,
     HealthServer,
     OutageBackoff,
+    broker_handouts,
     neo4j_security_kwargs,
     normalize_record,
+    requeue_or_dead_letter,
     setup_logging,
 )
 from common.db_resilience import DatabaseUnavailableError
@@ -85,11 +88,13 @@ progress_interval = 100  # Log progress every 100 messages
 last_message_time = {"artists": 0.0, "labels": 0.0, "masters": 0.0, "releases": 0.0}
 completed_files: set[str] = set()  # Track which files have completed processing
 
-# Non-batch mode only: throttles requeues while Neo4j is unavailable, so an
-# outage cannot burn the quorum queue's x-delivery-limit budget and dead-letter
-# valid records. Batch mode gets the same protection from _flush_queue's
-# re-enqueue+backoff, which never nacks.
+# Paces every record requeue, because nothing else does: RabbitMQ 4.3.5 and 4.4.0 do not
+# spend x-delivery-limit on nack(requeue=True), so a nacked record comes straight back
+# forever. Batch mode holds records in memory instead, and its failures do not nack.
 outage_backoff = OutageBackoff(SERVICE_NAME)
+# Requeues a record may use before it is dead-lettered, read from x-acquired-count. At the
+# 60 s backoff cap this is about 8.3 hours, so an outage does not dead-letter good records.
+RECORD_MAX_REQUEUES = DEFAULT_MAX_REQUEUES
 # An end-of-type marker waits out a Neo4j failure here before each requeue. RabbitMQ 4.3.5
 # and 4.4.0 do not spend x-delivery-limit on nack(requeue=True), so nothing else slows a
 # marker down or ever stops it: x-delivery-count stays absent and it never dead-letters.
@@ -941,19 +946,24 @@ async def run_stats_refresh(version: str) -> bool:
 
 async def requeue_marker(message: AbstractIncomingMessage, data_type: str, reason: str) -> None:
     """Return a marker to the broker after a pause, or dead-letter it once its budget is spent."""
-    headers = getattr(message, "headers", None) or {}
-    acquired = headers.get("x-acquired-count", 0)
-    if isinstance(acquired, int) and acquired >= MARKER_MAX_REQUEUES:
+    handouts = broker_handouts(message)
+    if handouts >= MARKER_MAX_REQUEUES:
         logger.critical(
             "🚨 End-of-type marker dead-lettered: its requeue budget is spent, so this type's signal has NOT landed",
             data_type=data_type,
             reason=reason,
-            deliveries=acquired + 1,
+            deliveries=handouts + 1,
         )
-        await message.nack(requeue=False)
-        return
-    await marker_backoff.wait()
-    await message.nack(requeue=True)
+    else:
+        await marker_backoff.wait()
+    await requeue_or_dead_letter(message, max_requeues=MARKER_MAX_REQUEUES)
+
+
+async def requeue_record(message: AbstractIncomingMessage) -> None:
+    """Return a record to the broker after a pause, or dead-letter it once its budget is spent."""
+    if broker_handouts(message) < RECORD_MAX_REQUEUES:
+        await outage_backoff.wait()
+    await requeue_or_dead_letter(message, max_requeues=RECORD_MAX_REQUEUES)
 
 
 async def check_file_completion(data: dict[str, Any], data_type: str, message: AbstractIncomingMessage) -> bool:
@@ -1091,10 +1101,10 @@ async def check_file_completion(data: dict[str, Any], data_type: str, message: A
         # node over 16 genres + ~757 styles, label stats cover ~2.3M labels, and
         # stub cleanup DETACH DELETEs millions of nodes — routinely hours. Holding
         # the delivery unacked across it trips RabbitMQ's 30-minute consumer ack
-        # timeout, which closes the SHARED channel with PRECONDITION_FAILED: all
-        # four consumers die, the signal is redelivered, maintenance restarts from
-        # scratch, and after x-delivery-limit=20 redeliveries the trigger is
-        # dead-lettered and maintenance never completes at all.
+        # timeout. The broker then cancels that consumer and requeues the delivery,
+        # with the channel left open and no x-delivery-count spent, so the signal is
+        # redelivered, maintenance restarts from scratch, and nothing on the broker
+        # ever ends the loop.
         marker_backoff.reset()
         await message.ack()
 
@@ -1939,11 +1949,9 @@ def make_message_handler(
         if shutdown_requested:
             # Leave the delivery UNACKED — never nack(requeue=True) here. The
             # consumer is still subscribed at this point, so a requeue is
-            # redelivered within milliseconds and nacked again, burning a quorum
-            # x-delivery-count per cycle; at x-delivery-limit=20 valid records
-            # are dead-lettered within a second of a routine restart. Returning
-            # without settling lets the connection close requeue them exactly
-            # once.
+            # redelivered within milliseconds and nacked again, in a hot loop that
+            # nothing ends. Returning without settling lets the connection close
+            # requeue them exactly once, which spends one x-delivery-count.
             logger.debug("🛑 Shutdown requested, leaving message unacked for redelivery")
             return
 
@@ -1965,7 +1973,18 @@ def make_message_handler(
         with gm_telemetry.consume_span(destination, getattr(message, "headers", None)) as span:
             try:
                 logger.debug("🔄 Received message", data_type=data_type[:-1])
-                record: dict[str, Any] = loads(message.body)
+                try:
+                    parsed = loads(message.body)
+                except ValueError:
+                    parsed = None
+                if not isinstance(parsed, dict):
+                    # Unreadable now means unreadable forever, so no retry can help.
+                    logger.error("❌ Malformed message body, dead-lettering", data_type=data_type)
+                    consumed_error_type = "MalformedRecord"
+                    gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
+                    await message.nack(requeue=False)
+                    return
+                record: dict[str, Any] = parsed
 
                 if await check_file_completion(record, data_type, message):
                     return
@@ -1986,9 +2005,8 @@ def make_message_handler(
                         # requeue=False: this callback nacks permanently-invalid
                         # input (unknown data_type, missing 'id', normalize failure,
                         # poison batch) — send it straight to the DLQ instead of
-                        # cycling x-delivery-limit (20) futile redeliveries. Transient
-                        # failures are handled by _flush_queue's re-enqueue+backoff,
-                        # which never nacks.
+                        # retrying what cannot succeed. Transient failures are held
+                        # in memory and retried, and never nack.
                         lambda: message.nack(requeue=False),
                         # This delivery's span has ended by the time the batch is written, so
                         # its context rides along and the flush span links back to it.
@@ -2006,7 +2024,15 @@ def make_message_handler(
                     # this data instead.
                     return
 
-                record = normalize_record(data_type, record)
+                try:
+                    record = normalize_record(data_type, record)
+                except Exception as e:
+                    # The same verdict batch mode reaches: bad input, not a failure to retry.
+                    logger.error("❌ Failed to normalize record, dead-lettering", data_type=data_type, error=str(e))
+                    consumed_error_type = type(e).__name__
+                    gm_telemetry.record_message(entity, "failed", time.perf_counter() - started)
+                    await message.nack(requeue=False)
+                    return
 
                 # Validate required 'id' field — nack with requeue=False to avoid
                 # infinite requeue loop for malformed messages (matches tableinator).
@@ -2071,12 +2097,8 @@ def make_message_handler(
                     f"⚠️ Neo4j unavailable, will retry {data_type[:-1]} message",
                     error=str(e),
                 )
-                # Pause before requeueing — x-delivery-limit=20 is a budget with no
-                # time dimension, so unthrottled requeues dead-letter valid records
-                # within minutes of a Neo4j outage.
-                await outage_backoff.wait()
                 try:
-                    await message.nack(requeue=True)
+                    await requeue_record(message)
                 except Exception as nack_error:
                     logger.warning("⚠️ Failed to nack message", error=str(nack_error))
             except Exception as e:
@@ -2088,7 +2110,7 @@ def make_message_handler(
                     error=str(e),
                 )
                 try:
-                    await message.nack(requeue=True)
+                    await requeue_record(message)
                 except Exception as nack_error:
                     logger.warning("⚠️ Failed to nack message", error=str(nack_error))
             finally:

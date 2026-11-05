@@ -32,8 +32,14 @@ flowchart LR
 - A repeated deterministic batch failure is isolated and nacked without requeue only
   after the poison retry threshold. Healthy records from the batch can still be
   acknowledged.
-- In non-batch mode, the outage backoff prevents a database outage from consuming the
-  quorum queue's delivery-limit budget.
+- In non-batch mode, every requeue waits on the outage backoff, 2 s doubling to 60 s,
+  because RabbitMQ 4.3.5 and 4.4.0 do not spend `x-delivery-limit` on `nack(requeue=True)`:
+  a nacked record comes straight back and never dead-letters. Once the broker's
+  `x-acquired-count` reaches `RECORD_MAX_REQUEUES` (500) the record goes to the DLQ instead,
+  about 8.3 hours at the cap and far sooner on a healthy backend, where a success resets
+  the backoff.
+- A body that cannot be read as a JSON object, or a record `normalize_record` refuses, goes
+  straight to the DLQ on its first delivery: no retry can help it.
 - Completion messages are acknowledged only after their required drain or durable
   latch write succeeds. See [file and extraction completion](file-completion-tracking.md).
 - Consumer recovery passively checks all four queues, recreates exchanges, durable
@@ -49,7 +55,10 @@ The stable queues are:
 | masters | `groovemap-discogs-graphinator-masters` | `groovemap-discogs-graphinator-masters.dlq` |
 | releases | `groovemap-discogs-graphinator-releases` | `groovemap-discogs-graphinator-releases.dlq` |
 
-Each main queue is durable and quorum-backed with `x-delivery-limit=20`. Its dead-letter
+Each main queue is durable and quorum-backed with `x-delivery-limit=20`, which counts
+`basic.reject` and channel or connection closes, dead-lettering after the 21st delivery. It
+does not count `nack(requeue=True)` or a consumer timeout, which cancels the consumer,
+requeues the delivery and leaves the channel open. Its dead-letter
 exchange and queue append `.dlx` and `.dlq` to the main queue name. These values are
 generated from the promoted catalog-event contract and frozen by tests; changing them
 requires a coordinated wire migration.
