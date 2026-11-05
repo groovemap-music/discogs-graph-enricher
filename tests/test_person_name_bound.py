@@ -42,3 +42,15 @@ def test_credit_rows_carry_the_bounded_name_and_keep_the_credit() -> None:
     assert len(rows[0]["name"].encode()) <= PERSON_NAME_MAX_BYTES
     assert rows[0]["artist_id"] == 7
     assert rows[1]["name"] == "Flood"
+
+
+def test_credit_rows_strip_padding_so_a_padded_name_is_its_stripped_person() -> None:
+    rows = person_credit_rows("R1", [{"name": " Flood‏", "role": "Producer"}, {"name": "﻿Flood ", "role": "Mixed By"}])
+
+    assert [row["name"] for row in rows] == ["Flood", "Flood"]
+
+
+def test_credit_rows_skip_an_all_padding_name_and_never_make_a_blank_person() -> None:
+    rows = person_credit_rows("R1", [{"name": " ", "role": "Producer"}, {"name": "‏﻿", "role": "Producer"}, {"name": "Flood", "role": "Producer"}])
+
+    assert [row["name"] for row in rows] == ["Flood"]

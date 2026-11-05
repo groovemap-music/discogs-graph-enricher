@@ -456,7 +456,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aio-pika", specifier = ">=10.1.1" },
-    { name = "groovemap-runtime", extras = ["neo4j", "otel", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=87c0d75ca457bd38b14e6ce6f713098a2b4c5e26" },
+    { name = "groovemap-runtime", extras = ["neo4j", "otel", "rabbitmq"], git = "https://github.com/groovemap-music/python-libraries.git?rev=068773653ab0edc78030c38f9c50c91c58815fcf" },
     { name = "neo4j-rust-ext", specifier = ">=6.4.1.0" },
     { name = "orjson", specifier = ">=3.13.0" },
     { name = "structlog", specifier = ">=26.1.0" },
@@ -481,7 +481,7 @@ dev = [
 [[package]]
 name = "groovemap-runtime"
 version = "0.1.0"
-source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=87c0d75ca457bd38b14e6ce6f713098a2b4c5e26#87c0d75ca457bd38b14e6ce6f713098a2b4c5e26" }
+source = { git = "https://github.com/groovemap-music/python-libraries.git?rev=068773653ab0edc78030c38f9c50c91c58815fcf#068773653ab0edc78030c38f9c50c91c58815fcf" }
 dependencies = [
     { name = "orjson" },
     { name = "structlog" },

@@ -58,7 +58,7 @@ packages = ["graphinator"]
 exclude-newer = "7 days"
 
 [tool.uv.sources]
-groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "87c0d75ca457bd38b14e6ce6f713098a2b4c5e26" }
+groovemap-runtime = { git = "https://github.com/groovemap-music/python-libraries.git", rev = "068773653ab0edc78030c38f9c50c91c58815fcf" }
 
 [tool.ruff]
 extend-exclude = ["graphinator/catalog_contract.py"]
