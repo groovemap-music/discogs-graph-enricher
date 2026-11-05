@@ -66,6 +66,42 @@ def test_label_page_is_bounded_and_keyed() -> None:
     assert "IN TRANSACTIONS" not in cypher
 
 
+def test_artist_page_is_bounded_and_keyed() -> None:
+    cypher = g.build_artist_stats_page_cypher()
+    assert "WHERE a.id > $cursor" in cypher
+    assert "ORDER BY a.id LIMIT $size" in cypher
+    assert "IN TRANSACTIONS" not in cypher
+    # The exact histogram: no sampling and no per-artist cap anywhere in the statement.
+    assert cypher.count("LIMIT") == 1
+
+
+@pytest.mark.asyncio
+async def test_artist_sweep_covers_everyone_and_resumes_after_its_last_page() -> None:
+    artists = [str(i) for i in range(1000, 1025)]
+    graph = FakePagedGraph(artists=artists)
+    calls = {"n": 0}
+
+    def crash_on_third_page(_kind: str, _params: dict[str, Any]) -> Exception | None:
+        calls["n"] += 1
+        return RuntimeError("connection lost") if calls["n"] == 3 else None
+
+    graph.fail = crash_on_third_page
+    with patch.object(g, "graph", graph), patch.object(g, "ARTIST_STATS_PAGE_SIZE", 10), _run_key("2026-11"), patch.object(g, "logger"):
+        assert await g.compute_artist_stats() is False
+        assert graph.checkpoints["artist_stats"]["cursor"] == artists[19]
+        graph.fail = None
+        assert await g.compute_artist_stats() is True
+
+    assert [a for page in graph.artist_pages for a in page] == artists
+    assert graph.checkpoints["artist_stats"]["done"] is True
+
+
+@pytest.mark.asyncio
+async def test_artist_stats_without_a_driver_is_a_no_op() -> None:
+    with patch.object(g, "graph", None):
+        assert await g.compute_artist_stats() is True
+
+
 def test_genre_style_metrics_are_grouped_by_what_they_share() -> None:
     """The three counts that walk the same release chain share one statement; the others stay apart."""
     for node in ("Genre", "Style"):
@@ -263,6 +299,7 @@ def _step(ok: bool = True) -> AsyncMock:
 @pytest.mark.asyncio
 async def test_failed_step_is_named_does_not_skip_siblings_and_leaves_stamp_unset() -> None:
     stats = _step(False)
+    artist_stats = _step(True)
     credits = _step(True)
     stamp = AsyncMock()
     record_failure = AsyncMock()
@@ -273,6 +310,7 @@ async def test_failed_step_is_named_does_not_skip_siblings_and_leaves_stamp_unse
         patch.object(g, "cleanup_all_stub_nodes", _step()),
         patch.object(g, "cleanup_sentinel_master", _step()),
         patch.object(g, "compute_genre_style_stats", stats),
+        patch.object(g, "compute_artist_stats", artist_stats),
         patch.object(g, "compute_person_credit_counts", credits),
         patch.object(g, "_stamp_maintenance_success", stamp),
         patch.object(g, "_record_maintenance_failure", record_failure),
@@ -282,6 +320,7 @@ async def test_failed_step_is_named_does_not_skip_siblings_and_leaves_stamp_unse
         logger.error = log
         assert await g.run_post_import_maintenance("2026-11") is False
 
+    assert artist_stats.await_count == g.POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS, "the next step still ran after the failure"
     assert credits.await_count == g.POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS, "the later step still ran after the failure"
     stamp.assert_not_awaited()
     steps_logged = [call.kwargs.get("step") for call in log.call_args_list]
@@ -299,6 +338,7 @@ async def test_a_raising_step_is_named_and_the_stamp_is_withheld() -> None:
         patch.object(g, "cleanup_all_stub_nodes", AsyncMock(side_effect=RuntimeError("kaput"))),
         patch.object(g, "cleanup_sentinel_master", _step()),
         patch.object(g, "compute_genre_style_stats", _step()),
+        patch.object(g, "compute_artist_stats", _step()),
         patch.object(g, "compute_person_credit_counts", _step()),
         patch.object(g, "_stamp_maintenance_success", stamp),
         patch.object(g, "_record_maintenance_failure", AsyncMock()) as record_failure,
@@ -320,6 +360,7 @@ async def test_stamp_is_written_when_every_step_succeeds() -> None:
         patch.object(g, "cleanup_all_stub_nodes", _step()),
         patch.object(g, "cleanup_sentinel_master", _step()),
         patch.object(g, "compute_genre_style_stats", _step()),
+        patch.object(g, "compute_artist_stats", _step()),
         patch.object(g, "compute_person_credit_counts", _step()),
         patch.object(g, "_stamp_maintenance_success", stamp),
     ):

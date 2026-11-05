@@ -204,11 +204,12 @@ async def test_maintenance_recounts_credits_after_the_aggregate_stats() -> None:
         patch.object(g, "cleanup_all_stub_nodes", step("cleanup")),
         patch.object(g, "cleanup_sentinel_master", step("sentinel")),
         patch.object(g, "compute_genre_style_stats", step("stats")),
+        patch.object(g, "compute_artist_stats", step("artists")),
         patch.object(g, "compute_person_credit_counts", step("credits")),
     ):
         assert await g.run_post_import_maintenance() is True
 
-    assert order == ["cleanup", "sentinel", "stats", "credits"]
+    assert order == ["cleanup", "sentinel", "stats", "artists", "credits"]
 
 
 @pytest.mark.asyncio
@@ -221,6 +222,7 @@ async def test_failed_credit_recount_fails_the_pass_and_is_retried() -> None:
         patch.object(g, "cleanup_all_stub_nodes", AsyncMock(return_value=True)),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=True)),
+        patch.object(g, "compute_artist_stats", AsyncMock(return_value=True)),
         patch.object(g, "compute_person_credit_counts", credits),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
     ):
@@ -239,6 +241,7 @@ async def test_credit_recount_still_runs_when_the_stats_sweep_fails() -> None:
         patch.object(g, "cleanup_all_stub_nodes", AsyncMock(return_value=True)),
         patch.object(g, "cleanup_sentinel_master", AsyncMock(return_value=True)),
         patch.object(g, "compute_genre_style_stats", AsyncMock(return_value=False)),
+        patch.object(g, "compute_artist_stats", AsyncMock(return_value=True)),
         patch.object(g, "compute_person_credit_counts", credits),
         patch.object(g, "POST_IMPORT_MAINTENANCE_RETRY_DELAY_SECONDS", 0.0),
         patch.object(g, "logger"),

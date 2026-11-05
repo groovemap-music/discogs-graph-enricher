@@ -22,8 +22,9 @@ The owning schema should provide the constraints and indexes appropriate to thos
 lookups. The full deployed inventory is authoritative in `database-schema`; copying
 its DDL here would create a second, drifting source of truth.
 
-`discogs-graph-enricher` also refreshes denormalized Genre, Style, and Label aggregate
-properties after a completed extraction. Those properties reduce work for readers,
+`discogs-graph-enricher` also refreshes denormalized Genre, Style, Label, and Artist
+aggregate properties and the derived `(:Label)-[:HAS_STYLE {release_count}]->(:Style)`
+edges after a completed extraction. Those values reduce work for readers,
 but read-query indexes and performance targets belong to
 [`catalog-api`](https://github.com/groovemap-music/catalog-api/blob/main/docs/query-performance-optimizations.md).
 

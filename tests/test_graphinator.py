@@ -1052,6 +1052,7 @@ class TestCheckFileCompletion:
 
         with (
             patch("graphinator.graphinator.compute_genre_style_stats", AsyncMock(return_value=True)),
+            patch("graphinator.graphinator.compute_artist_stats", AsyncMock(return_value=True)),
             patch("graphinator.graphinator.compute_person_credit_counts", AsyncMock(return_value=True)),
         ):
             result = await check_file_completion(completion_data, "releases", mock_message)
@@ -1197,6 +1198,7 @@ class TestCheckFileCompletionComputeGenreStyleStats:
 
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.cleanup_sentinel_master", new=AsyncMock(return_value=True))
+    @patch("graphinator.graphinator.compute_artist_stats", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
@@ -1231,6 +1233,7 @@ class TestCheckFileCompletionComputeGenreStyleStats:
         graphinator.graphinator.graph = None
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.compute_artist_stats", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
@@ -1278,6 +1281,7 @@ class TestCheckFileCompletionMaintenanceFailure:
     """
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.compute_artist_stats", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
@@ -1305,6 +1309,7 @@ class TestCheckFileCompletionMaintenanceFailure:
 
     @pytest.mark.asyncio
     @patch("graphinator.graphinator.cleanup_sentinel_master", new=AsyncMock(return_value=True))
+    @patch("graphinator.graphinator.compute_artist_stats", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
@@ -1336,6 +1341,7 @@ class TestCheckFileCompletionMaintenanceFailure:
         graphinator.graphinator.graph = None
 
     @pytest.mark.asyncio
+    @patch("graphinator.graphinator.compute_artist_stats", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_person_credit_counts", new=AsyncMock(return_value=True))
     @patch("graphinator.graphinator.compute_genre_style_stats", new_callable=AsyncMock)
     @patch("graphinator.graphinator.cleanup_stub_nodes", new_callable=AsyncMock)
@@ -4565,7 +4571,7 @@ class TestStubCleanupBatchAndOrdering:
 
         assert ok is True
         cypher = run_calls[0]
-        assert "NOT (n)--()" in cypher, "connected stubs must be excluded from the sweep"
+        assert "NOT EXISTS { (n)-[e]-() WHERE NOT e:HAS_STYLE }" in cypher, "connected stubs must be excluded from the sweep"
         # ...while genuinely orphaned stubs are still collected.
         assert "n.sha256 IS NULL" in cypher
         assert "DETACH DELETE" in cypher
@@ -4602,6 +4608,7 @@ class TestStubCleanupBatchAndOrdering:
             patch.object(g, "graph", graph_mock),
             patch.object(g, "cleanup_all_stub_nodes", fake_cleanup_all),
             patch.object(g, "compute_genre_style_stats", fake_stats),
+            patch.object(g, "compute_artist_stats", AsyncMock(return_value=True)),
             patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
             patch.object(g, "logger"),
         ):
@@ -4654,6 +4661,7 @@ class TestStubCleanupBatchAndOrdering:
             patch.object(g, "graph", graph_mock),
             patch.object(g, "cleanup_all_stub_nodes", failing_cleanup_all),
             patch.object(g, "compute_genre_style_stats", fake_stats),
+            patch.object(g, "compute_artist_stats", AsyncMock(return_value=True)),
             patch.object(g, "compute_person_credit_counts", AsyncMock(return_value=True)),
             patch.object(g, "logger"),
         ):

@@ -885,6 +885,167 @@ async def test_genre_style_label_stats_are_computed_by_paged_statements(neo4j_dr
     assert l3 == {"rc": 0, "ac": 0, "gc": 0}
 
 
+# catalog-api's statement for the two artist counts, verbatim from its
+# tests/test_explore_artist_stats_integration.py (bead gm-catalog-api-87pz). The sweep has
+# to store exactly what this computes.
+CATALOG_API_ARTIST_COUNTS = """
+MATCH (a:Artist)
+CALL (a) {
+    OPTIONAL MATCH (r:Release)-[:BY]->(a)
+    WITH a, count(DISTINCT r) AS release_count
+    OPTIONAL MATCH (r2:Release)-[:BY]->(a)
+    OPTIONAL MATCH (r2)-[:ON]->(l:Label)
+    WITH a, release_count, count(DISTINCT l) AS label_count
+    RETURN a.id AS id, release_count, label_count
+}
+RETURN id, release_count, label_count ORDER BY id
+"""
+
+# The whole histogram, with no ORDER BY or LIMIT tricks, for comparing with what the sweep stored.
+LIVE_GENRE_HISTOGRAM = """
+MATCH (a:Artist)<-[:BY]-(r:Release)-[:IS]->(g:Genre)
+RETURN a.id AS id, g.name AS genre, count(DISTINCT r) AS releases
+"""
+
+LIVE_LABEL_STYLES = """
+MATCH (l:Label)<-[:ON]-(r:Release)-[:IS]->(s:Style)
+RETURN l.id AS id, s.name AS style, count(DISTINCT r) AS releases ORDER BY id, style
+"""
+
+STORED_LABEL_STYLES = """
+MATCH (l:Label)-[h:HAS_STYLE]->(s:Style)
+RETURN l.id AS id, s.name AS style, h.release_count AS releases ORDER BY id, style
+"""
+
+ARTIST_STATS_SEED = """
+CREATE (rock:Genre {name: 'Rock'}), (jazz:Genre {name: 'Jazz'}), (pop:Genre {name: 'Pop'}),
+       (punk:Style {name: 'Punk'}), (bop:Style {name: 'Bebop'}),
+       (l1:Label {id: 'L1'}), (l2:Label {id: 'L2'}), (l3:Label {id: 'L3'}),
+       (heavy:Artist {id: 'A1'}), (tied:Artist {id: 'A2'}), (none:Artist {id: 'A3'}), (masters:Artist {id: 'A4'}),
+       (various:Artist {id: '194'}),
+       (m:Master {id: 'M1'}), (m)-[:BY]->(masters), (m)-[:IS]->(rock),
+       (r1:Release {id: 'R1'}), (r2:Release {id: 'R2'}), (r3:Release {id: 'R3'}), (r4:Release {id: 'R4'}),
+       (r1)-[:BY]->(heavy), (r1)-[:IS]->(rock), (r1)-[:IS]->(jazz), (r1)-[:IS]->(punk), (r1)-[:ON]->(l1), (r1)-[:ON]->(l2),
+       (r2)-[:BY]->(heavy), (r2)-[:IS]->(rock), (r2)-[:IS]->(punk), (r2)-[:ON]->(l1),
+       (r3)-[:BY]->(heavy), (r3)-[:BY]->(tied), (r3)-[:IS]->(jazz), (r3)-[:IS]->(bop), (r3)-[:ON]->(l2),
+       (r4)-[:BY]->(tied), (r4)-[:IS]->(rock)
+WITH various, rock, jazz, pop, punk, bop, l1, l2
+UNWIND range(1, 500) AS i
+WITH various, 'V' + i AS id, CASE WHEN i % 5 = 0 THEN rock ELSE pop END AS genre,
+     CASE WHEN i % 2 = 0 THEN punk ELSE bop END AS style, CASE WHEN i % 3 = 0 THEN l1 ELSE l2 END AS label
+CREATE (r:Release {id: id})-[:BY]->(various), (r)-[:IS]->(genre), (r)-[:IS]->(style), (r)-[:ON]->(label)
+"""
+
+
+async def run_artist_and_label_stats(driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch, run_key: str) -> None:
+    monkeypatch.setattr(graphinator, "graph", driver)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "LABEL_STATS_PAGE_SIZE", 2)
+    monkeypatch.setattr(graphinator, "ARTIST_STATS_PAGE_SIZE", 2)
+    token = graphinator._maintenance_run_key.set(run_key)
+    try:
+        assert await graphinator.compute_genre_style_stats() is True
+        assert await graphinator.compute_artist_stats() is True
+    finally:
+        graphinator._maintenance_run_key.reset(token)
+
+
+async def rows(driver: AsyncDriver, cypher: str) -> list[dict[str, Any]]:
+    async with driver.session(database="neo4j") as session:
+        result = await session.run(cypher)
+        return [dict(record) async for record in result]
+
+
+def exact_primary_genres(histogram: list[dict[str, Any]]) -> dict[str, str]:
+    """The most releases, then the alphabetically first name, computed outside Cypher."""
+    best: dict[str, tuple[int, str]] = {}
+    for row in histogram:
+        candidate = (-row["releases"], row["genre"])
+        if row["id"] not in best or candidate < best[row["id"]]:
+            best[row["id"]] = candidate
+    return {artist: genre for artist, (_, genre) in best.items()}
+
+
+@pytest.mark.asyncio
+async def test_artist_stats_equal_the_live_counts_including_a_hub(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The stored values against catalog-api's statement and an exhaustive genre histogram."""
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "integration-run")
+
+    stored = await rows(
+        neo4j_driver,
+        "MATCH (a:Artist) RETURN a.id AS id, a.release_count AS release_count, a.label_count AS label_count, a.primary_genre AS genre ORDER BY id",
+    )
+    assert [{k: row[k] for k in ("id", "release_count", "label_count")} for row in stored] == await rows(neo4j_driver, CATALOG_API_ARTIST_COUNTS)
+    assert {row["id"]: row["genre"] for row in stored if row["genre"]} == exact_primary_genres(await rows(neo4j_driver, LIVE_GENRE_HISTOGRAM))
+
+    by_id = {row["id"]: row for row in stored}
+    # Rock on two of three releases, Jazz on two: the same tie rule, with a real count behind it.
+    assert by_id["A1"] == {"id": "A1", "release_count": 3, "label_count": 2, "genre": "Jazz"}
+    # A hub is computed like anyone else: every release counted, none sampled.
+    assert by_id["194"] == {"id": "194", "release_count": 500, "label_count": 2, "genre": "Pop"}
+    # One Jazz and one Rock release: the tie goes to the alphabetically first name, every time.
+    assert by_id["A2"]["genre"] == "Jazz"
+    # No releases, and a Master credit that is not a Release: zero counts, no genre.
+    assert by_id["A3"] == {"id": "A3", "release_count": 0, "label_count": 0, "genre": None}
+    assert by_id["A4"] == {"id": "A4", "release_count": 0, "label_count": 0, "genre": None}
+
+
+@pytest.mark.asyncio
+async def test_label_style_edges_equal_the_live_counts(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "integration-run")
+
+    stored = await rows(neo4j_driver, STORED_LABEL_STYLES)
+    assert stored == await rows(neo4j_driver, LIVE_LABEL_STYLES)
+    assert {"id": "L1", "style": "Punk", "releases": 2 + 83} in stored
+    labels = await rows(neo4j_driver, "MATCH (l:Label {id: 'L3'}) RETURN l.release_count AS rc, l.artist_count AS ac, l.genre_count AS gc")
+    assert labels == [{"rc": 0, "ac": 0, "gc": 0}]
+    assert await rows(neo4j_driver, "MATCH (:Label {id: 'L3'})-[h:HAS_STYLE]->() RETURN h") == []
+
+
+@pytest.mark.asyncio
+async def test_a_later_pass_follows_the_graph_and_an_unchanged_one_writes_nothing(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A removed style loses its edge, a lost genre loses its property, and a rerun is free."""
+    await rows(neo4j_driver, ARTIST_STATS_SEED)
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "run-1")
+
+    async with neo4j_driver.session(database="neo4j") as session:
+        before = await (await session.run(graphinator.build_artist_stats_page_cypher(), cursor="", size=100)).consume()
+        label_before = await (await session.run(graphinator.build_label_stats_page_cypher(), cursor="", size=100)).consume()
+    assert before.counters.properties_set == 0
+    assert label_before.counters.properties_set == 0
+    assert label_before.counters.relationships_created == 0
+    assert label_before.counters.relationships_deleted == 0
+
+    # Bebop leaves L2 entirely (R3 and every odd V release), and A2 loses its genres.
+    await rows(neo4j_driver, "MATCH (:Style {name: 'Bebop'})<-[e:IS]-(:Release) DELETE e")
+    await rows(neo4j_driver, "MATCH (:Artist {id: 'A2'})<-[:BY]-(:Release)-[e:IS]->(:Genre) DELETE e")
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "run-2")
+
+    assert await rows(neo4j_driver, STORED_LABEL_STYLES) == await rows(neo4j_driver, LIVE_LABEL_STYLES)
+    assert await rows(neo4j_driver, "MATCH (:Label)-[h:HAS_STYLE]->(:Style {name: 'Bebop'}) RETURN h") == []
+    assert await rows(neo4j_driver, "MATCH (a:Artist {id: 'A2'}) RETURN a.primary_genre AS genre, a.release_count AS rc") == [
+        {"genre": None, "rc": 2}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_derived_style_edges_do_not_keep_an_orphaned_stub_label(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stub Label with only HAS_STYLE left is collected; a stub with a real edge is kept."""
+    await rows(
+        neo4j_driver,
+        """
+        CREATE (orphan:Label {id: 'L-orphan'})-[:HAS_STYLE {release_count: 3}]->(s:Style {name: 'Punk'}),
+               (kept:Label {id: 'L-kept'})-[:HAS_STYLE {release_count: 1}]->(s),
+               (:Release {id: 'R1'})-[:ON]->(kept)
+        """,
+    )
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    assert await graphinator.cleanup_stub_nodes("labels") is True
+    assert await rows(neo4j_driver, "MATCH (l:Label) RETURN l.id AS id") == [{"id": "L-kept"}]
+
+
 _ORACLE_METRICS = {
     "release_count": "MATCH (n)<-[:IS]-(r:Release) RETURN count(DISTINCT r) AS v",
     "artist_count": "MATCH (n)<-[:IS]-(r:Release)-[:BY]->(a:Artist) RETURN count(DISTINCT a) AS v",

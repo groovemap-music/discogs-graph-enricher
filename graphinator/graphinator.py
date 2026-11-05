@@ -1009,7 +1009,7 @@ async def _run_post_import_maintenance_attempts(version: str | None, failure: st
                 # that is a deferral, not a per-step failure.
                 logger.error(
                     "❌ Batch queues did not drain — deferring every maintenance step rather than sweeping while writers are still active",
-                    skipped_steps=["stub_cleanup", "sentinel_master_cleanup", "genre_style_label_stats", "person_credit_counts"],
+                    skipped_steps=["stub_cleanup", "sentinel_master_cleanup", "genre_style_label_stats", "artist_stats", "person_credit_counts"],
                 )
                 failed_steps.append("batch_queue_drain")
             elif graph is not None:
@@ -1028,6 +1028,8 @@ async def _run_post_import_maintenance_attempts(version: str | None, failure: st
                     # Aggregate stats on Genre/Style/Label nodes, over a graph that is no
                     # longer being written.
                     ("genre_style_label_stats", compute_genre_style_stats),
+                    # Release and label counts and the primary genre on every Artist.
+                    ("artist_stats", compute_artist_stats),
                     # Recount every Person's credits from the CREDITED_ON edges as they
                     # stand after the import (re-imported releases have already pruned the
                     # credits Discogs removed), so removals are reflected as well as additions.
@@ -1083,6 +1085,7 @@ async def _run_post_import_maintenance_attempts(version: str | None, failure: st
 # on a timeout / memory pressure and the working size is remembered in the checkpoint.
 GENRE_STYLE_STATS_PAGE_SIZE = 10
 LABEL_STATS_PAGE_SIZE = 100
+ARTIST_STATS_PAGE_SIZE = 1000
 
 # Identifies the run being maintained to the checkpoints (the dump version). ``None``
 # outside run_post_import_maintenance, which disables checkpoint persistence.
@@ -1143,33 +1146,98 @@ def build_label_stats_page_cypher() -> str:
     Returns ``last`` (next cursor) and ``processed``. Bounded by ``$size``, not by the
     ~millions of labels in the graph; most labels have few releases so a page is quick.
     Each property is written only when it differs, so a rerun over unchanged data writes nothing.
+
+    Writes ``release_count``, ``artist_count`` and ``genre_count`` on the Label, and one
+    ``(:Label)-[:HAS_STYLE {release_count}]->(:Style)`` per style of its releases, with no
+    cap on styles. The style counts are an edge and not list properties because
+    ``/api/label/{id}/similar`` has to go from a style to the labels carrying it: on lux
+    Pop Rock reaches 74,053 of the 2.43M labels, which an edge reads directly and a list
+    property could only find by scanning every Label. An edge whose style the label no
+    longer has is deleted, so the edges always equal a live count.
+
+    The artists, genres and styles share ONE expansion of each release, which on lux
+    takes the largest label (1818, 762,594 releases) from 21.4M db hits to 14.4M, in 2.7 s
+    and 64 MB. ``count(r)`` per target needs no ``DISTINCT``: ``BY`` and ``IS`` are
+    ``MERGE``d, so a release has at most one edge to a target.
     """
     return """
     MATCH (l:Label)
     WHERE l.id > $cursor
     WITH l ORDER BY l.id LIMIT $size
-    CALL {
-        WITH l
-        CALL {
-            WITH l
-            MATCH (l)<-[:ON]-(r:Release)
+    CALL (l) {
+        CALL (l) {
+            OPTIONAL MATCH (l)<-[:ON]-(r:Release)
             RETURN count(DISTINCT r) AS rc
         }
-        CALL {
-            WITH l
-            MATCH (l)<-[:ON]-(r:Release)-[:BY]->(a:Artist)
-            RETURN count(DISTINCT a) AS ac
-        }
-        CALL {
-            WITH l
-            MATCH (l)<-[:ON]-(r:Release)-[:IS]->(g:Genre)
-            RETURN count(DISTINCT g) AS gc
+        CALL (l) {
+            OPTIONAL MATCH (l)<-[:ON]-(r:Release)-[:BY|IS]->(t)
+            WHERE t:Artist OR t:Genre OR t:Style
+            WITH t, count(r) AS n
+            RETURN count(CASE WHEN t:Artist THEN 1 END) AS ac,
+                count(CASE WHEN t:Genre THEN 1 END) AS gc,
+                collect(CASE WHEN t:Style THEN {style: t, releases: n} END) AS styles
         }
         FOREACH (_ IN CASE WHEN l.release_count IS NULL OR l.release_count <> rc THEN [1] ELSE [] END | SET l.release_count = rc)
         FOREACH (_ IN CASE WHEN l.artist_count IS NULL OR l.artist_count <> ac THEN [1] ELSE [] END | SET l.artist_count = ac)
         FOREACH (_ IN CASE WHEN l.genre_count IS NULL OR l.genre_count <> gc THEN [1] ELSE [] END | SET l.genre_count = gc)
+        WITH l, styles
+        CALL (l, styles) {
+            MATCH (l)-[stale:HAS_STYLE]->(old:Style)
+            WHERE NOT old IN [row IN styles | row.style]
+            DELETE stale
+        }
+        CALL (l, styles) {
+            UNWIND styles AS row
+            WITH l, row.style AS style, row.releases AS releases
+            MERGE (l)-[h:HAS_STYLE]->(style)
+            FOREACH (_ IN CASE WHEN h.release_count IS NULL OR h.release_count <> releases THEN [1] ELSE [] END | SET h.release_count = releases)
+        }
     }
     RETURN max(l.id) AS last, count(l) AS processed
+    """
+
+
+def build_artist_stats_page_cypher() -> str:
+    """Keyed page of Artist aggregates: the ``$size`` artists with ``id > $cursor``.
+
+    Writes three properties, each only when it differs, so a rerun over unchanged data
+    writes nothing:
+
+    - ``release_count``: the distinct releases ``BY`` the artist. Only Releases count, and
+      Masters are ``BY`` the artist too.
+    - ``label_count``: the distinct labels those releases are ``ON``.
+    - ``primary_genre``: the Genre on the most of those releases, every release counted.
+      A tie goes to the alphabetically first genre name, so the answer never depends on
+      storage order. An artist with no genre has no property, and a genre lost since the
+      last pass removes it.
+
+    Every artist is computed the same way, placeholders included: Various (id 194,
+    1,361,622 releases) takes 4.0 s, 29M db hits and 49 MB on lux, inside the 600 s
+    transaction budget. Labels and genres share ONE expansion of each release. The
+    ``ORDER BY`` sits before the ``collect``, which keeps that order.
+    """
+    return """
+    MATCH (a:Artist)
+    WHERE a.id > $cursor
+    WITH a ORDER BY a.id LIMIT $size
+    CALL (a) {
+        CALL (a) {
+            OPTIONAL MATCH (a)<-[:BY]-(r:Release)
+            RETURN count(DISTINCT r) AS rc
+        }
+        CALL (a) {
+            OPTIONAL MATCH (a)<-[:BY]-(r:Release)-[:ON|IS]->(t)
+            WHERE t:Label OR t:Genre
+            WITH t, count(r) AS n
+            ORDER BY n DESC, CASE WHEN t:Genre THEN t.name END
+            RETURN count(CASE WHEN t:Label THEN 1 END) AS lc,
+                head(collect(CASE WHEN t:Genre THEN t.name END)) AS pg
+        }
+        FOREACH (_ IN CASE WHEN a.release_count IS NULL OR a.release_count <> rc THEN [1] ELSE [] END | SET a.release_count = rc)
+        FOREACH (_ IN CASE WHEN a.label_count IS NULL OR a.label_count <> lc THEN [1] ELSE [] END | SET a.label_count = lc)
+        FOREACH (_ IN CASE WHEN coalesce(a.primary_genre, '') <> coalesce(pg, '') THEN [1] ELSE [] END | SET a.primary_genre = pg)
+    }
+    RETURN max(a.id) AS last, count(a) AS processed
     """
 
 
@@ -1178,7 +1246,8 @@ async def compute_genre_style_stats() -> bool:
 
     Sets release_count, artist_count, label_count, style_count/genre_count,
     and first_year properties on each Genre and Style node.  Also sets
-    release_count, artist_count, genre_count on Label nodes.
+    release_count, artist_count, genre_count on Label nodes, and the label's
+    per-style release counts on its HAS_STYLE edges.
 
     - Genre/Style counts are read by explore/genre and explore/style endpoints,
       replacing 4 expensive traversal queries (~200M DB hits for Rock)
@@ -1187,6 +1256,8 @@ async def compute_genre_style_stats() -> bool:
       (~184M DB hits) with an index seek (~100 DB hits).
     - Label counts are read by explore/label, replacing a 1.2M DB-hit
       traversal (for Reprise Records with 55K releases) with ~3 DB hits.
+    - HAS_STYLE edges are read by /api/label/{id}/similar, which otherwise walks
+      every release of a style (19.6M DB hits for Pop Rock).
 
     Resumable: each of Genre, Style and Label is a keyed-page sweep checkpointed after
     every page (see :mod:`graphinator.maintenance_paging`), so no single transaction is
@@ -1252,6 +1323,43 @@ async def compute_genre_style_stats() -> bool:
             ok = False
 
     return ok
+
+
+async def compute_artist_stats() -> bool:
+    """Pre-compute ``release_count``, ``label_count`` and ``primary_genre`` on every Artist.
+
+    See :func:`build_artist_stats_page_cypher` for what each property holds. Explore reads
+    the two counts, and ``/api/network/cluster`` reads ``primary_genre``, instead of
+    walking each artist's whole discography per request.
+
+    Artists are processed in keyed pages of ``ARTIST_STATS_PAGE_SIZE``, checkpointed after
+    each page and halved on a timeout or transaction-memory pressure, so the sweep resumes
+    after its last committed page instead of restarting.
+
+    Returns:
+        True if the stats were written (or there is no driver), False if the sweep failed
+        (logged with the step name), so the detached maintenance task retries it.
+    """
+    if graph is None:
+        return True
+
+    step = "artist_stats"
+    try:
+        await asyncio.sleep(MAINTENANCE_SETTLE_SECONDS)
+        logger.info("📊 Computing aggregate stats on Artist nodes...", step=step)
+        processed = await maintenance_paging.run_checkpointed_step(
+            graph,
+            step=step,
+            run_key=_maintenance_run_key.get(),
+            process_page=maintenance_paging.keyed_page_processor(graph, build_artist_stats_page_cypher()),
+            page_size=ARTIST_STATS_PAGE_SIZE,
+        )
+        logger.info("✅ Artist stats computed", step=step, processed=processed)
+    except Exception as e:
+        logger.error("❌ Failed to compute Artist stats", step=step, error=str(e))
+        return False
+
+    return True
 
 
 async def compute_person_credit_counts() -> bool:
@@ -1478,11 +1586,13 @@ async def cleanup_stub_nodes(data_type: str) -> bool:
     # relationship blocks, and the edge is never rebuilt. Keeping the stub preserves
     # both the edge and the id, and a later dump upgrades it in place — the fill-in
     # path MERGEs on id, so the stub simply gains its properties and sha256.
-    # Truly orphaned stubs still get collected here.
+    # Truly orphaned stubs still get collected here. HAS_STYLE does not hold a stub: it is
+    # derived from the ON edges by the Label stats sweep, which runs after this one, so a
+    # label left with no releases must not be kept alive by last pass's derived edges.
     def _build_cleanup_cypher(batch_size: int | None) -> str:
         return f"""
     MATCH (n:{label})
-    WHERE n.sha256 IS NULL AND NOT (n)--()
+    WHERE n.sha256 IS NULL AND NOT EXISTS {{ (n)-[e]-() WHERE NOT e:HAS_STYLE }}
     CALL {{
         WITH n
         DETACH DELETE n
