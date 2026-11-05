@@ -6,8 +6,8 @@ a person the same way. A name that differs only by surrounding whitespace is the
 second person in both stores. This records how often that happens and the options.
 Nothing here has been migrated.
 
-**Decision: pending the operator.** The recommendation is option B, after the running
-Discogs load has finished.
+**Decision: option B, after the Discogs load.** The operator chose this on 2026-11-04. It
+is filed as its own bead, and nothing has been migrated yet.
 
 ## Measured on lux, 2026-11-04
 
