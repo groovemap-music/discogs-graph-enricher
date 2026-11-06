@@ -5293,6 +5293,9 @@ class TestMainBuildsTheBatchConfig:
             patch.object(gm, "BATCH_MAX_REQUEUES", 11),
             patch.object(gm, "BATCH_MAX_WRITE_S", 77.0),
             patch.object(gm, "shutdown_requested", False),
+            # main() sets up and shuts down the process-wide meter provider; later tests rely on theirs.
+            patch.object(gm, "setup_telemetry"),
+            patch.object(gm, "shutdown_telemetry"),
             patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
             contextlib.suppress(Exception),
         ):
