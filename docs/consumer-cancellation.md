@@ -52,6 +52,24 @@ all four entity types, including types whose queues were empty at the instant of
 depth check. Unexpectedly missing consumers are checked every
 `STUCK_CHECK_INTERVAL` seconds (default `30`) and use the same recovery path.
 
+## Terminal signals that arrive after the cancel
+
+The extractor publishes `extraction_complete` to every type only after the last file, so
+for a long-running file the earlier types are already cancelled and the signal is queued
+with no consumer. A cancelled consumer holds nothing, so the service does not keep it
+subscribed for the whole run. While a type is complete, unsubscribed, and its
+`extraction_complete` is not yet settled, the periodic checker probes that queue every
+`MARKER_CHECK_INTERVAL` seconds (default `5`) with a passive declare and resubscribes
+only the type that holds a message. The marker handler re-arms the cancel, so the
+consumer goes again `CONSUMER_CANCEL_DELAY` after the marker is settled and what a
+consumer may hold is unchanged. If the transport is closed, the same tick runs the full
+queue probe.
+
+A queued marker waits at most `MARKER_CHECK_INTERVAL` plus one resubscribe, where it used
+to wait for the idle reconnect, up to `QUEUE_CHECK_INTERVAL` (one hour). `/health` lists
+the types in that wait as `awaiting_extraction_complete`; an operator console should
+treat a queue in that list as an expected wait, not a critical `NO CONSUMER`.
+
 ## Process shutdown
 
 SIGINT and SIGTERM use a separate, immediate drain path:
@@ -74,7 +92,7 @@ completion signal or an operator-initiated rerun must perform it again.
 ## Operations and tests
 
 Health is available at `http://localhost:8001/health` (the role port; `HEALTH_PORT` overrides it). Its `active_consumers`,
-`completed_files`, `message_counts`, and `current_task` fields describe the local
+`completed_files`, `awaiting_extraction_complete`, `message_counts`, and `current_task` fields describe the local
 process; there is no Prometheus scrape route.
 
 ```bash
