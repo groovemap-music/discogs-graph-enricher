@@ -121,7 +121,7 @@ async def stack(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Stack]:
         connection_acquisition_timeout=2.0,
         connection_timeout=2.0,
     )
-    processor = Neo4jBatchProcessor(driver, BatchConfig(batch_size=RECORDS * 2, flush_interval=600.0))
+    processor = Neo4jBatchProcessor(driver, BatchConfig(batch_size=RECORDS * 2, flush_interval=600.0, max_hold_s=None))
     processor.last_flush["artists"] = time.time()
     monkeypatch.setattr(OutageBackoff, "wait", _OUTAGE_WAIT)
     monkeypatch.setattr(graphinator, "BATCH_MODE", True)

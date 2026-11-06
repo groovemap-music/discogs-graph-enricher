@@ -30,7 +30,8 @@ from orjson import loads
 
 from graphinator import maintenance_paging
 from graphinator import telemetry as gm_telemetry
-from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor
+from graphinator.batch_processor import DEFAULT_MAX_HOLD_S, BatchConfig, Neo4jBatchProcessor
+from graphinator.batch_processor import DEFAULT_MAX_REQUEUES as BATCH_DEFAULT_MAX_REQUEUES
 from graphinator.config import GraphinatorConfig
 from graphinator.entity_projection import (
     process_artist,
@@ -163,6 +164,11 @@ batch_processor: Neo4jBatchProcessor | None = None
 BATCH_MODE = os.environ.get("NEO4J_BATCH_MODE", "true").lower() == "true"
 BATCH_SIZE = int(os.environ.get("NEO4J_BATCH_SIZE", "100"))
 BATCH_FLUSH_INTERVAL = float(os.environ.get("NEO4J_BATCH_FLUSH_INTERVAL", "5.0"))
+# Held-delivery bound: deliveries waiting out Neo4j backoff longer than this go back to RabbitMQ with
+# requeue=True. BatchConfig rejects values that could reach the broker consumer_timeout (lux: 30 minutes).
+BATCH_MAX_HOLD_S = float(os.environ.get("NEO4J_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
+# Times a held delivery may go back to RabbitMQ before it is dead-lettered instead.
+BATCH_MAX_REQUEUES = int(os.environ.get("NEO4J_BATCH_MAX_REQUEUES", str(BATCH_DEFAULT_MAX_REQUEUES)))
 
 # Connection state tracking
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
@@ -2011,6 +2017,11 @@ def make_message_handler(
                         # This delivery's span has ended by the time the batch is written, so
                         # its context rides along and the flush span links back to it.
                         span_context=gm_telemetry.span_context_of(span),
+                        # A delivery held in Neo4j backoff past BATCH_MAX_HOLD_S goes back to RabbitMQ
+                        # before consumer_timeout can cancel this consumer, and the engine counts
+                        # each trip through the broker's headers.
+                        requeue_callback=lambda: message.nack(requeue=True),
+                        headers=getattr(message, "headers", None),
                     )
                     if accepted:
                         # Note: message_counts tracks received (not processed) messages in
@@ -2281,6 +2292,8 @@ async def main() -> None:
             batch_config = BatchConfig(
                 batch_size=BATCH_SIZE,
                 flush_interval=BATCH_FLUSH_INTERVAL,
+                max_hold_s=BATCH_MAX_HOLD_S,
+                max_requeues=BATCH_MAX_REQUEUES,
             )
             batch_processor = Neo4jBatchProcessor(graph, batch_config)
             logger.info(

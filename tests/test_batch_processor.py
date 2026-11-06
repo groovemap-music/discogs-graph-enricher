@@ -8,6 +8,9 @@ import pytest
 
 from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import (
+    BROKER_CONSUMER_TIMEOUT_S,
+    DEFAULT_MAX_HOLD_S,
+    DEFAULT_MAX_REQUEUES,
     BatchConfig,
     Neo4jBatchProcessor,
     PendingMessage,
@@ -81,6 +84,51 @@ class TestBatchConfig:
         assert config.batch_size == 50
         assert config.flush_interval == 10.0
         assert config.max_pending == 500
+
+
+class TestBoundedHolds:
+    """The hold bound that returns a held delivery to the broker before consumer_timeout."""
+
+    def test_defaults_bound_holds_below_the_broker_deadline(self) -> None:
+        config = BatchConfig()
+        policy = config.runtime_policy()
+        assert policy.max_hold_s == DEFAULT_MAX_HOLD_S
+        assert policy.max_requeues == DEFAULT_MAX_REQUEUES
+        assert config.max_hold_s + config.flush_interval + config.backoff_max < BROKER_CONSUMER_TIMEOUT_S
+
+    def test_a_hold_that_could_reach_consumer_timeout_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="consumer_timeout"):
+            BatchConfig(max_hold_s=1790.0)
+        with pytest.raises(ValueError, match="consumer_timeout"):
+            BatchConfig(max_hold_s=1500.0, flush_interval=600.0)
+
+    def test_the_bound_can_be_disabled(self) -> None:
+        assert BatchConfig(max_hold_s=None, flush_interval=600.0).runtime_policy().max_hold_s is None
+
+    @pytest.mark.asyncio
+    async def test_a_requeue_goes_to_the_broker_only_when_a_callback_was_given(self) -> None:
+        requeue = AsyncMock()
+        nack = AsyncMock()
+        held = PendingMessage("artists", {"id": "1"}, AsyncMock(), nack, requeue_callback=requeue, headers={"x-acquired-count": 3})
+        await held.nack(requeue=True)
+        requeue.assert_awaited_once()
+        nack.assert_not_awaited()
+        assert held.headers == {"x-acquired-count": 3}
+
+        with pytest.raises(ValueError, match="retried in-process"):
+            await PendingMessage("artists", {"id": "2"}, AsyncMock(), nack).nack(requeue=True)
+
+    @pytest.mark.asyncio
+    async def test_add_message_carries_the_callback_and_headers_to_the_engine(self) -> None:
+        processor = Neo4jBatchProcessor(MagicMock(), BatchConfig(batch_size=100))
+        requeue = AsyncMock()
+        with patch.object(processor._engine, "submit", new=AsyncMock()) as submit:
+            await processor.add_message(
+                "artists", {"id": "1", "name": "A"}, AsyncMock(), AsyncMock(), requeue_callback=requeue, headers={"x-acquired-count": 1}
+            )
+        delivery = submit.await_args.args[2]
+        assert delivery.requeue_callback is requeue
+        assert delivery.headers == {"x-acquired-count": 1}
 
 
 class TestPendingMessage:
