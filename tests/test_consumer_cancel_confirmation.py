@@ -262,3 +262,49 @@ async def test_interrupted_inflight_cancel_requests_recovery() -> None:
     await asyncio.gather(task, return_exceptions=True)
     assert service.consumer_tags == {"artists": "tag-a"}
     assert service.consumer_recovery_requested
+
+
+def test_a_type_waits_for_its_marker_only_while_complete_unsubscribed_and_unsignalled() -> None:
+    service.completed_files.update({"artists", "labels", "masters"})
+    service.consumer_tags["labels"] = "tag"
+    service.extraction_signalled.add("masters")
+    assert service.types_awaiting_marker() == ["artists"]
+    assert service.get_health_data()["awaiting_extraction_complete"] == ["artists"]
+
+
+@pytest.mark.asyncio
+async def test_parked_marker_resubscribes_only_the_type_that_holds_it() -> None:
+    service.completed_files.update({"artists", "labels"})
+    service.active_connection = MagicMock()
+    consume = AsyncMock(return_value="new-tag")
+    service.queues.update({"artists": MagicMock(consume=consume), "labels": MagicMock(consume=AsyncMock())})
+
+    async def depth(data_type: str) -> int:
+        return 1 if data_type == "artists" else 0
+
+    with patch.object(service, "queue_depth", depth):
+        assert await service.recover_parked_markers() is True
+    consume.assert_awaited_once()
+    assert service.consumer_tags == {"artists": "new-tag"}
+
+
+@pytest.mark.asyncio
+async def test_parked_marker_with_a_closed_transport_uses_the_full_probe() -> None:
+    service.completed_files.add("artists")
+    with patch.object(service, "_recover_consumers", AsyncMock()) as recover:
+        await service.recover_parked_markers()
+    recover.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_no_probe_when_nothing_awaits_a_marker_or_shutdown_is_requested() -> None:
+    service.active_connection = MagicMock()
+    with patch.object(service, "queue_depth", AsyncMock(return_value=1)) as depth:
+        assert await service.recover_parked_markers() is False
+        service.completed_files.add("artists")
+        service.shutdown_requested = True
+        try:
+            assert await service.recover_parked_markers() is False
+        finally:
+            service.shutdown_requested = False
+    depth.assert_not_awaited()

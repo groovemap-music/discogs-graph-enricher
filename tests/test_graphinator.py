@@ -4248,6 +4248,9 @@ class TestPeriodicQueueCheckerStuckState:
             "masters": 0,
             "releases": 0,
         }
+        # Fully settled idle: every extraction_complete is spent, so no marker is parked and the
+        # checker has only the hourly idle check left to run.
+        graphinator.graphinator.extraction_signalled = set(graphinator.graphinator.completed_files)
         graphinator.graphinator.active_connection = None
         graphinator.graphinator.shutdown_requested = False
 

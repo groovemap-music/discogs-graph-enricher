@@ -282,6 +282,7 @@ def reset_global_state() -> Iterator[None]:
         g.active_connection = None
         g.active_channel = None
         g.completed_files = set()
+        g.extraction_signalled = set()
         g.queues = {}
         g.idle_mode = False
 
