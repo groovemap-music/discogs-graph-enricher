@@ -132,6 +132,28 @@ class TestBoundedHolds:
             assert config.max_pending >= 4 * prefetch
             assert config.max_pending >= 1000
 
+    def test_the_runtime_policy_carries_every_limit_the_config_sets(self) -> None:
+        policy = BatchConfig(
+            batch_size=7,
+            flush_interval=3.0,
+            max_pending=900,
+            max_concurrent_flushes=3,
+            min_batch_size=2,
+            backoff_initial=0.5,
+            backoff_max=9.0,
+            backoff_multiplier=3.0,
+            max_flush_retries=4,
+            max_poison_retries=6,
+            max_hold_s=700.0,
+            max_requeues=9,
+            max_write_s=77.0,
+        ).runtime_policy()
+
+        assert (policy.batch_size, policy.flush_interval_s, policy.max_pending, policy.max_concurrent_flushes) == (7, 3.0, 900, 3)
+        assert (policy.min_batch_size, policy.backoff_initial_s, policy.backoff_max_s, policy.backoff_multiplier) == (2, 0.5, 9.0, 3.0)
+        assert (policy.max_drain_retries, policy.max_poison_retries) == (4, 6)
+        assert (policy.max_hold_s, policy.max_requeues, policy.max_write_s) == (700.0, 9, 77.0)
+
     def test_the_bound_can_be_disabled(self) -> None:
         assert BatchConfig(max_hold_s=None, flush_interval=600.0).runtime_policy().max_hold_s is None
 

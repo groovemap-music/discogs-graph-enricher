@@ -347,6 +347,34 @@ class TestBatchModeCarriesTheDeliveryContext:
         assert captured["span_context"].trace_id == UPSTREAM_TRACE_ID
 
     @pytest.mark.asyncio
+    async def test_the_handler_hands_the_engine_a_way_to_requeue_and_the_brokers_headers(
+        self,
+        artists_queue: FakeQueue,
+        artist_record: dict[str, Any],
+    ) -> None:
+        """Without these a held delivery cannot go back to the broker, and its requeue budget cannot be counted."""
+        captured: dict[str, Any] = {}
+
+        async def add_message(_data_type: str, _data: dict[str, Any], _ack: Any, _nack: Any, **delivery: Any) -> bool:
+            captured.update(delivery)
+            return True
+
+        processor = MagicMock()
+        processor.add_message = AsyncMock(side_effect=add_message)
+
+        with (
+            patch("graphinator.graphinator.BATCH_MODE", True),
+            patch("graphinator.graphinator.batch_processor", processor),
+        ):
+            message = await artists_queue.publish(artist_record, headers={"x-acquired-count": 3})
+
+        assert captured["headers"] == {"x-acquired-count": 3}
+        assert callable(captured["requeue_callback"]), "the handler must pass a requeue callback"
+        message.nack.assert_not_awaited()
+        await captured["requeue_callback"]()
+        message.nack.assert_awaited_once_with(requeue=True)
+
+    @pytest.mark.asyncio
     async def test_the_flush_span_links_back_to_the_delivery_that_produced_the_record(
         self,
         spans: SpanCollector,

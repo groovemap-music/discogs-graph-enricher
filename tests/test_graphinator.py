@@ -5236,3 +5236,78 @@ class TestMainHealthPort:
             await main()
         mock_health_server.assert_not_called()
         assert "Invalid HEALTH_PORT" in str(mock_logger.error.call_args_list)
+
+
+class TestMainBuildsTheBatchConfig:
+    """main() must hand the processor every limit; a dropped argument silently falls back to a default."""
+
+    @pytest.mark.asyncio
+    @patch("graphinator.graphinator.signal.signal")
+    @patch("graphinator.graphinator.setup_logging")
+    @patch("graphinator.graphinator.HealthServer")
+    @patch("graphinator.graphinator.GraphinatorConfig.from_env")
+    @patch("graphinator.graphinator.AsyncResilientNeo4jDriver")
+    @patch("graphinator.graphinator.AsyncResilientRabbitMQ")
+    async def test_every_limit_reaches_the_processor_and_capacity_covers_four_prefetches(
+        self,
+        mock_rabbitmq_class: MagicMock,
+        mock_neo4j_class: MagicMock,
+        mock_from_env: MagicMock,
+        _mock_health_server: MagicMock,
+        _mock_setup_logging: MagicMock,
+        _mock_signal: MagicMock,
+    ) -> None:
+        import graphinator.graphinator as gm
+
+        mock_config = MagicMock()
+        mock_config.neo4j_host = "bolt://localhost:7687"
+        mock_config.neo4j_username = "neo4j"
+        mock_config.neo4j_password = "password"
+        mock_config.amqp_connection = "amqp://guest:guest@localhost/"
+        mock_from_env.return_value = mock_config
+
+        mock_neo4j_instance = MagicMock()
+        mock_neo4j_class.return_value = mock_neo4j_instance
+        mock_neo4j_instance.close = AsyncMock()
+        mock_session = AsyncMock()
+        result = AsyncMock()
+        result.single = AsyncMock(return_value={"test": 1})
+        mock_session.run = AsyncMock(return_value=result)
+        ctx = AsyncMock()
+        ctx.__aenter__ = AsyncMock(return_value=mock_session)
+        ctx.__aexit__ = AsyncMock(return_value=None)
+        mock_neo4j_instance.session = MagicMock(return_value=ctx)
+
+        # Fail the AMQP connection right after the processor is built: only the config is under test.
+        mock_rabbitmq_instance = AsyncMock()
+        mock_rabbitmq_class.return_value = mock_rabbitmq_instance
+        mock_rabbitmq_instance.connect = AsyncMock(return_value=None)
+
+        processor_class = MagicMock()
+        with (
+            patch.object(gm, "Neo4jBatchProcessor", processor_class),
+            patch.object(gm, "BATCH_MODE", True),
+            patch.object(gm, "BATCH_SIZE", 500),
+            patch.object(gm, "BATCH_FLUSH_INTERVAL", 2.5),
+            patch.object(gm, "BATCH_MAX_HOLD_S", 600.0),
+            patch.object(gm, "BATCH_MAX_REQUEUES", 11),
+            patch.object(gm, "BATCH_MAX_WRITE_S", 77.0),
+            patch.object(gm, "shutdown_requested", False),
+            # main() sets up and shuts down the process-wide meter provider; later tests rely on theirs.
+            patch.object(gm, "setup_telemetry"),
+            patch.object(gm, "shutdown_telemetry"),
+            patch.dict("os.environ", {"STARTUP_DELAY": "0"}),
+            contextlib.suppress(Exception),
+        ):
+            await main()
+
+        processor_class.assert_called_once()
+        config = processor_class.call_args.args[1]
+        assert isinstance(config, gm.BatchConfig)
+        assert config.batch_size == 500
+        assert config.flush_interval == 2.5
+        assert config.max_hold_s == 600.0
+        assert config.max_requeues == 11
+        assert config.max_write_s == 77.0
+        assert config.prefetch_count == 1000, "the prefetch the channel is given must be the one checked"
+        assert config.max_pending == 4000, "capacity must cover four prefetches, not fall back to the 1000 default"
