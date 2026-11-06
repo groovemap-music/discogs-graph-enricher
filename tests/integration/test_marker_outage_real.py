@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import os
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -19,6 +21,7 @@ from urllib.parse import urlsplit
 import aio_pika
 import pytest
 import pytest_asyncio
+from common import batch as engine_module
 from common.neo4j_resilient import AsyncResilientNeo4jDriver
 from common.outage_backoff import OutageBackoff
 from neo4j import AsyncDriver, AsyncGraphDatabase
@@ -41,6 +44,9 @@ _PERSIST_EXTRACTION_SIGNALS = graphinator._persist_extraction_signals
 
 VERSION = "20261105"
 RECORDS = 40
+WRITE_CANCEL_GRACE_S = getattr(engine_module, "WRITE_CANCEL_GRACE_S", 0.0)
+# Small so a short failure crosses it, as a long one does at the production 1500 s.
+HOLD_S = 2.0
 
 
 class BoltProxy:
@@ -88,6 +94,7 @@ class Stack:
     queue: aio_pika.abc.AbstractQueue
     tag: str = ""
     marker_deliveries: list[float] = field(default_factory=list)
+    acquired: list[int] = field(default_factory=list)
 
     async def publish(self, body: dict[str, Any]) -> None:
         await self.channel.default_exchange.publish(
@@ -121,7 +128,7 @@ async def stack(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Stack]:
         connection_acquisition_timeout=2.0,
         connection_timeout=2.0,
     )
-    processor = Neo4jBatchProcessor(driver, BatchConfig(batch_size=RECORDS * 2, flush_interval=600.0, max_hold_s=None))
+    processor = Neo4jBatchProcessor(driver, BatchConfig(batch_size=RECORDS * 2, flush_interval=600.0, max_hold_s=HOLD_S))
     processor.last_flush["artists"] = time.time()
     monkeypatch.setattr(OutageBackoff, "wait", _OUTAGE_WAIT)
     monkeypatch.setattr(graphinator, "BATCH_MODE", True)
@@ -152,6 +159,8 @@ async def stack(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[Stack]:
     async def handle(message: aio_pika.abc.AbstractIncomingMessage) -> None:
         if b'"extraction_complete"' in message.body or b'"file_complete"' in message.body:
             built.marker_deliveries.append(loop.time())
+        else:
+            built.acquired.append(int((message.headers or {}).get("x-acquired-count", 0)))
         await graphinator.on_artist_message(message)
 
     tag = await queue.consume(handle)
@@ -312,3 +321,99 @@ async def test_a_persistent_failure_dead_letters_the_marker(stack: Stack, monkey
     message = await stack.dlq.get(fail=True, timeout=5)
     assert message.headers["x-first-death-reason"] == "rejected"
     await message.ack()
+
+
+TAIL = 3
+
+
+async def in_backoff_past_the_hold(stack: Stack) -> None:
+    """A failed write, then the hold passes and Neo4j returns, with nothing yet retrying the records."""
+    assert graphinator.batch_processor is not None
+    for index in range(TAIL):
+        await stack.publish(artist(index))
+
+    async def held() -> bool:
+        assert graphinator.batch_processor is not None
+        return graphinator.batch_processor._engine.snapshot()["pending"]["artists"] == TAIL
+
+    await until(held, 15)
+    await stack.proxy.cut()
+    assert await graphinator.batch_processor._engine.flush("artists") is False
+    await asyncio.sleep(HOLD_S + 0.2)
+    await stack.proxy.open()
+
+
+@pytest.mark.timeout(120)
+async def test_a_marker_cannot_land_while_its_records_are_on_the_broker(stack: Stack, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The drain that gates the marker returns the tail to RabbitMQ: the marker has to wait for it."""
+    at_landing: list[int] = []
+    real_record = graphinator._record_extraction_signal
+
+    async def record(version: str, data_type: str) -> Any:
+        at_landing.append((await stored())[0])
+        return await real_record(version, data_type)
+
+    monkeypatch.setattr(graphinator, "_record_extraction_signal", record)
+    await in_backoff_past_the_hold(stack)
+    await stack.publish({"type": "extraction_complete", "version": VERSION})
+
+    async def landed() -> bool:
+        return bool(at_landing) and await stack.depth(stack.queue_name) == 0
+
+    await until(landed, 60)
+    print(f"\nMARKER: enricher artists stored when the signal landed: {at_landing[-1]} of {TAIL}")
+    assert at_landing[-1] == TAIL
+
+
+HANG_HOLD_S = 1.0
+HANG_DEADLINE_S = 150.0
+
+
+@pytest.mark.timeout(240)
+async def test_a_hung_store_returns_its_deliveries_within_the_stated_bound(stack: Stack) -> None:
+    """docker pause on Neo4j, default write bound: the write ends and the hold returns the records."""
+    assert graphinator.batch_processor is not None
+    engine = graphinator.batch_processor._engine
+    engine._policy = dataclasses.replace(engine._policy, max_hold_s=HANG_HOLD_S)
+    if hasattr(engine._policy, "max_write_s") and os.environ.get("HANG_WRITE_S"):
+        engine._policy = dataclasses.replace(engine._policy, max_write_s=float(os.environ["HANG_WRITE_S"]))
+    # Bolt straight to the container is what freezes: the proxy stays up and keeps accepting.
+    container = os.environ["NEO4J_CONTAINER"]
+    # A live pooled connection: with none, the write fails fast at connect instead of hanging on a read.
+    await stack.publish(artist(1000))
+
+    async def one_held() -> bool:
+        return engine.snapshot()["pending"]["artists"] == 1
+
+    await until(one_held, 15)
+    assert await engine.flush("artists") is True
+    stack.acquired.clear()
+    for index in range(TAIL):
+        await stack.publish(artist(index))
+
+    async def held() -> bool:
+        return engine.snapshot()["pending"]["artists"] == TAIL
+
+    await until(held, 15)
+    subprocess.run(["docker", "pause", container], check=True)  # noqa: S603, S607
+    started = time.monotonic()
+    try:
+        first = len(stack.acquired)
+        flush = asyncio.create_task(engine.flush("artists"))
+        bound = engine._policy.max_write_s + WRITE_CANCEL_GRACE_S + 1.0 if getattr(engine._policy, "max_write_s", None) else HANG_DEADLINE_S
+        done, _ = await asyncio.wait({flush}, timeout=min(bound, HANG_DEADLINE_S))
+        elapsed = time.monotonic() - started
+        print(f"\nHANG: enricher drain returned={bool(done)} after {elapsed:.1f}s of docker pause, deliveries {len(stack.acquired) - first}")
+        assert done, f"the drain was still inside the write after {elapsed:.1f} s"
+        await asyncio.sleep(HANG_HOLD_S)
+        await engine.flush("artists")
+
+        async def came_back() -> bool:
+            return len(stack.acquired) >= TAIL * 2
+
+        await until(came_back, 10)
+        print(
+            f"HANG: enricher records back on the broker {time.monotonic() - started:.1f}s after the pause, x-acquired-count {sorted(stack.acquired)[-TAIL:]}"
+        )
+    finally:
+        subprocess.run(["docker", "unpause", container], check=False)  # noqa: S603, S607

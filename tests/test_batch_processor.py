@@ -5,6 +5,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from common.batch import DEFAULT_MAX_WRITE_S, WRITE_CANCEL_GRACE_S
 
 from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import (
@@ -101,6 +102,35 @@ class TestBoundedHolds:
             BatchConfig(max_hold_s=1790.0)
         with pytest.raises(ValueError, match="consumer_timeout"):
             BatchConfig(max_hold_s=1500.0, flush_interval=600.0)
+
+    def test_the_defaults_leave_room_for_two_bounded_writes_under_the_broker_deadline(self) -> None:
+        config = BatchConfig()
+        worst = config.max_hold_s + config.flush_interval + config.backoff_max + 2 * (config.max_write_s + WRITE_CANCEL_GRACE_S)
+        assert worst < BROKER_CONSUMER_TIMEOUT_S
+        assert config.runtime_policy().max_write_s == DEFAULT_MAX_WRITE_S
+
+    def test_two_writes_that_could_outlast_the_hold_past_the_deadline_are_rejected(self) -> None:
+        with pytest.raises(ValueError, match="max_write_s"):
+            BatchConfig(max_hold_s=1500.0, max_write_s=200.0)
+        # The same hold is fine once the write bound is short enough, or off.
+        assert BatchConfig(max_hold_s=1500.0, max_write_s=60.0).max_write_s == 60.0
+        assert BatchConfig(max_hold_s=1500.0, max_write_s=None).max_write_s is None
+
+    def test_max_pending_must_cover_four_times_the_prefetch(self) -> None:
+        with pytest.raises(ValueError, match="max_pending"):
+            BatchConfig(max_pending=799, prefetch_count=200)
+        assert BatchConfig(max_pending=800, prefetch_count=200).max_pending == 800
+        assert BatchConfig(max_pending=10).prefetch_count is None, "without a known prefetch there is nothing to check"
+
+    def test_the_service_sizes_max_pending_from_its_prefetch(self) -> None:
+        import graphinator.graphinator as service
+
+        for batch_size in (100, 500, 2000):
+            with patch.object(service, "BATCH_SIZE", batch_size), patch.object(service, "BATCH_MODE", True):
+                prefetch = service.channel_prefetch()
+                config = BatchConfig(max_pending=max(service.DEFAULT_MAX_PENDING, service.PENDING_PER_PREFETCH * prefetch), prefetch_count=prefetch)
+            assert config.max_pending >= 4 * prefetch
+            assert config.max_pending >= 1000
 
     def test_the_bound_can_be_disabled(self) -> None:
         assert BatchConfig(max_hold_s=None, flush_interval=600.0).runtime_policy().max_hold_s is None

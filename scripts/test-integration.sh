@@ -64,8 +64,10 @@ port="${published##*:}"
 amqp_published="$(docker port "${rabbitmq}" 5672/tcp)"
 # Use direct Bolt for the random host port. The routing scheme would accept the
 # container's advertised 7687 address and accidentally leave this disposable endpoint.
+# NEO4J_CONTAINER is for the hung-store test, which freezes that container with `docker pause`.
 RABBITMQ_URL="amqp://groovemap:groovemap@127.0.0.1:${amqp_published##*:}/" \
 NEO4J_URI="bolt://127.0.0.1:${port}" \
+NEO4J_CONTAINER="${container}" \
 NEO4J_INTEGRATION_USER=neo4j \
 NEO4J_INTEGRATION_PASSWORD="${password}" \
     uv run pytest -m integration tests/integration "$@"
