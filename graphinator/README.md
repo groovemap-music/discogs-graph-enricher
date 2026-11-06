@@ -98,6 +98,9 @@ OTEL_RESOURCE_ATTRIBUTES=service.namespace=groovemap,deployment.environment.name
 NEO4J_BATCH_MODE=true               # Enable batch processing (default: true)
 NEO4J_BATCH_SIZE=100                # Records per batch (default: 100)
 NEO4J_BATCH_FLUSH_INTERVAL=5.0      # Seconds between automatic flushes (default: 5.0)
+NEO4J_BATCH_MAX_HOLD_S=1500          # Seconds a delivery is held through a Neo4j outage before it returns to RabbitMQ (default: 1500)
+NEO4J_BATCH_MAX_REQUEUES=60          # Returns to RabbitMQ before a held delivery is dead-lettered (default: 60)
+NEO4J_BATCH_MAX_WRITE_S=120          # Seconds one Neo4j write may run before it is cancelled and retried (default: 120)
 
 # Health
 HEALTH_PORT=8001                    # Health server port (default: 8001; invalid values fail startup)

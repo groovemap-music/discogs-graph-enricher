@@ -328,7 +328,7 @@ class TestBatchModeCarriesTheDeliveryContext:
     ) -> None:
         captured: dict[str, Any] = {}
 
-        async def add_message(_data_type: str, _data: dict[str, Any], _ack: Any, _nack: Any, span_context: Any = None) -> bool:
+        async def add_message(_data_type: str, _data: dict[str, Any], _ack: Any, _nack: Any, span_context: Any = None, **_delivery: Any) -> bool:
             captured["span_context"] = span_context
             return True
 

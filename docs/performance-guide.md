@@ -18,6 +18,9 @@ For those concerns use the owning repositories:
 | `NEO4J_BATCH_MODE` | `true` | Use per-entity batch queues and projection transactions. |
 | `NEO4J_BATCH_SIZE` | `100` | Target records in each Neo4j flush. |
 | `NEO4J_BATCH_FLUSH_INTERVAL` | `5.0` | Maximum seconds a low-volume batch waits for a periodic flush. |
+| `NEO4J_BATCH_MAX_HOLD_S` | `1500` | Longest a delivery waits out a Neo4j outage in memory before it goes back to RabbitMQ with `requeue=True`. Startup rejects values where hold + flush interval + the 30 s backoff cap reach the 1800 s `consumer_timeout`. |
+| `NEO4J_BATCH_MAX_REQUEUES` | `60` | Trips back to RabbitMQ a held delivery may make before it is dead-lettered, counted from the broker's `x-acquired-count`. With the hold above that is about 25.4 hours of continuous outage. |
+| `NEO4J_BATCH_MAX_WRITE_S` | `120` | Longest one Neo4j write may run before the engine cancels it (waiting up to 5 s for it to stop) and counts it as a transient failure, so a Neo4j that stops answering no longer holds a drain forever. Startup rejects values where `NEO4J_BATCH_MAX_HOLD_S` + flush interval + the 30 s backoff cap + 2 x (this + 5 s) reach the 1800 s `consumer_timeout`: the defaults give 1785 s. `max_pending` is set to at least four times the consumer prefetch (`max(200, 2 x NEO4J_BATCH_SIZE)`), so a delivery waits for Neo4j and not for a free slot. |
 | `CONSUMER_CANCEL_DELAY` | `300` | Grace period before cancelling a completed entity consumer; `0` disables it. |
 | `QUEUE_CHECK_INTERVAL` | `3600` | Queue-depth polling interval after every consumer is idle. |
 | `STUCK_CHECK_INTERVAL` | `30` | Interval for detecting unexpectedly absent consumers. |

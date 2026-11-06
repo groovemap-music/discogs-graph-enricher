@@ -23,6 +23,7 @@ from common import (
     requeue_or_dead_letter,
     setup_logging,
 )
+from common.batch import DEFAULT_MAX_WRITE_S
 from common.db_resilience import DatabaseUnavailableError
 from common.telemetry import setup_telemetry, shutdown_telemetry, start_event_loop_monitor
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
@@ -30,7 +31,8 @@ from orjson import loads
 
 from graphinator import maintenance_paging
 from graphinator import telemetry as gm_telemetry
-from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor
+from graphinator.batch_processor import DEFAULT_MAX_HOLD_S, DEFAULT_MAX_PENDING, PENDING_PER_PREFETCH, BatchConfig, Neo4jBatchProcessor
+from graphinator.batch_processor import DEFAULT_MAX_REQUEUES as BATCH_DEFAULT_MAX_REQUEUES
 from graphinator.config import GraphinatorConfig
 from graphinator.entity_projection import (
     process_artist,
@@ -163,6 +165,19 @@ batch_processor: Neo4jBatchProcessor | None = None
 BATCH_MODE = os.environ.get("NEO4J_BATCH_MODE", "true").lower() == "true"
 BATCH_SIZE = int(os.environ.get("NEO4J_BATCH_SIZE", "100"))
 BATCH_FLUSH_INTERVAL = float(os.environ.get("NEO4J_BATCH_FLUSH_INTERVAL", "5.0"))
+# Held-delivery bound: deliveries waiting out Neo4j backoff longer than this go back to RabbitMQ with
+# requeue=True. BatchConfig rejects values that could reach the broker consumer_timeout (lux: 30 minutes).
+BATCH_MAX_HOLD_S = float(os.environ.get("NEO4J_BATCH_MAX_HOLD_S", str(DEFAULT_MAX_HOLD_S)))
+# Times a held delivery may go back to RabbitMQ before it is dead-lettered instead.
+BATCH_MAX_REQUEUES = int(os.environ.get("NEO4J_BATCH_MAX_REQUEUES", str(BATCH_DEFAULT_MAX_REQUEUES)))
+# Longest one Neo4j write may run before the engine cancels it and treats it as a transient failure.
+BATCH_MAX_WRITE_S = float(os.environ.get("NEO4J_BATCH_MAX_WRITE_S", str(DEFAULT_MAX_WRITE_S)))
+
+
+def channel_prefetch() -> int:
+    """Per-consumer prefetch: enough for a batch to fill before it flushes."""
+    return max(200, BATCH_SIZE * 2) if BATCH_MODE else 200
+
 
 # Connection state tracking
 rabbitmq_manager: Any = None  # Will hold AsyncResilientRabbitMQ instance
@@ -496,7 +511,7 @@ async def _recover_consumers() -> None:
             active_channel = temp_channel
 
             # Set QoS - scale with batch_size for efficient batch processing
-            prefetch_count = max(200, BATCH_SIZE * 2) if BATCH_MODE else 200
+            prefetch_count = channel_prefetch()
             await active_channel.set_qos(prefetch_count=prefetch_count)
 
             # Declare per-data-type fanout exchanges and consumer-owned queues
@@ -2011,6 +2026,11 @@ def make_message_handler(
                         # This delivery's span has ended by the time the batch is written, so
                         # its context rides along and the flush span links back to it.
                         span_context=gm_telemetry.span_context_of(span),
+                        # A delivery held in Neo4j backoff past BATCH_MAX_HOLD_S goes back to RabbitMQ
+                        # before consumer_timeout can cancel this consumer, and the engine counts
+                        # each trip through the broker's headers.
+                        requeue_callback=lambda: message.nack(requeue=True),
+                        headers=getattr(message, "headers", None),
                     )
                     if accepted:
                         # Note: message_counts tracks received (not processed) messages in
@@ -2281,6 +2301,12 @@ async def main() -> None:
             batch_config = BatchConfig(
                 batch_size=BATCH_SIZE,
                 flush_interval=BATCH_FLUSH_INTERVAL,
+                max_hold_s=BATCH_MAX_HOLD_S,
+                max_requeues=BATCH_MAX_REQUEUES,
+                max_write_s=BATCH_MAX_WRITE_S,
+                # Capacity for four times the prefetch, so a delivery waits on Neo4j and not on a free slot.
+                max_pending=max(DEFAULT_MAX_PENDING, PENDING_PER_PREFETCH * channel_prefetch()),
+                prefetch_count=channel_prefetch(),
             )
             batch_processor = Neo4jBatchProcessor(graph, batch_config)
             logger.info(
@@ -2346,7 +2372,7 @@ async def main() -> None:
         # rather than silent. Unlike the Discogs SQL loader's non-batch mode,
         # graphinator writes through the Neo4j driver's own pool, so there is no small
         # fixed connection budget to couple the prefetch to.
-        prefetch_count = max(200, BATCH_SIZE * 2) if BATCH_MODE else 200
+        prefetch_count = channel_prefetch()
         await channel.set_qos(prefetch_count=prefetch_count)
         logger.info(
             "🔧 QoS prefetch configured",

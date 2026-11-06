@@ -20,8 +20,9 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 from common import normalize_record
-from common.batch import AsyncBatchEngine, BatchItemResult, BatchPolicy
+from common.batch import DEFAULT_MAX_WRITE_S, WRITE_CANCEL_GRACE_S, AsyncBatchEngine, BatchItemResult, BatchPolicy
 from common.db_resilience import DatabaseUnavailableError
+from common.delivery import DEFAULT_MAX_REQUEUES as ENGINE_DEFAULT_MAX_REQUEUES
 from common.delivery import DeliveryResult, FailureKind, Settlement
 from common.tracing import flush_span
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
@@ -31,13 +32,23 @@ from graphinator.batch_projection import Neo4jBatchProjector
 
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Sequence
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
     from types import TracebackType
 
 
 logger = structlog.get_logger(__name__)
 DATA_TYPES = ("artists", "labels", "masters", "releases")
 _CURRENT_FLUSH: ContextVar[_FlushObservation | None] = ContextVar("discogs_graph_flush", default=None)
+# RabbitMQ consumer_timeout on lux (30 minutes). A held delivery must be returned before it, or the
+# broker cancels the consumer and the delivery comes back without being counted.
+BROKER_CONSUMER_TIMEOUT_S = 1800.0
+DEFAULT_MAX_HOLD_S = 1500.0
+# Requeues a held delivery may use before it is dead-lettered. RabbitMQ does not spend
+# x-delivery-limit on nack(requeue=True), so the engine counts x-acquired-count instead.
+DEFAULT_MAX_REQUEUES = ENGINE_DEFAULT_MAX_REQUEUES
+DEFAULT_MAX_PENDING = 1000
+# max_pending must hold this many consumer prefetches (see BatchConfig.prefetch_count).
+PENDING_PER_PREFETCH = 4
 
 
 @dataclass
@@ -46,7 +57,7 @@ class BatchConfig:
 
     batch_size: int = 100
     flush_interval: float = 5.0
-    max_pending: int = 1000
+    max_pending: int = DEFAULT_MAX_PENDING
     max_concurrent_flushes: int = 2
     min_batch_size: int = 10
     backoff_initial: float = 1.0
@@ -54,6 +65,40 @@ class BatchConfig:
     backoff_multiplier: float = 2.0
     max_flush_retries: int = 5
     max_poison_retries: int = 5
+    # Longest a delivery may be held in transient backoff before it is returned to RabbitMQ with
+    # requeue=True. None disables the bound. __post_init__ checks it against the broker deadline.
+    max_hold_s: float | None = DEFAULT_MAX_HOLD_S
+    # Times a held delivery may go back to RabbitMQ before it is dead-lettered. None is unbounded.
+    max_requeues: int | None = DEFAULT_MAX_REQUEUES
+    # Longest one Neo4j write may run before the engine cancels it and counts it as a transient failure. A store
+    # that stops answering raises nothing, so without this a drain waits forever and the hold never acts. None
+    # keeps the write unbounded.
+    max_write_s: float | None = DEFAULT_MAX_WRITE_S
+    # The consumer prefetch of every channel feeding this engine. When known, max_pending has to cover four times
+    # it, or deliveries spend their requeue budget waiting for capacity instead of for Neo4j.
+    prefetch_count: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.prefetch_count is not None and self.max_pending < self.prefetch_count * PENDING_PER_PREFETCH:
+            raise ValueError(
+                f"max_pending={self.max_pending} is below {PENDING_PER_PREFETCH} x the consumer prefetch "
+                f"({self.prefetch_count}); a delivery would wait for capacity until it is returned to the broker"
+            )
+        if self.max_hold_s is None:
+            return
+        # Holds are checked at each flush entry, and the periodic flush runs every flush_interval, so
+        # budget for that gap and for the longest backoff sleep: the bound must act before the
+        # broker's consumer_timeout can. A write that started just inside the hold, and another key's write it
+        # waited behind for a flush slot, each run for at most max_write_s plus the time a cancelled write is
+        # given to stop, which adds twice that (the engine documents the same sum).
+        write_s = 0.0 if self.max_write_s is None else 2 * (self.max_write_s + WRITE_CANCEL_GRACE_S)
+        worst_case_s = self.max_hold_s + self.flush_interval + self.backoff_max + write_s
+        if worst_case_s >= BROKER_CONSUMER_TIMEOUT_S:
+            raise ValueError(
+                f"max_hold_s={self.max_hold_s:g} plus flush_interval={self.flush_interval:g}, "
+                f"backoff_max={self.backoff_max:g} and 2 x (max_write_s={self.max_write_s} + {WRITE_CANCEL_GRACE_S:g} s cancel grace) "
+                f"can reach {worst_case_s:g} s, which is not below the {BROKER_CONSUMER_TIMEOUT_S:g} s consumer_timeout"
+            )
 
     def runtime_policy(self) -> BatchPolicy:
         """Return the dependency-light runtime policy for this service."""
@@ -68,6 +113,9 @@ class BatchConfig:
             backoff_multiplier=self.backoff_multiplier,
             max_drain_retries=self.max_flush_retries,
             max_poison_retries=self.max_poison_retries,
+            max_hold_s=self.max_hold_s,
+            max_requeues=self.max_requeues,
+            max_write_s=self.max_write_s,
         )
 
 
@@ -81,13 +129,20 @@ class PendingMessage:
     nack_callback: Callable[[], Awaitable[None]]
     received_at: float = field(default_factory=time.time)
     span_context: Any = None
+    # Only set for deliveries the engine may return to the broker once held past max_hold_s.
+    requeue_callback: Callable[[], Awaitable[None]] | None = None
+    # The broker's headers, which is where the engine reads how often the message came back.
+    headers: Mapping[str, Any] | None = None
 
     async def ack(self) -> None:
         await self.ack_callback()
 
     async def nack(self, *, requeue: bool) -> None:
         if requeue:
-            raise ValueError("batch deliveries may only be rejected without requeue")
+            if self.requeue_callback is None:
+                raise ValueError("batch deliveries are retried in-process, not broker-requeued")
+            await self.requeue_callback()
+            return
         await self.nack_callback()
 
 
@@ -250,7 +305,14 @@ class Neo4jBatchProcessor:
         ack_callback: Callable[[], Awaitable[None]],
         nack_callback: Callable[[], Awaitable[None]],
         span_context: Any = None,
+        requeue_callback: Callable[[], Awaitable[None]] | None = None,
+        headers: Mapping[str, Any] | None = None,
     ) -> bool:
+        """Normalize and submit one delivery; invalid input is rejected locally.
+
+        ``requeue_callback`` returns a delivery held past ``max_hold_s`` to the broker. ``headers``
+        are the broker's, which the requeue budget reads.
+        """
         if data_type not in DATA_TYPES:
             logger.error("Unknown data type", data_type=data_type)
             await nack_callback()
@@ -266,7 +328,9 @@ class Neo4jBatchProcessor:
             await nack_callback()
             return False
 
-        pending = PendingMessage(data_type, normalized, ack_callback, nack_callback, span_context=span_context)
+        pending = PendingMessage(
+            data_type, normalized, ack_callback, nack_callback, span_context=span_context, requeue_callback=requeue_callback, headers=headers
+        )
         await self._engine.submit(data_type, pending, pending, span_context=span_context)
         snapshot = self._engine.snapshot()
         pending_count = snapshot["pending"][data_type]  # type: ignore[index]
