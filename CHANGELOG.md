@@ -3,6 +3,18 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.6.2 (2026-11-06)
+
+### Release notes
+
+No schema change. A parked extraction_complete is now delivered within about a second, and `/health` lists `awaiting_extraction_complete`. Batch holds and writes are bounded through a long Neo4j outage.
+
+### Fix
+
+- **consumers**: deliver extraction_complete parked on a cancelled consumer
+- **batch**: bound writes and size capacity from the engine's hold fixes
+- **batch**: bound batch holds through a long Neo4j outage
+
 ## v0.6.1 (2026-11-05)
 
 ### Fix
