@@ -3,6 +3,20 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.7.0 (2026-11-09)
+
+### Release notes
+
+Genre and Style nodes gain `release_years` and `release_year_counts`, parallel lists of releases per year (documented in `graphinator/README.md`, "Genre/Style release series"). The separate `first_year` statement is folded into the `release_count` walk, and paged maintenance steps keep `started_at` in their checkpoints and log `duration_seconds`. `STATS_VERSION` is now 2, so the first start after deploy runs one full stats sweep (Genre/Style/Label, then Artist), about 4-5 minutes of Neo4j reads on the reference catalog (261 s read-side, down from 305 s). No schema dependency.
+
+### Feat
+
+- **stats**: store per-year release series on Genre and Style
+
+### Fix
+
+- **release**: keep breaking changes below 1.0 with major_version_zero
+
 ## v0.6.2 (2026-11-06)
 
 ### Release notes
