@@ -160,16 +160,19 @@ names what the sweeps write, and each pass records it as
 `ExtractionCompletion.stats_version`.
 
 At every start, if the newest dump has all four signals and `maintained_at`, and its
-`stats_version` differs from the code's, `resume_stats_refresh()` runs the Label and Artist
-sweeps once. Deploying is the whole trigger: there is no manual step. Bump `STATS_VERSION`
-whenever a sweep's output changes.
+`stats_version` differs from the code's, `resume_stats_refresh()` runs every stats sweep
+once: Genre, Style and Label, then Artist. Running them all means a dump stamped by any older
+stats version gets everything it is missing (version 1 added the Label `HAS_STYLE` edges and
+the Artist stats, version 2 the Genre/Style year series). A sweep whose values have not
+changed writes nothing on Label and Artist, so the cost is the walk. Deploying is the whole
+trigger: there is no manual step. Bump `STATS_VERSION` whenever a sweep's output changes.
 
 - It never touches `maintained_at`, `maintenance_status` or `maintenance_error`, so readers
   keep seeing a final graph while the values arrive.
 - The run key includes the stats version, so older checkpoints do not skip it, and a retry
   or restart continues after the last committed page.
 - A failed refresh is logged and retried at the next start. `stats_version` is written
-  only once both sweeps have finished.
+  only once every sweep has finished.
 - It has its own task slot, and only one runs at a time. A real maintenance trigger cancels
   it, because that trigger is acked and cannot be replayed, and the pass writes every stat.
 - It stops between pages if a catalog message arrives or a newer version appears. Messages

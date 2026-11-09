@@ -147,19 +147,31 @@ async def test_a_stats_check_that_cannot_read_neo4j_starts_nothing() -> None:
 
 
 def test_genre_style_metrics_are_grouped_by_what_they_share() -> None:
-    """The three counts that walk the same release chain share one statement; the others stay apart."""
+    """Two walks per node: releases by year, and the shared expansion of each release."""
     for node in ("Genre", "Style"):
         other = "style_count" if node == "Genre" else "genre_count"
         statements = g.build_node_stat_statements(node)
         sets = [cypher.split("SET ")[1].strip() for cypher, _ in statements]
         assert sets == [
-            "n.release_count = v0",
+            "n.release_count = v0, n.release_years = v1, n.release_year_counts = v2, n.first_year = v3",
             f"n.artist_count = v0, n.label_count = v1, n.{other} = v2",
-            "n.first_year = v0",
         ]
+        by_year = statements[0][0]
         # release_count needs no DISTINCT set: the IS edge is MERGEd, one per release/node pair.
-        assert "count(r) AS v0" in statements[0][0]
-        assert "DISTINCT" not in statements[0][0]
+        assert "DISTINCT" not in by_year
+        # Every release is counted, dated or not; the series keeps only year > 0, like trends.
+        assert "sum(releases) AS v0" in by_year
+        assert "WITH r.year AS year, count(*) AS releases" in by_year
+        assert by_year.count("CASE WHEN year > 0 THEN") == 2
+        assert "ORDER BY year" in by_year
+        # first_year is the series' first year, not a separate min(r.year) walk.
+        assert "head(v1) AS v3" in by_year
+        assert not any("min(r.year)" in cypher for cypher, _ in statements)
+        # BY and ON from a Release only reach Artist and Label: no label check on those targets.
+        expansion = statements[1][0]
+        assert "CASE type(x) WHEN 'BY' THEN t END" in expansion
+        assert "CASE type(x) WHEN 'ON' THEN t END" in expansion
+        assert "t:Artist" not in expansion and "t:Label" not in expansion
 
 
 @pytest.mark.asyncio
@@ -207,6 +219,38 @@ async def test_resume_survives_a_restart_because_the_cursor_lives_in_the_graph()
         assert await g.compute_person_credit_counts() is True
 
     assert [n for page in graph.person_pages for n in page] == NAMES[15:]
+
+
+@pytest.mark.asyncio
+async def test_a_step_keeps_its_start_time_across_a_resume_and_logs_its_duration() -> None:
+    """started_at is written with every checkpoint and kept on a resume, so a done
+    checkpoint's started_at..updated_at brackets the whole step, and the log says how long it took."""
+    graph = FakePagedGraph(persons=NAMES)
+    graph.checkpoints["person_credit_counts"] = {
+        "run_key": "2026-11",
+        "cursor": NAMES[14],
+        "size": 10,
+        "done": False,
+        "started_at": "2026-11-06T20:00:00+00:00",
+    }
+    with patch.object(g, "graph", graph), _run_key("2026-11"), patch.object(mp, "logger") as log:
+        assert await g.compute_person_credit_counts() is True
+
+    assert graph.checkpoints["person_credit_counts"]["done"] is True
+    assert graph.checkpoints["person_credit_counts"]["started_at"] == "2026-11-06T20:00:00+00:00"
+    complete = [c for c in log.info.call_args_list if c.args[0] == "✅ Maintenance step complete"]
+    assert len(complete) == 1
+    assert complete[0].kwargs["started_at"] == "2026-11-06T20:00:00+00:00"
+    assert complete[0].kwargs["duration_seconds"] >= 0
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_step_records_when_it_started() -> None:
+    graph = FakePagedGraph(persons=NAMES[:3])
+    with patch.object(g, "graph", graph), _run_key("2026-11"):
+        assert await g.compute_person_credit_counts() is True
+    started_at = graph.checkpoints["person_credit_counts"]["started_at"]
+    assert started_at is not None and started_at.endswith("+00:00")
 
 
 @pytest.mark.asyncio
@@ -328,7 +372,7 @@ async def test_genre_and_style_stats_run_every_metric_for_every_node() -> None:
 
     assert sorted({k for k, _ in graph.metric_sets}) == ["Jazz", "Punk", "Rock"]
     assert sorted(p for k, p in graph.metric_sets if k == "Rock") == sorted(
-        ["release_count", "artist_count", "label_count", "style_count", "first_year"]
+        ["release_count", "release_years", "release_year_counts", "first_year", "artist_count", "label_count", "style_count"]
     )
     assert set(graph.checkpoints) == {"genre_stats", "style_stats", "label_stats"}
 

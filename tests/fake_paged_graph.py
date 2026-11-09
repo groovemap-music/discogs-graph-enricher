@@ -93,6 +93,7 @@ class FakePagedGraph:
                 "cursor": params["cursor"],
                 "size": params["size"],
                 "done": params["done"],
+                "started_at": params.get("started_at"),
             }
             return _Result([{"written": 1}])
         if "MATCH (p:Person)" in cypher:

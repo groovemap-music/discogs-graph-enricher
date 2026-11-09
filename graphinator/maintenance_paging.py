@@ -28,6 +28,11 @@ The sweep is now shaped as many short statements instead:
   and the size that worked is remembered in the checkpoint;
 * a finished step is marked ``done`` and skipped by later passes of the same run.
 
+Each checkpoint also keeps ``started_at``, when the step began for its run key, next to
+``updated_at``. On a ``done`` checkpoint the two bracket the step, so how long a sweep
+took survives the logs; a step resumed after a restart counts from its first start. The
+log lines of a step carry ``duration_seconds`` for the call that ran them.
+
 A checkpoint belongs to one *run key* (the dump version being maintained). A different
 run key starts the step from the beginning, so counts are recomputed for every new dump.
 """
@@ -36,8 +41,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -125,6 +132,7 @@ class Checkpoint:
     cursor: str = START_CURSOR
     size: int | None = None
     done: bool = False
+    started_at: str | None = None
 
 
 async def read_checkpoint(graph: Any, step: str, run_key: str) -> Checkpoint:
@@ -133,7 +141,8 @@ async def read_checkpoint(graph: Any, step: str, run_key: str) -> Checkpoint:
         graph,
         f"""
         OPTIONAL MATCH (c:{CHECKPOINT_LABEL} {{step: $step}})
-        RETURN c.run_key AS run_key, c.cursor AS cursor, c.size AS size, c.done AS done
+        RETURN c.run_key AS run_key, c.cursor AS cursor, c.size AS size, c.done AS done,
+            toString(c.started_at) AS started_at
         """,
         step=step,
     )
@@ -143,6 +152,7 @@ async def read_checkpoint(graph: Any, step: str, run_key: str) -> Checkpoint:
         cursor=record.get("cursor") or START_CURSOR,
         size=record.get("size"),
         done=bool(record.get("done")),
+        started_at=record.get("started_at"),
     )
 
 
@@ -153,7 +163,7 @@ async def write_checkpoint(graph: Any, step: str, run_key: str, checkpoint: Chec
         f"""
         MERGE (c:{CHECKPOINT_LABEL} {{step: $step}})
         SET c.run_key = $run_key, c.cursor = $cursor, c.size = $size, c.done = $done,
-            c.updated_at = datetime()
+            c.started_at = datetime($started_at), c.updated_at = datetime()
         RETURN count(c) AS written
         """,
         step=step,
@@ -161,6 +171,7 @@ async def write_checkpoint(graph: Any, step: str, run_key: str, checkpoint: Chec
         cursor=checkpoint.cursor,
         size=checkpoint.size,
         done=checkpoint.done,
+        started_at=checkpoint.started_at,
     )
 
 
@@ -213,6 +224,13 @@ async def run_checkpointed_step(
         if checkpoint.cursor != START_CURSOR:
             logger.info("▶️ Resuming maintenance step after its last committed page", step=step, cursor=checkpoint.cursor)
 
+    started = time.monotonic()
+    started_at = checkpoint.started_at or datetime.now(UTC).isoformat()
+    logger.info("▶️ Maintenance step started", step=step, started_at=started_at)
+
+    def elapsed() -> float:
+        return round(time.monotonic() - started, 3)
+
     size = max(min_page_size, min(page_size, checkpoint.size or page_size))
     cursor = checkpoint.cursor
     total = 0
@@ -225,7 +243,7 @@ async def run_checkpointed_step(
             last, processed = await process_page(cursor, size)
         except Exception as e:
             if not is_page_retryable(e):
-                logger.error("❌ Maintenance step failed", step=step, cursor=cursor, page_size=size, error=str(e))
+                logger.error("❌ Maintenance step failed", step=step, cursor=cursor, page_size=size, duration_seconds=elapsed(), error=str(e))
                 raise
             if size > min_page_size:
                 size = max(min_page_size, size // 2)
@@ -255,15 +273,28 @@ async def run_checkpointed_step(
         failures_at_min = 0
         if processed == 0 or last is None:
             if run_key is not None:
-                await write_checkpoint(graph, step, run_key, Checkpoint(cursor=cursor, size=size, done=True))
-            logger.info("✅ Maintenance step complete", step=step, processed_this_call=total)
+                await write_checkpoint(graph, step, run_key, Checkpoint(cursor=cursor, size=size, done=True, started_at=started_at))
+            logger.info(
+                "✅ Maintenance step complete",
+                step=step,
+                processed_this_call=total,
+                started_at=started_at,
+                duration_seconds=elapsed(),
+            )
             return total
 
         cursor = last
         total += processed
         if run_key is not None:
-            await write_checkpoint(graph, step, run_key, Checkpoint(cursor=cursor, size=size))
-        logger.info("📊 Maintenance page committed", step=step, cursor=cursor, page_size=size, processed_this_call=total)
+            await write_checkpoint(graph, step, run_key, Checkpoint(cursor=cursor, size=size, started_at=started_at))
+        logger.info(
+            "📊 Maintenance page committed",
+            step=step,
+            cursor=cursor,
+            page_size=size,
+            processed_this_call=total,
+            duration_seconds=elapsed(),
+        )
 
 
 def keyed_page_processor(graph: Any, page_cypher: str) -> PageProcessor:

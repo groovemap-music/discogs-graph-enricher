@@ -176,12 +176,12 @@ See the [performance guide](../docs/performance-guide.md) for detailed tuning gu
 
 1. **Genre** - Musical genres
 
-   - Properties: name, release_count\*, artist_count\*, label_count\*, style_count\*, first_year\*
+   - Properties: name, release_count\*, artist_count\*, label_count\*, style_count\*, first_year\*, release_years\*, release_year_counts\*
    - \*Pre-computed by `compute_genre_style_stats()` (see [Pre-Computed Node Properties](#-pre-computed-node-properties))
 
 1. **Style** - Musical styles (sub-genres)
 
-   - Properties: name, release_count\*, artist_count\*, label_count\*, genre_count\*, first_year\*
+   - Properties: name, release_count\*, artist_count\*, label_count\*, genre_count\*, first_year\*, release_years\*, release_year_counts\*
    - Relationships: PART_OF (to Genre)
    - \*Pre-computed by `compute_genre_style_stats()` (see [Pre-Computed Node Properties](#-pre-computed-node-properties))
 
@@ -349,6 +349,7 @@ After graph import of releases, the graphinator runs `compute_genre_style_stats(
 | `label_count`   | Number of distinct labels with releases in this genre  |
 | `style_count`   | Number of styles associated with this genre            |
 | `first_year`    | Earliest release year for this genre                   |
+| `release_years`, `release_year_counts` | Releases per year (see [Genre/Style release series](#genrestyle-release-series)) |
 
 **Style nodes:**
 
@@ -359,6 +360,35 @@ After graph import of releases, the graphinator runs `compute_genre_style_stats(
 | `label_count`   | Number of distinct labels with releases in this style  |
 | `genre_count`   | Number of genres associated with this style            |
 | `first_year`    | Earliest release year for this style                   |
+| `release_years`, `release_year_counts` | Releases per year (see [Genre/Style release series](#genrestyle-release-series)) |
+
+#### Genre/Style release series
+
+The per-year release counts of every Genre and Style, which catalog-api's genre and style trends read instead of walking every release of the node (20.7M db hits and 3.9 s for Rock on lux, against about 3 db hits for two properties). Two parallel integer lists:
+
+| Property              | Type             | Content                                                                 |
+| --------------------- | ---------------- | ----------------------------------------------------------------------- |
+| `release_years`       | `LIST<INTEGER>`  | Every year with at least one of the node's releases, ascending, each `> 0` |
+| `release_year_counts` | `LIST<INTEGER>`  | The number of the node's releases in the year at the same index         |
+
+- The two lists always have the same length. `release_years[i]` pairs with `release_year_counts[i]`.
+- A year with no releases is absent, not `0`. A reader that wants a continuous axis fills the gaps.
+- A release with no `year`, or `year <= 0`, is left out of the series but counted in `release_count`, so `sum(release_year_counts) <= release_count`.
+- Masters are not counted: only `(:Release)-[:IS]->` edges.
+- A node with no dated release has two empty lists, and no `first_year`.
+- `first_year` equals `release_years[0]`. All four properties (`release_count`, the two lists, `first_year`) are written in one statement, so they describe the same graph.
+
+The series equals catalog-api's live traversal (`trends_genre` / `trends_style`: the node's releases, `year IS NOT NULL AND year > 0`, grouped by year, ordered by year). `tests/integration/test_real_neo4j_writes.py` runs that traversal verbatim against the stored series. To turn the series back into the rows the live query returns:
+
+```cypher
+MATCH (g:Genre {name: $name})
+WHERE g.release_years IS NOT NULL
+UNWIND range(0, size(g.release_years) - 1) AS i
+RETURN g.release_years[i] AS year, g.release_year_counts[i] AS count
+ORDER BY year
+```
+
+**Reading it safely.** `release_years` absent means the node has not been swept by code that writes the series (a graph stamped before `stats_version` 2, or the very first pass still running): fall back to the live traversal. The series is current for the whole graph once the newest `ExtractionCompletion` node has `maintained_at` and `stats_version >= 2` (see below). A deploy that raises `stats_version` refreshes the stats of the newest dump at start-up, Genre and Style included, so the series appears without waiting for the next dump. Like every stored stat, it can be one dump old while a new dump is importing.
 
 **Label nodes:**
 
@@ -397,7 +427,7 @@ ORDER BY coalesce(m.created_at, datetime({epochMillis: 0})) DESC
 LIMIT 1
 ```
 
-`stats_version` is written only after every label and artist has been swept, and never after a failed or stopped sweep. A new dump's node withdraws the marker until that dump's own pass. Once the marker is set, a label with no edges has no styles. As with every stored stat, the edges can be one dump old between the start of an import and that dump's first `extraction_complete`, when its node appears.
+`stats_version` is written only after every genre, style, label and artist has been swept, and never after a failed or stopped sweep. A new dump's node withdraws the marker until that dump's own pass. Once the marker is set, a label with no edges has no styles. As with every stored stat, the edges can be one dump old between the start of an import and that dump's first `extraction_complete`, when its node appears.
 
 A dump stamped before these stats existed gets them from a refresh at the next start, with no manual step. See [Stats refresh on a stamped dump](../docs/file-completion-tracking.md#stats-refresh-on-a-stamped-dump-stats_version).
 

@@ -831,6 +831,11 @@ async def test_paged_person_recount_resumes_from_its_committed_cursor(neo4j_driv
             neo4j_driver, "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.cursor AS cursor, c.done AS done"
         )
         assert checkpoint == {"cursor": "Bravo", "done": False}
+        first_start = await one(
+            neo4j_driver,
+            "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.started_at AS started_at, c.started_at <= c.updated_at AS ordered",
+        )
+        assert first_start["started_at"] is not None and first_start["ordered"] is True
         assert (await credit_counts(neo4j_driver, "Charlie"))["credit_count"] is None, "not yet reached"
 
         monkeypatch.setattr(graphinator.maintenance_paging, "run_statement", real_run)
@@ -840,8 +845,12 @@ async def test_paged_person_recount_resumes_from_its_committed_cursor(neo4j_driv
 
     for name, extra in (("Alpha", {"production": 1}), ("Bravo", {"engineering": 1}), ("Charlie", {"session": 1}), ("Delta", {"mastering": 1})):
         assert await credit_counts(neo4j_driver, name) == expected(1, **extra)
-    done = await one(neo4j_driver, "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.done AS done")
-    assert done == {"done": True}
+    done = await one(
+        neo4j_driver,
+        "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.done AS done, c.started_at AS started_at",
+    )
+    # started_at is a datetime like updated_at, and the resume kept the first start.
+    assert done == {"done": True, "started_at": first_start["started_at"]}
 
 
 @pytest.mark.asyncio
@@ -872,11 +881,21 @@ async def test_genre_style_label_stats_are_computed_by_paged_statements(neo4j_dr
 
     rock = await one(
         neo4j_driver,
-        "MATCH (g:Genre {name: 'Rock'}) RETURN g.release_count AS rc, g.artist_count AS ac, g.label_count AS lc, g.style_count AS sc, g.first_year AS fy",
+        """MATCH (g:Genre {name: 'Rock'}) RETURN g.release_count AS rc, g.artist_count AS ac, g.label_count AS lc, g.style_count AS sc,
+            g.first_year AS fy, g.release_years AS ys, g.release_year_counts AS cs""",
     )
-    assert rock == {"rc": 3, "ac": 2, "lc": 2, "sc": 1, "fy": 1977}
-    punk = await one(neo4j_driver, "MATCH (s:Style {name: 'Punk'}) RETURN s.release_count AS rc, s.genre_count AS gc, s.first_year AS fy")
-    assert punk == {"rc": 1, "gc": 1, "fy": 1977}
+    assert rock == {"rc": 3, "ac": 2, "lc": 2, "sc": 1, "fy": 1977, "ys": [1977, 1980], "cs": [1, 1]}
+    punk = await one(
+        neo4j_driver,
+        "MATCH (s:Style {name: 'Punk'}) RETURN s.release_count AS rc, s.genre_count AS gc, s.first_year AS fy, s.release_years AS ys, s.release_year_counts AS cs",
+    )
+    assert punk == {"rc": 1, "gc": 1, "fy": 1977, "ys": [1977], "cs": [1]}
+    # Jazz's only release has year 0: counted, but no year to put in the series.
+    jazz = await one(
+        neo4j_driver,
+        "MATCH (g:Genre {name: 'Jazz'}) RETURN g.release_count AS rc, g.first_year AS fy, g.release_years AS ys, g.release_year_counts AS cs",
+    )
+    assert jazz == {"rc": 1, "fy": None, "ys": [], "cs": []}
     l2 = await one(neo4j_driver, "MATCH (l:Label {id: 'L2'}) RETURN l.release_count AS rc, l.artist_count AS ac, l.genre_count AS gc")
     assert l2 == {"rc": 2, "ac": 2, "gc": 2}
     l3 = await one(neo4j_driver, "MATCH (l:Label {id: 'L3'}) RETURN l.release_count AS rc, l.artist_count AS ac, l.genre_count AS gc")
@@ -1110,6 +1129,104 @@ async def test_shared_traversal_genre_style_metrics_equal_the_separate_distinct_
             assert row == expected_props, f"{node} {name}"
         # The graph exercises real values, not only zeros.
         assert any(row["artist_count"] and row["label_count"] for row in results.values())
+
+
+# catalog-api's live trends traversals, verbatim from api/queries/neo4j_queries.py
+# (trends_genre / trends_style at catalog-api 2467d12). The stored series has to equal them.
+CATALOG_API_TRENDS = {
+    "Genre": """
+    MATCH (g:Genre {name: $name})
+    CALL {
+        WITH g
+        MATCH (g)<-[:IS]-(r:Release)
+        RETURN r.year AS year
+    }
+    WITH year WHERE year IS NOT NULL AND year > 0
+    WITH year, count(*) AS count
+    RETURN year, count
+    ORDER BY year
+    """,
+    "Style": """
+    MATCH (s:Style {name: $name})
+    CALL {
+        WITH s
+        MATCH (s)<-[:IS]-(r:Release)
+        RETURN r.year AS year
+    }
+    WITH year WHERE year IS NOT NULL AND year > 0
+    WITH year, count(*) AS count
+    RETURN year, count
+    ORDER BY year
+    """,
+}
+
+
+@pytest.mark.asyncio
+async def test_stored_year_series_equal_catalog_api_live_trends(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every Genre and Style: the stored series against catalog-api's live traversal, row for row.
+
+    Releases with no year property, year 0 and a negative year (none of which trends shows),
+    a Master with IS edges (not a Release), a node whose only release is undated and one
+    with no releases at all.
+    """
+    async with neo4j_driver.session(database="neo4j") as session:
+        for statement in (
+            "UNWIND range(1, 6) AS g CREATE (:Genre {name: 'G' + g})",
+            "UNWIND range(1, 15) AS s CREATE (:Style {name: 'S' + s})",
+            "CREATE (:Genre {name: 'Empty'}), (:Style {name: 'Undated'})",
+        ):
+            await session.run(statement)
+        await session.run(
+            """
+            UNWIND range(1, 400) AS i
+            CREATE (r:Release {id: 'R' + i})
+            SET r.year = CASE WHEN i % 11 = 0 THEN null WHEN i % 13 = 0 THEN 0 WHEN i % 97 = 0 THEN -1 ELSE 1940 + (i * 7) % 80 END
+            WITH r, i
+            CALL (r, i) { UNWIND range(0, i % 3) AS k MATCH (g:Genre {name: 'G' + (1 + (i + k * 5) % 6)}) MERGE (r)-[:IS]->(g) }
+            CALL (r, i) { UNWIND range(0, i % 4) AS k MATCH (s:Style {name: 'S' + (1 + (i * 3 + k * 7) % 15)}) MERGE (r)-[:IS]->(s) }
+            """
+        )
+        await session.run(
+            """
+            CREATE (m:Master {id: 'M1', year: 1999}), (u:Release {id: 'U1'})
+            WITH m, u MATCH (g:Genre {name: 'G1'}), (s:Style {name: 'S1'}), (undated:Style {name: 'Undated'})
+            CREATE (m)-[:IS]->(g), (m)-[:IS]->(s), (u)-[:IS]->(undated)
+            """
+        )
+    monkeypatch.setattr(graphinator, "graph", neo4j_driver)
+    monkeypatch.setattr(graphinator, "MAINTENANCE_SETTLE_SECONDS", 0.0)
+    monkeypatch.setattr(graphinator, "GENRE_STYLE_STATS_PAGE_SIZE", 4)
+    token = graphinator._maintenance_run_key.set("integration-series")
+    try:
+        assert await graphinator.compute_genre_style_stats() is True
+    finally:
+        graphinator._maintenance_run_key.reset(token)
+
+    checked = 0
+    for node in ("Genre", "Style"):
+        stored = await rows(
+            neo4j_driver,
+            f"""MATCH (n:{node}) RETURN n.name AS name, n.release_years AS years, n.release_year_counts AS counts,
+                n.first_year AS first_year, n.release_count AS release_count ORDER BY name""",
+        )
+        for row in stored:
+            async with neo4j_driver.session(database="neo4j") as session:
+                live = await (await session.run(CATALOG_API_TRENDS[node], name=row["name"])).data()
+                releases = await (
+                    await session.run(f"MATCH (n:{node} {{name: $name}})<-[:IS]-(r:Release) RETURN count(DISTINCT r) AS v", name=row["name"])
+                ).single()
+            assert [(r["year"], r["count"]) for r in live] == list(zip(row["years"], row["counts"], strict=True)), f"{node} {row['name']}"
+            assert row["first_year"] == (live[0]["year"] if live else None), f"{node} {row['name']}"
+            assert row["release_count"] == releases["v"], f"{node} {row['name']}"
+            checked += bool(live)
+    assert checked >= 20, "the graph exercises real series, not only empty ones"
+    edge = await one(
+        neo4j_driver,
+        """MATCH (e:Genre {name: 'Empty'}), (u:Style {name: 'Undated'})
+           RETURN e.release_count AS erc, e.release_years AS eys, e.release_year_counts AS ecs, e.first_year AS efy,
+                  u.release_count AS urc, u.release_years AS uys, u.first_year AS ufy""",
+    )
+    assert edge == {"erc": 0, "eys": [], "ecs": [], "efy": None, "urc": 1, "uys": [], "ufy": None}
 
 
 # --- names carried by release references (stub nodes) ------------------------------------

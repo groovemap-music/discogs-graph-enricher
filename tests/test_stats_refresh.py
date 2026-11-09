@@ -180,9 +180,10 @@ async def test_the_stats_stamp_never_touches_maintained_at() -> None:
 
 
 def _sweeps(*, label: Any = None, artist: Any = None) -> tuple[Any, Any, AsyncMock]:
+    """Stand in for the two refresh steps: Genre/Style/Label stats (``label``) and Artist stats."""
     stamp = AsyncMock()
     return (
-        patch.object(g, "compute_label_stats", label or AsyncMock(return_value=True)),
+        patch.object(g, "compute_genre_style_stats", label or AsyncMock(return_value=True)),
         patch.object(g, "compute_artist_stats", artist or AsyncMock(return_value=True)),
         stamp,
     )
@@ -249,13 +250,18 @@ async def test_a_stamp_that_cannot_be_written_reports_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_label_only_sweep_leaves_genre_and_style_alone() -> None:
-
-    graph = FakePagedGraph(labels=["L1", "L2"], genres=["Rock"], styles=["Punk"])
-    with patch.object(g, "graph", graph):
-        assert await g.compute_label_stats() is True
+async def test_a_refresh_writes_the_genre_and_style_series_and_every_other_stat() -> None:
+    """STATS_VERSION 2 added the year series on Genre/Style, so a refresh has to sweep them too."""
+    graph = FakePagedGraph(labels=["L1", "L2"], genres=["Rock"], styles=["Punk"], artists=["1"])
+    stamp = AsyncMock()
+    with patch.object(g, "graph", graph), patch.object(g, "_stamp_stats_version", stamp):
+        assert await g.run_stats_refresh("20261101") is True
+    stamp.assert_awaited_once_with("20261101")
+    for key in ("Rock", "Punk"):
+        assert {"release_years", "release_year_counts", "first_year"} <= {p for k, p in graph.metric_sets if k == key}
     assert graph.label_pages[0] == ["L1", "L2"]
-    assert graph.metric_sets == []
+    assert graph.artist_pages[0] == ["1"]
+    assert set(graph.checkpoints) == {"genre_stats", "style_stats", "label_stats", "artist_stats"}
 
 
 @pytest.mark.asyncio
@@ -269,7 +275,7 @@ async def test_a_stop_is_not_swallowed_as_a_failed_sweep() -> None:
             with pytest.raises(mp.MaintenanceStopped):
                 await g.compute_artist_stats()
             with pytest.raises(mp.MaintenanceStopped):
-                await g.compute_label_stats()
+                await g.compute_genre_style_stats()
             with pytest.raises(mp.MaintenanceStopped):
                 await g._run_maintenance_step("artist_stats", g.compute_artist_stats)
     finally:
