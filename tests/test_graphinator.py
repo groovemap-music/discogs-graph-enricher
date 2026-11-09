@@ -1143,7 +1143,7 @@ class TestComputeGenreStyleStats:
 
     @pytest.mark.asyncio
     async def test_computes_stats_for_genres_styles_and_labels(self) -> None:
-        """Every Genre/Style gets all five aggregates, every Label is paged through."""
+        """Every Genre/Style gets all five aggregates and the year series, every Label is paged through."""
         from tests.fake_paged_graph import FakePagedGraph
 
         graph = FakePagedGraph(genres=["Rock"], styles=["Punk"], labels=["1", "2"])
@@ -1151,8 +1151,15 @@ class TestComputeGenreStyleStats:
             assert await compute_genre_style_stats() is True
 
         props = {p for k, p in graph.metric_sets if k == "Rock"}
-        assert props == {"release_count", "artist_count", "label_count", "style_count", "first_year"}
-        assert {p for k, p in graph.metric_sets if k == "Punk"} == {"release_count", "artist_count", "label_count", "genre_count", "first_year"}
+        series = {"release_years", "release_year_counts"}
+        assert props == {"release_count", "artist_count", "label_count", "style_count", "first_year"} | series
+        assert {p for k, p in graph.metric_sets if k == "Punk"} == {
+            "release_count",
+            "artist_count",
+            "label_count",
+            "genre_count",
+            "first_year",
+        } | series
         assert [n for page in graph.label_pages for n in page] == ["1", "2"]
         # No statement is a single whole-graph IN TRANSACTIONS sweep any more.
         assert not any("IN TRANSACTIONS" in c for c in graph.statements)

@@ -1007,9 +1007,10 @@ async def _stamp_stats_version(version: str) -> None:
 async def run_stats_refresh(version: str) -> bool:
     """Bring the stats of a stamped dump up to STATS_VERSION, retrying on failure.
 
-    Runs only the Label and Artist sweeps, under the same run key as a pass of this stats
-    version, so the checkpoints from older code do not skip them and a restart continues
-    after the last committed page. It leaves maintained_at, maintenance_status and
+    Runs every stats sweep (Genre, Style and Label, then Artist), so a dump stamped by any
+    older stats version gets everything it is missing, under the same run key as a pass of
+    this stats version, so the checkpoints from older code do not skip them and a restart
+    continues after the last committed page. It leaves maintained_at, maintenance_status and
     maintenance_error alone: the graph stays final for readers, and a failure is logged
     and retried at the next start rather than recorded against a stamped dump.
 
@@ -1021,7 +1022,7 @@ async def run_stats_refresh(version: str) -> bool:
     try:
         for attempt in range(1, POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS + 1):
             failed_steps: list[str] = []
-            for name, step in (("label_stats", compute_label_stats), ("artist_stats", compute_artist_stats)):
+            for name, step in (("genre_style_label_stats", compute_genre_style_stats), ("artist_stats", compute_artist_stats)):
                 if (step_failure := await _run_maintenance_step(name, step)) is not None:
                     failed_steps.append(step_failure)
             if not failed_steps:
@@ -1399,8 +1400,18 @@ ARTIST_STATS_PAGE_SIZE = 1000
 # The version of what the stats sweeps write. Bump it when a sweep's output changes:
 # ExtractionCompletion.stats_version then differs from this on the newest dump, and the
 # next start refreshes it (see resume_stats_refresh) instead of leaving the new values
-# missing until the next dump. 1 added the Artist stats and the HAS_STYLE edges.
-STATS_VERSION = 1
+# missing until the next dump. 1 added the Artist stats and the HAS_STYLE edges. 2 added
+# the per-year release series on Genre and Style.
+STATS_VERSION = 2
+
+# The per-year release series on every Genre and Style node, read by catalog-api's
+# trends. Two parallel integer lists, in this order: the years, ascending, each > 0
+# (a release with no year or year 0 is left out), and the number of the node's releases
+# in each of those years. A year with no releases is absent, not 0. A node with no dated
+# release has two empty lists. The series is written in the same transaction as
+# release_count and first_year (first_year is release_years[0]), so all of them describe
+# the same graph. See graphinator/README.md, "Genre/Style release series".
+RELEASE_YEAR_SERIES_PROPERTIES = ("release_years", "release_year_counts")
 
 # How often a running refresh asks Neo4j whether a newer dump has arrived. Arriving
 # messages are checked before every page; this read is throttled to keep pages cheap.
@@ -1429,26 +1440,49 @@ def _node_stat_metrics(node: str) -> list[tuple[tuple[str, ...], str]]:
     each becomes its own statement and transaction. The node is Genre or Style, and the
     "other" taxonomy is counted.
 
-    ``release_count`` is ``count(r)``, not ``count(DISTINCT r)``: the ``IS`` edge is
-    ``MERGE``d, so a release has at most one edge to a node (checked live on Rock, Pop,
-    Electronic, Folk/World/Country and Jazz: edges equal distinct releases), and the
-    distinct set only cost memory (286 MB for Rock). ``artist_count``, ``label_count``
-    and the other taxonomy's count share ONE expansion of each release: the cost of a
-    release is walking its relationship chain, which three separate statements did three
-    times over.
+    The first statement walks the node's releases once, grouped by ``r.year``, and from
+    those groups writes ``release_count``, the per-year series (``release_years`` and
+    ``release_year_counts``, see :data:`RELEASE_YEAR_SERIES_PROPERTIES`) and
+    ``first_year``. The groups are at most a few hundred rows, so it needs no memory
+    beyond the walk. ``first_year`` is the first year of the series, which replaced a
+    separate ``min(r.year)`` statement. ``release_count`` is the sum over every group,
+    the releases with no usable year included, so it is still ``count(r)``. No
+    ``DISTINCT`` is needed: the ``IS`` edge is ``MERGE``d, so a release has at most one
+    edge to a node (checked live on Rock, Pop, Electronic, Folk/World/Country and Jazz:
+    edges equal distinct releases), and the distinct set only cost memory (286 MB for
+    Rock). On lux the year groups took Rock from 14.3M db hits to 20.7M, the price of
+    reading ``r.year`` once per release. The series uses the same ``year > 0``
+    predicate and grouping as catalog-api's live trends traversal, so it equals that
+    traversal.
+
+    ``artist_count``, ``label_count`` and the other taxonomy's count share ONE expansion
+    of each release: the cost of a release is walking its relationship chain, which
+    three separate statements did three times over. A ``BY`` edge from a Release only
+    ever points at an Artist and an ``ON`` edge only at a Label (both are ``MERGE``d
+    against those labels in entity_projection and batch_projection), so those two need
+    no label check on the target. That took Rock from 248.0M db hits and 21.6 s to
+    232.6M and 18.8 s on lux, which pays for reading the year above.
     """
     other_label, other_prop = ("Style", "style_count") if node == "Genre" else ("Genre", "genre_count")
     return [
-        (("release_count",), "MATCH (n)<-[:IS]-(r:Release) RETURN count(r) AS v0"),
+        (
+            ("release_count", *RELEASE_YEAR_SERIES_PROPERTIES, "first_year"),
+            """MATCH (n)<-[:IS]-(r:Release)
+                WITH r.year AS year, count(*) AS releases
+                ORDER BY year
+                WITH sum(releases) AS v0,
+                    collect(CASE WHEN year > 0 THEN year END) AS v1,
+                    collect(CASE WHEN year > 0 THEN releases END) AS v2
+                RETURN v0, v1, v2, head(v1) AS v3""",
+        ),
         (
             ("artist_count", "label_count", other_prop),
             f"""MATCH (n)<-[:IS]-(r:Release)
                 OPTIONAL MATCH (r)-[x:BY|ON|IS]->(t)
-                RETURN count(DISTINCT CASE WHEN type(x) = 'BY' AND t:Artist THEN t END) AS v0,
-                    count(DISTINCT CASE WHEN type(x) = 'ON' AND t:Label THEN t END) AS v1,
+                RETURN count(DISTINCT CASE type(x) WHEN 'BY' THEN t END) AS v0,
+                    count(DISTINCT CASE type(x) WHEN 'ON' THEN t END) AS v1,
                     count(DISTINCT CASE WHEN type(x) = 'IS' AND t:{other_label} THEN t END) AS v2""",
         ),
-        (("first_year",), "MATCH (n)<-[:IS]-(r:Release) WHERE r.year > 0 RETURN min(r.year) AS v0"),
     ]
 
 
@@ -1572,10 +1606,11 @@ def build_artist_stats_page_cypher() -> str:
 
 
 async def compute_genre_style_stats() -> bool:
-    """Pre-compute aggregate counts and first_year on Genre, Style, and Label nodes.
+    """Pre-compute aggregate counts, first_year and the year series on Genre, Style, and Label nodes.
 
     Sets release_count, artist_count, label_count, style_count/genre_count,
-    and first_year properties on each Genre and Style node.  Also sets
+    first_year, and the per-year release series (release_years and
+    release_year_counts) on each Genre and Style node.  Also sets
     release_count, artist_count, genre_count on Label nodes, and the label's
     per-style release counts on its HAS_STYLE edges.
 
@@ -1584,6 +1619,8 @@ async def compute_genre_style_stats() -> bool:
       with a single property read (~3 DB hits).
     - first_year is read by genre-emergence, replacing a full IS edge scan
       (~184M DB hits) with an index seek (~100 DB hits).
+    - The year series is read by catalog-api's genre/style trends, replacing a
+      walk of every release of the node (20.7M DB hits for Rock).
     - Label counts are read by explore/label, replacing a 1.2M DB-hit
       traversal (for Reprise Records with 55K releases) with ~3 DB hits.
     - HAS_STYLE edges are read by /api/label/{id}/similar, which otherwise walks
@@ -1602,11 +1639,6 @@ async def compute_genre_style_stats() -> bool:
         step name; a failure does not skip the sweeps after it.
     """
     return await _run_stat_sweeps(("Genre", "Style", "Label"))
-
-
-async def compute_label_stats() -> bool:
-    """Run only the Label sweep of :func:`compute_genre_style_stats`, for a stats refresh."""
-    return await _run_stat_sweeps(("Label",))
 
 
 async def _run_stat_sweeps(node_labels: tuple[str, ...]) -> bool:
