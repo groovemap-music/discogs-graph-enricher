@@ -3,6 +3,16 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.9.0 (2026-11-10)
+
+### Release notes
+
+After the last label_stats page and before the dump's stats_version is stamped, a new rank phase numbers every real label by catalog-api's label-longevity order: years_active desc, total_releases desc, then l.id as a string. Eligibility is the same as catalog-api's: a name, at least one dated release, and not a placeholder. Each label's rank is stored as `l.longevity_rank` (1..M). M is stored once, on the dump's ExtractionCompletion node, as `label_longevity_rank_of`. A label that is no longer eligible has its rank removed. Only changed ranks are written, in 10k-label transactions, so a rerun on unchanged stats writes nothing. STATS_VERSION is 4, so the first start after deploy runs one full stats sweep plus the rank phase (benchmarked locally at about 42 s for the first write and 5 s for a rerun, at lux's label count). The rank read holds about 420 MB of Neo4j transaction memory and must finish inside the transaction timeout. The placeholder constants are pinned to catalog-api by a contract check. catalog-api will serve the rank once its node_label change ships (gm-catalog-api-gkcu). No database-schema dependency.
+
+### Feat
+
+- **stats**: store each real label's longevity rank and the ranked count
+
 ## v0.8.0 (2026-11-09)
 
 ### Release notes
