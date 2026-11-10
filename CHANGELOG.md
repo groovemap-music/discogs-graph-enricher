@@ -3,6 +3,16 @@
 All notable changes to this repository will be recorded here by Commitizen from
 Conventional Commits.
 
+## v0.8.0 (2026-11-09)
+
+### Release notes
+
+Label nodes gain stored longevity fields computed in the existing label_stats walk: first_year, last_year, years_active, total_releases (dated releases, year > 0) and peak_decade (earliest decade on a tie), matching catalog-api's /api/insights/label-longevity definitions; a label with no dated release stores total_releases = 0 and none of the others. Documented in graphinator/README.md under "Label longevity". STATS_VERSION is 3, so the first start after deploy runs one full stats sweep; catalog-api reads the stored fields once the newest ExtractionCompletion has stats_version >= 3 and falls back to a live traversal otherwise. The label_stats step reads about 4-5% more (an estimated 15-25 s on a 165 s step); the overall sweep stays shorter than before v0.7.0. No schema dependency.
+
+### Feat
+
+- **stats**: store label longevity on Label
+
 ## v0.7.0 (2026-11-09)
 
 ### Release notes
