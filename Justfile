@@ -17,6 +17,10 @@ lint:
 contract-check:
     uv run python scripts/check-contracts.py
 
+# Compares the pinned placeholder-label constants with catalog-api on GitHub (needs the network).
+contract-upstream:
+    uv run python scripts/check-label-placeholders-upstream.py
+
 secret-scan:
     gitleaks git --redact --no-banner
     gitleaks dir . --redact --no-banner

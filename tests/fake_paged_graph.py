@@ -22,8 +22,9 @@ def timeout_error() -> Neo4jError:
 
 
 class _Result:
-    def __init__(self, rows: list[dict[str, Any]]) -> None:
+    def __init__(self, rows: list[dict[str, Any]], properties_set: int = 0) -> None:
         self._rows = rows
+        self._properties_set = properties_set
 
     async def single(self) -> dict[str, Any] | None:
         return self._rows[0] if self._rows else None
@@ -36,7 +37,9 @@ class _Result:
         return gen()
 
     async def consume(self) -> MagicMock:
-        return MagicMock()
+        summary = MagicMock()
+        summary.counters.properties_set = self._properties_set
+        return summary
 
 
 class FakePagedGraph:
@@ -62,6 +65,11 @@ class FakePagedGraph:
         self.metric_sets: list[tuple[str, str]] = []  # (key, property)
         self.page_sizes: list[int] = []
         self.statements: list[str] = []
+        # Labels in the longevity-rank read's order, before numbering: {"id", "ranked", "longevity_rank"}.
+        self.rank_rows: list[dict[str, Any]] = []
+        self.rank_writes: list[list[dict[str, Any]]] = []
+        self.rank_of: dict[str, int] = {}  # version -> label_longevity_rank_of
+        self.missing_dumps: set[str] = set()  # versions with no ExtractionCompletion node
         self.fail: Any = None  # callable(kind, params) -> exception | None
         self.timeouts_seen: list[Any] = []
 
@@ -96,6 +104,28 @@ class FakePagedGraph:
                 "started_at": params.get("started_at"),
             }
             return _Result([{"written": 1}])
+        if "AS ranked_count" in cypher:
+            self._maybe_fail("rank_read", params)
+            # The statement's result: a header row with M, then each label whose stored rank
+            # differs from its position among ``rank_rows`` (eligible first, then the rest).
+            ranked = [r for r in self.rank_rows if r["ranked"]]
+            ordered = ranked + [r for r in self.rank_rows if not r["ranked"]]
+            out: list[dict[str, Any]] = [{"position": 0, "id": None, "rank": None, "ranked_count": len(ranked)}]
+            for position, label in enumerate(ordered, start=1):
+                rank = position if position <= len(ranked) else None
+                if label["longevity_rank"] != rank:
+                    out.append({"position": position, "id": label["id"], "rank": rank, "ranked_count": len(ranked)})
+            return _Result(out)
+        if "SET l.longevity_rank" in cypher:
+            self._maybe_fail("rank_write", params)
+            self.rank_writes.append(list(params["rows"]))
+            return _Result([], properties_set=len(params["rows"]))
+        if "SET m.label_longevity_rank_of" in cypher:
+            self._maybe_fail("rank_of", params)
+            if params["version"] in self.missing_dumps:
+                return _Result([{"stored": 0}])
+            self.rank_of[params["version"]] = params["rank_of"]
+            return _Result([{"stored": 1}])
         if "MATCH (p:Person)" in cypher:
             return self._page("person", self.persons, self.person_pages, params)
         if "MATCH (l:Label)" in cypher:

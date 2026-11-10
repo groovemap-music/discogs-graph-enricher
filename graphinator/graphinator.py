@@ -29,7 +29,7 @@ from common.telemetry import setup_telemetry, shutdown_telemetry, start_event_lo
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from orjson import loads
 
-from graphinator import maintenance_paging
+from graphinator import label_longevity_rank, maintenance_paging
 from graphinator import telemetry as gm_telemetry
 from graphinator.batch_processor import DEFAULT_MAX_HOLD_S, DEFAULT_MAX_PENDING, PENDING_PER_PREFETCH, BatchConfig, Neo4jBatchProcessor
 from graphinator.batch_processor import DEFAULT_MAX_REQUEUES as BATCH_DEFAULT_MAX_REQUEUES
@@ -1018,6 +1018,7 @@ async def run_stats_refresh(version: str) -> bool:
         True if the stats are current and stamped; False if the refresh failed or stopped.
     """
     run_key_token = _maintenance_run_key.set(maintenance_run_key(version))
+    version_token = _maintenance_version.set(version)
     guard_token = _maintenance_before_page.set(_stop_if_superseded(version))
     try:
         for attempt in range(1, POST_IMPORT_MAINTENANCE_MAX_ATTEMPTS + 1):
@@ -1040,6 +1041,7 @@ async def run_stats_refresh(version: str) -> bool:
         logger.error("❌ Stats refresh could not complete — it continues at the next start", version=version, error=str(e))
     finally:
         _maintenance_before_page.reset(guard_token)
+        _maintenance_version.reset(version_token)
         _maintenance_run_key.reset(run_key_token)
     return False
 
@@ -1267,9 +1269,11 @@ async def run_post_import_maintenance(version: str | None = None) -> bool:
     # current.
     run_key = maintenance_run_key(version) if version is not None else f"adhoc-{time.time_ns()}"
     token = _maintenance_run_key.set(run_key)
+    version_token = _maintenance_version.set(version)
     try:
         return await _run_post_import_maintenance_attempts(version, failure)
     finally:
+        _maintenance_version.reset(version_token)
         _maintenance_run_key.reset(token)
 
 
@@ -1402,7 +1406,8 @@ ARTIST_STATS_PAGE_SIZE = 1000
 # next start refreshes it (see resume_stats_refresh) instead of leaving the new values
 # missing until the next dump. 1 added the Artist stats and the HAS_STYLE edges. 2 added
 # the per-year release series on Genre and Style. 3 added the longevity fields on Label.
-STATS_VERSION = 3
+# 4 added each real label's longevity_rank and the dump's label_longevity_rank_of.
+STATS_VERSION = 4
 
 # The per-year release series on every Genre and Style node, read by catalog-api's
 # trends. Two parallel integer lists, in this order: the years, ascending, each > 0
@@ -1420,6 +1425,10 @@ STATS_REFRESH_VERSION_CHECK_SECONDS = 30.0
 # Identifies the run being maintained to the checkpoints (the dump version). ``None``
 # outside run_post_import_maintenance, which disables checkpoint persistence.
 _maintenance_run_key: contextvars.ContextVar[str | None] = contextvars.ContextVar("maintenance_run_key", default=None)
+
+# The dump version a pass or refresh is maintaining, whose ExtractionCompletion node takes
+# label_longevity_rank_of. ``None`` for an unversioned run, which has no node to write it on.
+_maintenance_version: contextvars.ContextVar[str | None] = contextvars.ContextVar("maintenance_version", default=None)
 
 # Runs before every page of a sweep. Set only by a stats refresh, which has to stop if a
 # new dump starts writing; a full maintenance pass runs after the writers have drained.
@@ -1642,6 +1651,9 @@ async def compute_genre_style_stats() -> bool:
       traversal (for Reprise Records with 55K releases) with ~3 DB hits.
     - HAS_STYLE edges are read by /api/label/{id}/similar, which otherwise walks
       every release of a style (19.6M DB hits for Pop Rock).
+    - After the last Label page, every real label's ``longevity_rank`` and the
+      ranked count on the dump's node (see :func:`compute_label_longevity_ranks`),
+      read by catalog-api for graph-explorer's "#N of M".
 
     Resumable: each of Genre, Style and Label is a keyed-page sweep checkpointed after
     every page (see :mod:`graphinator.maintenance_paging`), so no single transaction is
@@ -1689,6 +1701,7 @@ async def _run_stat_sweeps(node_labels: tuple[str, ...]) -> bool:
     }
 
     ok = True
+    label_stats_ok = False
     for index, node_label in enumerate(node_labels):
         process_page, page_size = available[node_label]
         if index:
@@ -1705,6 +1718,7 @@ async def _run_stat_sweeps(node_labels: tuple[str, ...]) -> bool:
                 before_page=before_page,
             )
             logger.info(f"✅ {node_label} stats computed", step=step, processed=processed)
+            label_stats_ok = label_stats_ok or node_label == "Label"
         except maintenance_paging.MaintenanceStopped:
             raise
         except Exception as e:
@@ -1713,7 +1727,75 @@ async def _run_stat_sweeps(node_labels: tuple[str, ...]) -> bool:
             logger.error(f"❌ Failed to compute {node_label} stats", step=step, error=str(e))
             ok = False
 
+    # The ranking reads every label's longevity, so it waits for the last Label page. A
+    # failed Label sweep skips it: the stamp is withheld anyway, and the retry ranks.
+    if label_stats_ok:
+        ok = await compute_label_longevity_ranks() and ok
+
     return ok
+
+
+async def compute_label_longevity_ranks() -> bool:
+    """Rank every real label by longevity and store M on the dump being maintained.
+
+    See :mod:`graphinator.label_longevity_rank`. Runs after every Label page and before the
+    dump's ``stats_version`` is stamped, so ``stats_version >= 4`` means the ranks agree with
+    the stored longevity. M goes once on the dump's ExtractionCompletion node as
+    ``label_longevity_rank_of``, never on each label, where one more ranked label would
+    rewrite them all.
+
+    Returns:
+        True if every rank (and M, for a versioned run) was written, False if not (logged).
+    """
+    if graph is None:
+        return True
+
+    step = "label_longevity_rank"
+    started = time.monotonic()
+    logger.info("📊 Ranking labels by longevity...", step=step)
+    try:
+        result = await label_longevity_rank.compute_label_longevity_ranks(graph, before_batch=_maintenance_before_page.get())
+        version = _maintenance_version.get()
+        if version is not None:
+            await _store_label_longevity_rank_of(version, result.ranked)
+    except maintenance_paging.MaintenanceStopped:
+        raise
+    except Exception as e:
+        logger.error("❌ Failed to rank labels by longevity", step=step, error=str(e))
+        return False
+
+    logger.info(
+        "✅ Labels ranked by longevity",
+        step=step,
+        ranked=result.ranked,
+        properties_written=result.written,
+        write_batches=result.batches,
+        stored_on_version=version,
+        duration_seconds=round(time.monotonic() - started, 3),
+    )
+    return True
+
+
+async def _store_label_longevity_rank_of(version: str, rank_of: int) -> None:
+    """Record M on ``version``'s ExtractionCompletion node, only when it changed."""
+    if graph is None:
+        raise RuntimeError("Neo4j driver is not initialized")
+
+    async with extraction_latch_lock, graph.session(database="neo4j") as session:
+        result = await session.run(
+            """
+            MATCH (m:ExtractionCompletion {version: $version})
+            FOREACH (_ IN CASE WHEN m.label_longevity_rank_of IS NULL OR m.label_longevity_rank_of <> $rank_of THEN [1] ELSE [] END |
+                SET m.label_longevity_rank_of = $rank_of)
+            RETURN count(m) AS stored
+            """,
+            version=version,
+            rank_of=rank_of,
+        )
+        record = await result.single()
+        await result.consume()
+    if record is None or not record["stored"]:
+        raise RuntimeError(f"No ExtractionCompletion node for version {version!r} to store label_longevity_rank_of on")
 
 
 async def compute_artist_stats() -> bool:

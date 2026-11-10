@@ -5,6 +5,8 @@ import tomllib
 from hashlib import sha256
 from pathlib import Path
 
+from label_placeholders import constants_in, pin
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -33,3 +35,13 @@ assert runtime_attestation["compatibility_baseline"] == compatibility["applicati
 assert runtime_attestation["source_repository"] == "https://github.com/groovemap-music/python-libraries"
 assert len(runtime_attestation["source_tree"]) == 40
 assert set(runtime_attestation["source_tree"]) <= set("0123456789abcdef")
+
+label_placeholders = pin()
+assert label_placeholders["producer_repository"] == "https://github.com/groovemap-music/catalog-api"
+assert len(label_placeholders["producer_commit"]) == 40
+assert set(label_placeholders["producer_commit"]) <= set("0123456789abcdef")
+consumer = constants_in((ROOT / label_placeholders["consumer_module"]).read_text())
+assert consumer == label_placeholders["constants"], (
+    f"{label_placeholders['consumer_module']} carries placeholder-label constants that differ from catalog-api's "
+    f"at {label_placeholders['producer_commit']}: {consumer} != {label_placeholders['constants']}"
+)
