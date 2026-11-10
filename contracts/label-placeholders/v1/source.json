@@ -1,0 +1,13 @@
+{
+  "constants": {
+    "PLACEHOLDER_LABEL_IDS": ["1818"],
+    "PLACEHOLDER_LABEL_NAME": "(?is)not on label *[(\\[{].*|.*not on label.*self.?release.*",
+    "REAL_LABELS_NAMED_LIKE_PLACEHOLDERS": ["109707", "2614996"]
+  },
+  "consumer_module": "graphinator/label_longevity_rank.py",
+  "note": "catalog-api's placeholder-label rule, which decides which labels its label-longevity ranking leaves out. graphinator/label_longevity_rank.py must carry the same values, or the stored longevity_rank disagrees with /api/insights/label-longevity from the first label the rules disagree on. scripts/check-contracts.py compares the module with these values offline; scripts/check-label-placeholders-upstream.py compares these values with catalog-api at producer_commit and at its default branch.",
+  "producer_commit": "6623029b2f1ee7a0cfbbe860cd1c980b6d21d031",
+  "producer_path": "api/queries/insights_neo4j_queries.py",
+  "producer_repository": "https://github.com/groovemap-music/catalog-api",
+  "producer_sha256": "94bfeb776b6e4f4068b0f668505d8dbb19660ccb43d16d24e571f56b364b1ef9"
+}

@@ -14,6 +14,7 @@ from neo4j import AsyncDriver, AsyncGraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 
 import graphinator.graphinator as graphinator
+from graphinator import label_longevity_rank
 from graphinator.batch_processor import BatchConfig, Neo4jBatchProcessor, PendingMessage
 from graphinator.entity_projection import process_artist, process_label, process_release
 from graphinator.person_credits import CREDIT_COUNT_PROPERTIES, build_credit_count_page_cypher
@@ -1096,6 +1097,153 @@ async def test_label_longevity_equals_catalog_apis_live_statement(neo4j_driver: 
     assert (await rows(neo4j_driver, "MATCH (l:Label {id: 'A'}) RETURN l.last_year AS ly, l.total_releases AS tr"))[0] == {"ly": 2020, "tr": 5}
 
 
+# catalog-api's label-longevity statement verbatim (api/queries/insights_neo4j_queries.py,
+# _LABEL_LONGEVITY_CYPHER, at the commit pinned in contracts/label-placeholders/v1/source.json),
+# run with its own placeholder rule: what /api/insights/label-longevity ranks.
+CATALOG_API_LABEL_LONGEVITY_RANKED = """
+MATCH (l:Label)
+WHERE l.name IS NOT NULL
+WITH l, l.id IN $placeholder_ids
+        OR (l.name =~ $placeholder_name AND NOT l.id IN $real_lookalike_ids) AS is_placeholder
+WHERE is_placeholder = $placeholders
+CALL (l) {
+  MATCH (r:Release)-[:ON]->(l)
+  WHERE r.year > 0
+  RETURN min(r.year) AS first_year, max(r.year) AS last_year, count(DISTINCT r) AS total_releases
+}
+WITH l, is_placeholder, first_year, last_year, total_releases, last_year - first_year + 1 AS years_active
+WHERE total_releases > 0
+ORDER BY years_active DESC, total_releases DESC, l.id
+LIMIT $limit
+CALL (l) {
+  MATCH (r:Release)-[:ON]->(l)
+  WHERE r.year > 0
+  WITH (r.year / 10) * 10 AS decade, count(DISTINCT r) AS decade_count
+  ORDER BY decade_count DESC, decade
+  LIMIT 1
+  RETURN decade AS peak_decade
+}
+RETURN l.id AS label_id, l.name AS label_name,
+       first_year, last_year, years_active,
+       total_releases, peak_decade, is_placeholder
+"""
+
+# 78 generated labels whose years and releases tie in many groups across ids of different
+# lengths ('45' and '5' tie, and '45' ranks first as a string), and the hand-made cases: '10'
+# and '9' tie at the top, Not On Label (1818) and a "Not On Label (Artist)" holding area would
+# outrank them but are placeholders, Not On Label (2) and (3) are real labels named like one,
+# and a label with no name, one with only undated releases and one with no release at all.
+LABEL_RANK_SEED = """
+UNWIND [i IN range(1, 80) WHERE NOT i IN [9, 10]] AS i
+CREATE (l:Label {id: toString(i), name: 'Label ' + i})
+WITH l, i, 1960 + i % 3 AS first, i % 5 AS span, 1 + i % 4 AS releases
+UNWIND range(0, releases - 1) AS k
+CREATE (:Release {id: l.id + '-' + k, year: first + CASE WHEN k = releases - 1 THEN span ELSE 0 END})-[:ON]->(l)
+WITH count(*) AS _
+UNWIND [
+  {id: '10', name: 'Ten', years: [1900, 1950, 2020]},
+  {id: '9', name: 'Nine', years: [1900, 1960, 2020]},
+  {id: '1818', name: 'Not On Label', years: [1890, 2025]},
+  {id: '555', name: 'Not On Label (Some Artist)', years: [1890, 2025]},
+  {id: '109707', name: 'Not On Label (2)', years: [1910, 2020]},
+  {id: '2614996', name: 'Not On Label (3)', years: [1990, 2000]},
+  {id: '9001', name: null, years: [1800, 2025]},
+  {id: '9002', name: 'Undated', years: [0, 0]},
+  {id: '9003', name: 'Empty', years: []}
+] AS spec
+CREATE (l:Label {id: spec.id})
+SET l.name = spec.name
+WITH l, spec
+UNWIND CASE WHEN size(spec.years) = 0 THEN [null] ELSE range(0, size(spec.years) - 1) END AS k
+WITH l, spec, k WHERE k IS NOT NULL
+CREATE (:Release {id: l.id + '-' + k, year: spec.years[k]})-[:ON]->(l)
+"""
+
+STORED_LABEL_RANKS = """
+MATCH (l:Label) WHERE l.longevity_rank IS NOT NULL
+RETURN l.id AS label_id, l.longevity_rank AS rank
+ORDER BY rank
+"""
+
+
+async def catalog_api_ranking(driver: AsyncDriver, limit: int) -> list[str]:
+    """The label ids catalog-api ranks, in its order, under its own placeholder rule."""
+    async with driver.session(database="neo4j") as session:
+        result = await session.run(
+            CATALOG_API_LABEL_LONGEVITY_RANKED,
+            limit=limit,
+            placeholders=False,
+            placeholder_ids=list(label_longevity_rank.PLACEHOLDER_LABEL_IDS),
+            placeholder_name=label_longevity_rank.PLACEHOLDER_LABEL_NAME,
+            real_lookalike_ids=list(label_longevity_rank.REAL_LABELS_NAMED_LIKE_PLACEHOLDERS),
+        )
+        return [record["label_id"] async for record in result]
+
+
+async def rank_labels_for_dump(driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch, run_key: str) -> None:
+    """Run the Label sweep and its ranking as a pass for DUMP would, so M lands on DUMP's node."""
+    token = graphinator._maintenance_version.set(DUMP)
+    try:
+        await run_artist_and_label_stats(driver, monkeypatch, run_key)
+    finally:
+        graphinator._maintenance_version.reset(token)
+
+
+async def rank_of(driver: AsyncDriver) -> Any:
+    return (await one(driver, "MATCH (m:ExtractionCompletion {version: $version}) RETURN m.label_longevity_rank_of AS m", version=DUMP))["m"]
+
+
+@pytest.mark.asyncio
+async def test_label_longevity_ranks_equal_catalog_apis_ranking(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ranks 1-50 are catalog-api's top 50, ties and string ids included; M is the ranked count."""
+    await rows(neo4j_driver, LABEL_RANK_SEED)
+    async with neo4j_driver.session(database="neo4j") as session:
+        await (await session.run("CREATE (:ExtractionCompletion {version: $version})", version=DUMP)).consume()
+    # Several write transactions, the last one partial.
+    monkeypatch.setattr(label_longevity_rank, "RANK_WRITE_BATCH_SIZE", 9)
+    await rank_labels_for_dump(neo4j_driver, monkeypatch, "rank-run")
+
+    stored = await rows(neo4j_driver, STORED_LABEL_RANKS)
+    everyone = await catalog_api_ranking(neo4j_driver, limit=1000)
+    assert len(everyone) == 82
+    assert [r["label_id"] for r in stored if r["rank"] <= 50] == await catalog_api_ranking(neo4j_driver, limit=50)
+    # Every eligible label, ordinal 1..M with no gap or shared place, and M on the dump.
+    assert [r["label_id"] for r in stored] == everyone
+    assert [r["rank"] for r in stored] == list(range(1, 83))
+    assert await rank_of(neo4j_driver) == 82
+
+    ranks = {r["label_id"]: r["rank"] for r in stored}
+    # Tied on years and releases: the string id decides, so '10' before '9' and '45' before '5'.
+    assert (ranks["10"], ranks["9"], ranks["109707"]) == (1, 2, 3)
+    assert ranks["45"] < ranks["5"]
+    tie = await rows(neo4j_driver, "MATCH (l:Label) WHERE l.id IN ['5', '45'] RETURN DISTINCT l.years_active AS y, l.total_releases AS n")
+    assert len(tie) == 1, "the seed must tie '5' and '45'"
+    # Placeholders, the unnamed, the undated and the empty are not ranked; real look-alikes are.
+    unranked = await rows(neo4j_driver, "MATCH (l:Label) WHERE l.longevity_rank IS NULL RETURN l.id AS id ORDER BY id")
+    assert [r["id"] for r in unranked] == ["1818", "555", "9001", "9002", "9003"]
+    assert "2614996" in ranks
+
+    # A rerun over unchanged stats writes nothing.
+    again = await label_longevity_rank.compute_label_longevity_ranks(neo4j_driver)
+    assert again == label_longevity_rank.RankResult(ranked=82, written=0, batches=0)
+
+    # Labels that lose eligibility lose their rank, and everyone below moves up.
+    await rows(
+        neo4j_driver,
+        """MATCH (renamed:Label {id: '10'}), (unnamed:Label {id: '45'}), (undated:Label {id: '20'})
+           SET renamed.name = 'Not On Label (Ten Self-Released)'
+           REMOVE unnamed.name
+           WITH undated MATCH (r:Release)-[:ON]->(undated) SET r.year = 0""",
+    )
+    await rank_labels_for_dump(neo4j_driver, monkeypatch, "rank-run-2")
+    stored = await rows(neo4j_driver, STORED_LABEL_RANKS)
+    assert [r["label_id"] for r in stored] == await catalog_api_ranking(neo4j_driver, limit=1000)
+    assert [r["rank"] for r in stored] == list(range(1, 80))
+    assert not {"10", "45", "20"} & {r["label_id"] for r in stored}
+    assert stored[0] == {"label_id": "9", "rank": 1}
+    assert await rank_of(neo4j_driver) == 79
+
+
 @pytest.mark.asyncio
 async def test_a_later_pass_follows_the_graph_and_an_unchanged_one_writes_nothing(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
     """A removed style loses its edge, a lost genre loses its property, and a rerun is free."""
@@ -1533,6 +1681,9 @@ async def test_a_restart_on_a_stamped_dump_writes_the_stats_and_keeps_the_stamp(
         "error": None,
         "stats_version": graphinator.STATS_VERSION,
     }
+    # The refresh ranks too, and records M on the dump it refreshed: no label in this seed has a
+    # name and a dated release, so none is ranked and M is 0, not absent.
+    assert await rank_of(stamped_dump) == 0
     # The steps a refresh has no business repeating keep their checkpoints.
     assert await rows(stamped_dump, "MATCH (c:MaintenanceCheckpoint {step: 'person_credit_counts'}) RETURN c.run_key AS key") == [{"key": DUMP}]
 

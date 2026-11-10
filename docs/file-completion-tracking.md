@@ -137,6 +137,7 @@ per `version`:
 | `maintenance_error` | Truncated reason from a pass that failed every retry. Cleared by a later success. Never coexists with a failure recorded after `maintained_at`: a stamped node is not modified by later failures. |
 | `maintenance_failed_at` | When `maintenance_error` was recorded. |
 | `stats_version` | The `STATS_VERSION` the dump's stats were last written at. See [the stats refresh](#stats-refresh-on-a-stamped-dump-stats_version). |
+| `label_longevity_rank_of` | M, the number of labels carrying a `longevity_rank`, written by the dump's pass or stats refresh. See [Label longevity](../graphinator/README.md#label-longevity). |
 
 Guarantees:
 
@@ -192,6 +193,10 @@ trigger: there is no manual step. Bump `STATS_VERSION` whenever a sweep's output
 - `STATS_VERSION` 3 added the Label longevity fields (`first_year`, `last_year`, `years_active`,
   `total_releases`, `peak_decade`). A reader of those requires `stats_version >= 3`, and falls back to the
   live traversal on a label with no `total_releases`. See
+  [Label longevity](../graphinator/README.md#label-longevity).
+- `STATS_VERSION` 4 added `longevity_rank` on each ranked Label and `label_longevity_rank_of` (M)
+  on the dump's `ExtractionCompletion` node. The ranking runs after the last Label page and
+  before the stamp, so a reader of either requires `stats_version >= 4`. See
   [Label longevity](../graphinator/README.md#label-longevity).
 
 ### Deploying `STATS_VERSION` 1

@@ -398,6 +398,7 @@ ORDER BY year
 | `artist_count`  | Number of distinct artists on this label               |
 | `genre_count`   | Number of distinct genres across this label's releases |
 | `first_year`, `last_year`, `years_active`, `total_releases`, `peak_decade` | Longevity (see [Label longevity](#label-longevity)) |
+| `longevity_rank` | The label's place in catalog-api's longevity ranking (see [Label longevity](#label-longevity)) |
 
 #### Label longevity
 
@@ -411,13 +412,21 @@ Five integer properties on every Label, which catalog-api's `/api/insights/label
 | `total_releases` | The number of the label's releases with `year > 0` (not `release_count`, which counts every release) |
 | `peak_decade`    | The decade, `(year / 10) * 10` in integer division, with the most dated releases; a tie goes to the earliest decade |
 
-The definitions are those of catalog-api's `_LABEL_LONGEVITY_CYPHER` (`api/queries/insights_neo4j_queries.py`): `(r:Release)-[:ON]->(l)`, `r.year > 0`, Masters not counted. Placeholder labels and unnamed stubs are catalog-api's rule, not stored here.
+The definitions are those of catalog-api's `_LABEL_LONGEVITY_CYPHER` (`api/queries/insights_neo4j_queries.py`): `(r:Release)-[:ON]->(l)`, `r.year > 0`, Masters not counted. These five are written on every label, placeholders and unnamed stubs included; catalog-api's placeholder rule applies only to `longevity_rank`, below.
 
 - A label with no dated release has `total_releases = 0` and no `first_year`, `last_year`, `years_active` or `peak_decade`. catalog-api's `total_releases > 0` filter drops it either way.
 - Scalars rather than a per-year series: the label page needs only these five, and a series on 2.43M labels would be stored for nearly nobody's benefit.
 - All of them are written in the same statement as `release_count`, from one walk of the label's releases grouped by year, so they describe the same graph. Each is written only when it differs.
 
-**Reading it safely.** `total_releases` absent means the label has not been swept by code that writes longevity (a graph stamped before `stats_version` 3, or the pass still running): fall back to the live traversal. It is current for the whole graph once the newest `ExtractionCompletion` node has `maintained_at` and `stats_version >= 3`. A deploy that raises `stats_version` refreshes the newest dump at start-up, so the fields appear without waiting for the next dump. Like every stored stat, they can be one dump old while a new dump is importing.
+**Longevity rank.** `longevity_rank` is the label's place, 1 to M, in catalog-api's label-longevity ranking, so graph-explorer can show "#N of M" on any label without ranking 2.43M labels per request. M, the number of ranked labels, is `label_longevity_rank_of` on the dump's `ExtractionCompletion` node (the one `maintained_at` and `stats_version` are on), not on each label, where one more ranked label would rewrite them all.
+
+- **Ranked:** a label with a name, `total_releases > 0`, and not a placeholder by catalog-api's rule (`PLACEHOLDER_LABEL_IDS`, `PLACEHOLDER_LABEL_NAME` and `REAL_LABELS_NAMED_LIKE_PLACEHOLDERS`, carried in `graphinator/label_longevity_rank.py`). Every other label has no `longevity_rank`, and a label that stops qualifying loses it.
+- **Order:** `years_active` descending, then `total_releases` descending, then `l.id` ascending as a string (so `'10'` ranks before `'9'`), exactly as `_LABEL_LONGEVITY_CYPHER` orders. The rank is ordinal: no gaps and no shared places, so `longevity_rank = N` is the Nth row `/api/insights/label-longevity` returns with placeholders left out.
+- **When:** a global ranking cannot come from the keyed Label pages, so it runs once after the last Label page and before `stats_version` is stamped. One statement reads the ranked labels in order; a rank is written only when it changed, in batches of 10,000 per transaction, so a rerun on unchanged data writes nothing.
+- **Pinned rule:** `contracts/label-placeholders/v1/source.json` pins the placeholder constants to a catalog-api commit, and `just check` fails when the module's differ from it. `just contract-upstream` compares the pin with catalog-api on GitHub at that commit and on `main`. When catalog-api changes its rule, change the constants, re-pin, and bump `STATS_VERSION`.
+- Finding the label with a given rank, or listing the top N by rank, needs a range index on `Label.longevity_rank`, which belongs to `database-schema`. Reading one label's rank needs none.
+
+**Reading it safely.** `total_releases` absent means the label has not been swept by code that writes longevity (a graph stamped before `stats_version` 3, or the pass still running): fall back to the live traversal. It is current for the whole graph once the newest `ExtractionCompletion` node has `maintained_at` and `stats_version >= 3`. A deploy that raises `stats_version` refreshes the newest dump at start-up, so the fields appear without waiting for the next dump. Like every stored stat, they can be one dump old while a new dump is importing. `longevity_rank` and `label_longevity_rank_of` need `stats_version >= 4` on that same node: below it, a label's rank may be absent or describe older stats, so rank live.
 
 **Label style counts** — `(:Label)-[:HAS_STYLE {release_count}]->(:Style)`, one edge per style of the label's releases with no cap on styles. `release_count` is the number of the label's releases in that style. It is an edge rather than list properties so a reader can go from a style to the labels carrying it without scanning every Label. A label with no styles has no edges, and an edge for a style the label has lost is deleted by the next pass. The edges are derived from `ON` and `IS`, so they never keep an otherwise orphaned stub Label alive.
 
