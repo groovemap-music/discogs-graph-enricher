@@ -692,9 +692,10 @@ async def test_sweeps_write_only_properties_that_changed(neo4j_driver: AsyncDriv
     person_page = build_credit_count_page_cypher()
     label_page = graphinator.build_label_stats_page_cypher()
 
-    # First pass writes every property: 8 on the one person, 3 on the one label.
+    # First pass writes every property: 8 on the one person, 4 on the one label (its three counts
+    # and total_releases = 0: the label has no dated release, so no first_year and the like).
     assert await run_page(neo4j_driver, person_page) == len(CREDIT_COUNT_PROPERTIES)
-    assert await run_page(neo4j_driver, label_page) == 3
+    assert await run_page(neo4j_driver, label_page) == 4
     flood = await credit_counts(neo4j_driver, "Flood")
     assert flood == expected(2, production=1, engineering=1, session=1)
 
@@ -1019,6 +1020,80 @@ async def test_label_style_edges_equal_the_live_counts(neo4j_driver: AsyncDriver
     labels = await rows(neo4j_driver, "MATCH (l:Label {id: 'L3'}) RETURN l.release_count AS rc, l.artist_count AS ac, l.genre_count AS gc")
     assert labels == [{"rc": 0, "ac": 0, "gc": 0}]
     assert await rows(neo4j_driver, "MATCH (:Label {id: 'L3'})-[h:HAS_STYLE]->() RETURN h") == []
+
+
+# catalog-api's label-longevity statement (api/queries/insights_neo4j_queries.py,
+# _LABEL_LONGEVITY_CYPHER) without the ranking, placeholder rule and LIMIT, so it runs for every label.
+CATALOG_API_LABEL_LONGEVITY = """
+MATCH (l:Label)
+CALL (l) {
+  MATCH (r:Release)-[:ON]->(l)
+  WHERE r.year > 0
+  RETURN min(r.year) AS first_year, max(r.year) AS last_year, count(DISTINCT r) AS total_releases
+}
+CALL (l) {
+  MATCH (r:Release)-[:ON]->(l)
+  WHERE r.year > 0
+  WITH (r.year / 10) * 10 AS decade, count(DISTINCT r) AS decade_count
+  ORDER BY decade_count DESC, decade
+  LIMIT 1
+  RETURN decade AS peak_decade
+}
+WITH l, first_year, last_year, total_releases, peak_decade
+WHERE total_releases > 0
+RETURN l.id AS id, first_year, last_year, last_year - first_year + 1 AS years_active, total_releases, peak_decade
+ORDER BY id
+"""
+
+STORED_LABEL_LONGEVITY = """
+MATCH (l:Label) WHERE l.total_releases > 0
+RETURN l.id AS id, l.first_year AS first_year, l.last_year AS last_year, l.years_active AS years_active,
+       l.total_releases AS total_releases, l.peak_decade AS peak_decade
+ORDER BY id
+"""
+
+
+@pytest.mark.asyncio
+async def test_label_longevity_equals_catalog_apis_live_statement(neo4j_driver: AsyncDriver, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stored first/last year, years active, dated releases and peak decade equal the live traversal."""
+    await rows(
+        neo4j_driver,
+        """CREATE (a:Label {id: 'A'}), (b:Label {id: 'B'}), (c:Label {id: 'C'}), (d:Label {id: 'D'}), (e:Label {id: 'E'}),
+                  (:Release {id: 'a1', year: 1969})-[:ON]->(a), (:Release {id: 'a2', year: 1971})-[:ON]->(a),
+                  (:Release {id: 'a3', year: 1979})-[:ON]->(a), (:Release {id: 'a4', year: 1999})-[:ON]->(a),
+                  (:Release {id: 'a5'})-[:ON]->(a), (:Release {id: 'a6', year: 0})-[:ON]->(a),
+                  (:Release {id: 'b1', year: 1985})-[:ON]->(b), (:Release {id: 'b2', year: 1995})-[:ON]->(b),
+                  (:Release {id: 'c1', year: 2001})-[:ON]->(c), (:Release {id: 'c2', year: 2001})-[:ON]->(c),
+                  (:Release {id: 'd1'})-[:ON]->(d), (:Release {id: 'd2', year: 0})-[:ON]->(d)""",
+    )
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "longevity-run")
+
+    live = await rows(neo4j_driver, CATALOG_API_LABEL_LONGEVITY)
+    assert live, "the graph exercises real labels"
+    assert await rows(neo4j_driver, STORED_LABEL_LONGEVITY) == live
+    by_id = {row["id"]: row for row in live}
+    # A tie between decades goes to the earliest; a label dated in one year has years_active 1.
+    assert by_id["A"] == {"id": "A", "first_year": 1969, "last_year": 1999, "years_active": 31, "total_releases": 4, "peak_decade": 1970}
+    assert by_id["B"]["peak_decade"] == 1980
+    assert by_id["C"] == {"id": "C", "first_year": 2001, "last_year": 2001, "years_active": 1, "total_releases": 2, "peak_decade": 2000}
+    # No dated release: counted in release_count only, no longevity beyond total_releases = 0.
+    assert await rows(
+        neo4j_driver,
+        "MATCH (l:Label) WHERE l.id IN ['D', 'E'] RETURN l.id AS id, l.release_count AS rc, l.total_releases AS tr, "
+        "l.first_year AS fy, l.last_year AS ly, l.years_active AS ya, l.peak_decade AS pd ORDER BY id",
+    ) == [
+        {"id": "D", "rc": 2, "tr": 0, "fy": None, "ly": None, "ya": None, "pd": None},
+        {"id": "E", "rc": 0, "tr": 0, "fy": None, "ly": None, "ya": None, "pd": None},
+    ]
+
+    # A rerun writes nothing, and a release dated later moves the fields with it.
+    async with neo4j_driver.session(database="neo4j") as session:
+        again = await (await session.run(graphinator.build_label_stats_page_cypher(), cursor="", size=100)).consume()
+    assert again.counters.properties_set == 0
+    await rows(neo4j_driver, "MATCH (r:Release {id: 'a5'}) SET r.year = 2020")
+    await run_artist_and_label_stats(neo4j_driver, monkeypatch, "longevity-run-2")
+    assert await rows(neo4j_driver, STORED_LABEL_LONGEVITY) == await rows(neo4j_driver, CATALOG_API_LABEL_LONGEVITY)
+    assert (await rows(neo4j_driver, "MATCH (l:Label {id: 'A'}) RETURN l.last_year AS ly, l.total_releases AS tr"))[0] == {"ly": 2020, "tr": 5}
 
 
 @pytest.mark.asyncio

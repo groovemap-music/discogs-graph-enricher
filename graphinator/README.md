@@ -397,6 +397,27 @@ ORDER BY year
 | `release_count` | Number of releases on this label                       |
 | `artist_count`  | Number of distinct artists on this label               |
 | `genre_count`   | Number of distinct genres across this label's releases |
+| `first_year`, `last_year`, `years_active`, `total_releases`, `peak_decade` | Longevity (see [Label longevity](#label-longevity)) |
+
+#### Label longevity
+
+Five integer properties on every Label, which catalog-api's `/api/insights/label-longevity` and the label page read instead of two traversals of every release of the label (1.2 s server time for Not On Label, id 1818, 762,594 releases):
+
+| Property         | Content                                                                                               |
+| ---------------- | ----------------------------------------------------------------------------------------------------- |
+| `first_year`     | The earliest `year` among the label's releases with `year > 0`                                        |
+| `last_year`      | The latest such year                                                                                  |
+| `years_active`   | `last_year - first_year + 1`                                                                          |
+| `total_releases` | The number of the label's releases with `year > 0` (not `release_count`, which counts every release) |
+| `peak_decade`    | The decade, `(year / 10) * 10` in integer division, with the most dated releases; a tie goes to the earliest decade |
+
+The definitions are those of catalog-api's `_LABEL_LONGEVITY_CYPHER` (`api/queries/insights_neo4j_queries.py`): `(r:Release)-[:ON]->(l)`, `r.year > 0`, Masters not counted. Placeholder labels and unnamed stubs are catalog-api's rule, not stored here.
+
+- A label with no dated release has `total_releases = 0` and no `first_year`, `last_year`, `years_active` or `peak_decade`. catalog-api's `total_releases > 0` filter drops it either way.
+- Scalars rather than a per-year series: the label page needs only these five, and a series on 2.43M labels would be stored for nearly nobody's benefit.
+- All of them are written in the same statement as `release_count`, from one walk of the label's releases grouped by year, so they describe the same graph. Each is written only when it differs.
+
+**Reading it safely.** `total_releases` absent means the label has not been swept by code that writes longevity (a graph stamped before `stats_version` 3, or the pass still running): fall back to the live traversal. It is current for the whole graph once the newest `ExtractionCompletion` node has `maintained_at` and `stats_version >= 3`. A deploy that raises `stats_version` refreshes the newest dump at start-up, so the fields appear without waiting for the next dump. Like every stored stat, they can be one dump old while a new dump is importing.
 
 **Label style counts** — `(:Label)-[:HAS_STYLE {release_count}]->(:Style)`, one edge per style of the label's releases with no cap on styles. `release_count` is the number of the label's releases in that style. It is an edge rather than list properties so a reader can go from a style to the labels carrying it without scanning every Label. A label with no styles has no edges, and an edge for a style the label has lost is deleted by the next pass. The edges are derived from `ON` and `IS`, so they never keep an otherwise orphaned stub Label alive.
 

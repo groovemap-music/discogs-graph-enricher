@@ -1401,8 +1401,8 @@ ARTIST_STATS_PAGE_SIZE = 1000
 # ExtractionCompletion.stats_version then differs from this on the newest dump, and the
 # next start refreshes it (see resume_stats_refresh) instead of leaving the new values
 # missing until the next dump. 1 added the Artist stats and the HAS_STYLE edges. 2 added
-# the per-year release series on Genre and Style.
-STATS_VERSION = 2
+# the per-year release series on Genre and Style. 3 added the longevity fields on Label.
+STATS_VERSION = 3
 
 # The per-year release series on every Genre and Style node, read by catalog-api's
 # trends. Two parallel integer lists, in this order: the years, ascending, each > 0
@@ -1511,7 +1511,9 @@ def build_label_stats_page_cypher() -> str:
     ~millions of labels in the graph; most labels have few releases so a page is quick.
     Each property is written only when it differs, so a rerun over unchanged data writes nothing.
 
-    Writes ``release_count``, ``artist_count`` and ``genre_count`` on the Label, and one
+    Writes ``release_count``, ``artist_count`` and ``genre_count`` on the Label, its
+    longevity (``first_year``, ``last_year``, ``years_active``, ``total_releases``,
+    ``peak_decade``, see graphinator/README.md "Label longevity"), and one
     ``(:Label)-[:HAS_STYLE {release_count}]->(:Style)`` per style of its releases, with no
     cap on styles. The style counts are an edge and not list properties because
     ``/api/label/{id}/similar`` has to go from a style to the labels carrying it: on lux
@@ -1521,7 +1523,9 @@ def build_label_stats_page_cypher() -> str:
 
     The artists, genres and styles share ONE expansion of each release, which on lux
     takes the largest label (1818, 762,594 releases) from 21.4M db hits to 14.4M, in 2.7 s
-    and 64 MB. ``count(r)`` per target needs no ``DISTINCT``: ``BY`` and ``IS`` are
+    and 64 MB. The release count and the longevity come from ONE walk of the label's
+    releases, grouped by ``r.year`` (a few hundred groups at most), which replaces the
+    plain release count and costs the read of ``r.year`` per release. ``count(r)`` per target needs no ``DISTINCT``: ``BY`` and ``IS`` are
     ``MERGE``d, so a release has at most one edge to a target.
     """
     return """
@@ -1531,7 +1535,15 @@ def build_label_stats_page_cypher() -> str:
     CALL (l) {
         CALL (l) {
             OPTIONAL MATCH (l)<-[:ON]-(r:Release)
-            RETURN count(DISTINCT r) AS rc
+            WITH r.year AS year, count(DISTINCT r) AS n
+            ORDER BY year
+            WITH sum(n) AS rc, collect(CASE WHEN year > 0 THEN {year: year, n: n} END) AS ys
+            UNWIND CASE WHEN size(ys) = 0 THEN [null] ELSE ys END AS y
+            WITH rc, ys, (y.year / 10) * 10 AS decade, sum(y.n) AS decade_count
+            ORDER BY decade_count DESC, decade
+            LIMIT 1
+            RETURN rc, decade AS pd, head(ys).year AS fy, last(ys).year AS ly,
+                reduce(total = 0, y IN ys | total + y.n) AS tr
         }
         CALL (l) {
             OPTIONAL MATCH (l)<-[:ON]-(r:Release)-[:BY|IS]->(t)
@@ -1544,6 +1556,11 @@ def build_label_stats_page_cypher() -> str:
         FOREACH (_ IN CASE WHEN l.release_count IS NULL OR l.release_count <> rc THEN [1] ELSE [] END | SET l.release_count = rc)
         FOREACH (_ IN CASE WHEN l.artist_count IS NULL OR l.artist_count <> ac THEN [1] ELSE [] END | SET l.artist_count = ac)
         FOREACH (_ IN CASE WHEN l.genre_count IS NULL OR l.genre_count <> gc THEN [1] ELSE [] END | SET l.genre_count = gc)
+        FOREACH (_ IN CASE WHEN coalesce(l.first_year, -1) <> coalesce(fy, -1) THEN [1] ELSE [] END | SET l.first_year = fy)
+        FOREACH (_ IN CASE WHEN coalesce(l.last_year, -1) <> coalesce(ly, -1) THEN [1] ELSE [] END | SET l.last_year = ly)
+        FOREACH (_ IN CASE WHEN coalesce(l.years_active, -1) <> coalesce(ly - fy + 1, -1) THEN [1] ELSE [] END | SET l.years_active = ly - fy + 1)
+        FOREACH (_ IN CASE WHEN coalesce(l.total_releases, -1) <> tr THEN [1] ELSE [] END | SET l.total_releases = tr)
+        FOREACH (_ IN CASE WHEN coalesce(l.peak_decade, -1) <> coalesce(pd, -1) THEN [1] ELSE [] END | SET l.peak_decade = pd)
         WITH l, styles
         CALL (l, styles) {
             MATCH (l)-[stale:HAS_STYLE]->(old:Style)

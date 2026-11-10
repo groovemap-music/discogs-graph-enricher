@@ -189,6 +189,10 @@ trigger: there is no manual step. Bump `STATS_VERSION` whenever a sweep's output
   until the refresh finishes, so a reader checking `stats_version >= 1` keeps trusting
   `HAS_STYLE` while that refresh is rewriting it. Before a bump that changes those edges, raise
   the minimum those readers require, or they can read a part-written set.
+- `STATS_VERSION` 3 added the Label longevity fields (`first_year`, `last_year`, `years_active`,
+  `total_releases`, `peak_decade`). A reader of those requires `stats_version >= 3`, and falls back to the
+  live traversal on a label with no `total_releases`. See
+  [Label longevity](../graphinator/README.md#label-longevity).
 
 ### Deploying `STATS_VERSION` 1
 
